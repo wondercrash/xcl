@@ -493,15 +493,20 @@ const HUGE_HLSL: usize = 8 * 1024 * 1024;
 /// of CPU and 3.4 GB (9.5 MB DXIL instead of 20 MB). -O0 stays only for enormous programs in
 /// the `pc` dispatcher form (`uint pc`, unstructured control flow), where DXC's loop passes
 /// blow up: a 76 696-instruction one had not finished -O1 or -O3 after 13 CPU-minutes.
+/// -O0 also past `O1_MAX_HLSL`, structured or not.
 fn default_level(src: &str) -> Option<&'static str> {
     if src.len() > HUGE_HLSL {
-        Some(if src.contains("\n    uint pc = ") { "-O0" } else { "-O1" })
+        Some(if src.len() > O1_MAX_HLSL || src.contains("\n    uint pc = ") { "-O0" } else { "-O1" })
     } else if src.len() > 1024 * 1024 {
         Some("-O1")
     } else {
         None
     }
 }
+
+/// Structured HLSL past this size is not optimised either: a retail program's 154 MB (5.7 M
+/// short-circuit `||` terms in its skip guards) is far past what -O1 was measured on (30 MB).
+const O1_MAX_HLSL: usize = 64 * 1024 * 1024;
 
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
@@ -1074,6 +1079,13 @@ mod cache_tests {
         assert_ne!(cache_key_for_toolchain(&structured, "main", "cs_6_6", "tc"), plain(&structured));
         // still -O0 as before: the same key
         assert_eq!(cache_key_for_toolchain(&dispatch, "main", "cs_6_6", "tc"), plain(&dispatch));
+        // structured but past the -O1 cap: -O0, with the key it had before -O1
+        let mut over = structured.repeat(O1_MAX_HLSL / structured.len() + 1);
+        over.truncate(O1_MAX_HLSL + 1);
+        assert!(!over.contains("\n    uint pc = "));
+        assert_eq!(default_level(&over), Some("-O0"));
+        assert_eq!(default_level(&over[..O1_MAX_HLSL]), Some("-O1"));
+        assert_eq!(cache_key_for_toolchain(&over, "main", "cs_6_6", "tc"), plain(&over));
     }
 
     #[test]
