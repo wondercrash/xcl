@@ -3339,35 +3339,6 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// DXIL size from which a compute pipeline's driver compile goes to the background
 const BIG_DRIVER_COMPILE: usize = 256 << 10;
 
-/// A counting semaphore: background driver compiles of big programs at once.
-struct Slots {
-    n: Mutex<usize>,
-    cv: std::sync::Condvar,
-    most: usize,
-}
-
-struct SlotGuard(&'static Slots);
-
-impl Slots {
-    fn acquire(&'static self) -> SlotGuard {
-        let mut n = self.n.lock().unwrap();
-        while *n >= self.most {
-            n = self.cv.wait(n).unwrap();
-        }
-        *n += 1;
-        SlotGuard(self)
-    }
-}
-
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        *self.0.n.lock().unwrap() -= 1;
-        self.0.cv.notify_one();
-    }
-}
-
-static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
-
 /// Before a big driver compile in the background: until 3 GB of commit are free (each takes
 /// ~1.5 GB; the title loading next to it must not run out – no minute's grace as for DXC).
 fn wait_for_commit() {
@@ -3431,9 +3402,10 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
     let started = std::time::Instant::now();
-    // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
+    // in the background, one at a time and within the commit left (each ~1.5 GB in the driver);
+    // one a bind waits for gets the next slot, ahead of the ones built ahead of their first use
     let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = BIG_COMPILES.acquire();
+        let slot = super::pso_async::big_compile();
         wait_for_commit();
         slot
     });
