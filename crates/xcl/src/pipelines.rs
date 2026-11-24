@@ -56,7 +56,10 @@ fn binary_key(gpu: u64) -> u64 {
 const WARM_STACK: usize = 512 << 20;
 
 /// `pipelines.trying`: the pipelines in the making now, written whole at each change, so a run cut
-/// short (a crash, or Ctrl+C) leaves the next run exactly those.
+/// short (a crash, or Ctrl+C) leaves the next run exactly those. A pipeline is in it while it is
+/// translated and compiled by DXC and while it is in the driver's compile, not while it waits for
+/// a big-compile turn or a driver slot: big ones go one at a time, and a stop would otherwise
+/// give up every worker's waiting pipeline, which the driver never saw.
 struct Trying {
     file: std::fs::File,
     now: Vec<u64>,
@@ -317,11 +320,25 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
                     }
                 };
                 let (hash, replay) = item;
+                // in `trying` through translation and DXC, out while it waits for the driver, in
+                // again while the driver has it
                 trying.lock().unwrap().set(hash, true);
                 let r = match &replay {
                     None => Err("not readable from the journal".to_string()),
                     // the driver's compiles, few at once (the biggest take ~1.5 GB each)
-                    Some(r) => unsafe { crate::hle::d3d12x::real::warm(dev, r, max_dxil, || DriverSlot::take(gpu, gpu_most)) },
+                    Some(r) => unsafe {
+                        crate::hle::d3d12x::real::warm(
+                            dev,
+                            r,
+                            max_dxil,
+                            || trying.lock().unwrap().set(hash, false),
+                            || {
+                                let slot = DriverSlot::take(gpu, gpu_most);
+                                trying.lock().unwrap().set(hash, true);
+                                slot
+                            },
+                        )
+                    },
                 };
                 // done: made, or left to the title; a failure is tried again by the next run
                 let done = match r {

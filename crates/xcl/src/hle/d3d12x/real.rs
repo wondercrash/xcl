@@ -4823,11 +4823,13 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 
 /// `xcl pipelines`: a journal's pipeline made on `dev` (a plain device of this process) as
 /// `translated_graphics_pso` / `translated_compute_pso` make it, which fills the DXIL cache
-/// and the driver's, and released. `driver` is held around the driver's compile only (few of
-/// those at once; translation and DXC run freely). A compute program over `max_dxil` bytes of
-/// DXIL (`XCL_PRECOMPILE_MAX_DXIL`) is translated but left to the title (`over_max_dxil`), as
-/// `xcl shaders --precompile --pipelines` does. Err: what kept it from being made.
-pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay, max_dxil: Option<usize>, driver: impl FnOnce() -> G) -> Result<(), String> {
+/// and the driver's, and released. `translated` is called once translation and DXC are done,
+/// before the waits for a big-compile turn and for `driver`, which is held around the driver's
+/// compile only (few of those at once; translation and DXC run freely). A compute program over
+/// `max_dxil` bytes of DXIL (`XCL_PRECOMPILE_MAX_DXIL`) is translated but left to the title
+/// (`over_max_dxil`), as `xcl shaders --precompile --pipelines` does. Err: what kept it from
+/// being made.
+pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay, max_dxil: Option<usize>, translated: impl FnOnce(), driver: impl FnOnce() -> G) -> Result<(), String> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     use windows::core::Interface;
     let this = dev.as_raw();
@@ -4838,6 +4840,7 @@ pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay,
                 return Err("GS / HS / DS pipeline – left to the title".into());
             }
             let GraphicsPrep { desc: mut copy, rect_gs, _dxil, .. } = prep_graphics(this, d, vs).ok_or("not translated")?;
+            translated();
             let _slot = driver();
             let mut made = None;
             let hr = retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| match dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(c) {
@@ -4863,6 +4866,7 @@ pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay,
                 return Ok(());
             }
             over_max_dxil(compiled.dxil.len(), max_dxil)?;
+            translated();
             // a big one as the title's background makes it: one at a time (huge ones in a lane of
             // their own), within the commit left
             let _big = (compiled.dxil.len() >= BIG_DRIVER_COMPILE).then(|| big_compile_turn(big_compile_lane(compiled.dxil.len()).0, big_compile_commit_free, || false));
