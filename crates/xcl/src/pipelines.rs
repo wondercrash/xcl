@@ -176,8 +176,9 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     if std::env::var_os("XCL_DXC_THREADS").is_none() {
         std::env::set_var("XCL_DXC_THREADS", half.to_string());
     }
-    // a running title keeps its commit (`wait_for_memory`'s 6 GB); without one, 2
-    crate::gpu::recomp::dxc::set_memory_reserve(if watch { 6 } else { 2 });
+    // `wait_for_memory` keeps 6 GB of commit free, as next to a running title: the tool runs in
+    // the background of a PC in use, and a title's last pipelines take GBs each in DXC
+    crate::gpu::recomp::dxc::set_memory_reserve(6);
     let gpu_most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(if watch { 2 } else { 4usize }).max(1);
     let threads = opt("--threads").unwrap_or(half).max(1);
 
