@@ -701,6 +701,7 @@ pub(super) fn on_queue_release(queue: usize) {
         }
     }
     super::cpu_writes::forget_queue(queue);
+    super::sparse::forget_queue(queue);
 }
 
 #[cfg(test)]
@@ -2004,10 +2005,12 @@ unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &
 /// A gated wait on a value this very list writes later while no submission has signalled it
 /// yet can only be reached after the list: skipped, as `try_gpu_wait` does for a same-batch
 /// self-wait, instead of gating the list on itself. Once another queue's producer of the value
-/// is submitted (`submitted_max`), the wait is gated so the list does not run ahead of it.
+/// is submitted (`submitted_max`), the wait is gated so the list does not run ahead of it. A
+/// non-monotonic cell's `submitted_max` is no longer kept up to date (a counter that restarted
+/// keeps its old high value), so there the list's own write decides, as before.
 fn waits_on_itself(w: &PendingWait, list_writes: &[(u64, u64)]) -> bool {
     list_writes.iter().any(|&(va, v)| va == w.va && v >= w.value)
-        && SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&w.va)).is_none_or(|c| c.submitted_max < w.value)
+        && SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&w.va)).is_none_or(|c| c.non_monotonic || c.submitted_max < w.value)
 }
 
 /// `q{id}/ty{type}` of a title queue, as the other synchronisation warnings name it.
@@ -4295,8 +4298,12 @@ mod tests {
         assert!(waits_on_itself(&w, &list_writes), "a lower submitted value is not the producer");
         SYNC_GRAPH.lock().unwrap().as_mut().unwrap().cells.get_mut(&va).unwrap().submitted_max = 7;
         let skipped = waits_on_itself(&w, &list_writes);
+        // a counter that restarted: its old high submitted_max is stale, the list's write decides
+        SYNC_GRAPH.lock().unwrap().as_mut().unwrap().cells.get_mut(&va).unwrap().non_monotonic = true;
+        let skipped_non_monotonic = waits_on_itself(&w, &list_writes);
         SYNC_GRAPH.lock().unwrap().as_mut().unwrap().cells.remove(&va);
         assert!(!skipped, "another queue's producer is already submitted: the wait must be gated");
+        assert!(skipped_non_monotonic, "a non-monotonic cell must not gate the list on its own write");
     }
 
     #[test]

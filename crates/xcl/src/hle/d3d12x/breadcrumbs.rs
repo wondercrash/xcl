@@ -39,13 +39,17 @@ const STUCK_REPORTS: u32 = 3;
 /// ops before the stuck one searched for skipped ones, on any list
 const SKIP_WINDOW: u32 = 4096;
 
+/// Breadcrumbs on for the current thread's calls only, so a test that turns them on (and one
+/// that fails with them on) does not turn them on for other tests' fake lists.
 #[cfg(test)]
-static FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub(super) fn on() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("XCL_GPU_BREADCRUMBS").is_ok_and(|v| v.trim() == "1"));
     #[cfg(test)]
-    if FORCE.load(Ordering::Relaxed) {
+    if FORCE.with(|f| f.get()) {
         return true;
     }
     *ON
@@ -476,7 +480,16 @@ mod tests {
                 return;
             }
             let dev = dev.unwrap();
-            FORCE.store(true, Ordering::Relaxed);
+            // off again however the test ends (with one test thread, the next test runs on this
+            // thread)
+            struct Unforce;
+            impl Drop for Unforce {
+                fn drop(&mut self) {
+                    FORCE.with(|f| f.set(false));
+                }
+            }
+            FORCE.with(|f| f.set(true));
+            let _unforce = Unforce;
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
@@ -492,7 +505,11 @@ mod tests {
             queue.Wait(&gate, 1).unwrap();
             waited(queue.as_raw(), || "test wait".into());
             queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
-            executed(queue.as_raw(), &[list.as_raw()]);
+            // a queue of a device an earlier test adopted marks its ExecuteCommandLists itself
+            // (`real::q_execute_command_lists`)
+            if !real::is_adopted(queue.as_raw()) {
+                executed(queue.as_raw(), &[list.as_raw()]);
+            }
             let (fence, next, ops) = {
                 let g = STATE.lock().unwrap();
                 let line = &g.as_ref().unwrap().queues[&(queue.as_raw() as usize)];
@@ -507,7 +524,6 @@ mod tests {
             gate.Signal(1).unwrap();
             assert!(until(|| fence.GetCompletedValue() >= 2), "the queue did not pass its marks");
             assert_eq!(state_of(ran), "done");
-            FORCE.store(false, Ordering::Relaxed);
         }
     }
 }
