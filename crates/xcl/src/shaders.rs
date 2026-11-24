@@ -736,20 +736,146 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
 /// ABI root signature with its static samplers). Save the driver's compiled blob in the same
 /// cache the runtime reads at startup. Nothing runs on the GPU.
+///
+/// A program whose blob is in that cache is made from it on the translating thread
+/// (`from_cache`, a cheap create). The others wait in a `BiggestFirst` queue for the driver's
+/// compiles, which run on threads of their own (`drain`). The translating threads used to make
+/// each pipeline themselves behind a gate of 4: with three retail programs of 13 – 28 MB DXIL
+/// holding 3 slots for 15+ CPU-minutes each, every translating thread held a finished program
+/// waiting for the one slot left, and the DXC pool sat idle. Each driver thread takes the
+/// biggest waiting program that `driver_fits` lets in: by the commit and memory free, and with
+/// at most `huge_most` programs over `HUGE` at once, so those never hold every thread.
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
-    /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
-    /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
-    running: (Mutex<usize>, std::sync::Condvar),
-    most: usize,
+    /// the driver compiles running now: when each started and its DXIL bytes
+    running: Mutex<Vec<(std::time::Instant, usize)>>,
+    /// driver threads, the most compiles at once: `XCL_PIPELINE_THREADS`, or half the logical CPUs
+    threads: usize,
 }
 
 // D3D12 devices and root signatures are free-threaded
 unsafe impl Sync for Pipelines {}
+
+/// Commit and memory kept free besides the driver's compiles.
+const DRIVER_RESERVE: u64 = 8 << 30;
+/// What the driver's compile of a program is taken to need: 1536 bytes for each byte of DXIL,
+/// between 64 MB and 1.5 GB (a 1 MB program took ~1.5 GB, fifteen at once 24 GB); 3 GB for one
+/// over `HUGE` (seven of 1 – 25 MB at once took 8.7 GB upstream: this is on the safe side).
+const DRIVER_PER_BYTE: u64 = 1536;
+const DRIVER_LEAST: u64 = 64 << 20;
+const DRIVER_MOST: u64 = 3 << 29;
+const DRIVER_HUGE: u64 = 3 << 30;
+/// DXIL bytes past which a program is huge: a retail pack's three of 13 – 28 MB each took the
+/// driver 15+ CPU-minutes (the next biggest is 1.9 MB).
+const HUGE: usize = 8 << 20;
+
+fn driver_memory(dxil: usize) -> u64 {
+    if dxil > HUGE {
+        DRIVER_HUGE
+    } else {
+        (dxil as u64).saturating_mul(DRIVER_PER_BYTE).clamp(DRIVER_LEAST, DRIVER_MOST)
+    }
+}
+
+/// Huge programs compiled at once by `threads` driver threads: at most 2, and with two threads
+/// or more one left for the rest.
+fn huge_most(threads: usize) -> usize {
+    threads.saturating_sub(1).clamp(1, 2)
+}
+
+/// The most DXIL bytes a program may have for its driver compile to start now, with those of
+/// `running` (DXIL bytes each) going, `avail` bytes free (the smaller of free commit and
+/// physical memory) and at most `huge_most` programs over `HUGE` at once. None: nothing may
+/// start. With nothing running anything may.
+fn driver_fits(running: &[usize], avail: u64, huge_most: usize) -> Option<usize> {
+    if running.is_empty() {
+        return Some(usize::MAX);
+    }
+    // the running ones are counted in full: `avail` shows what they took only once they have
+    let held = running.iter().fold(DRIVER_RESERVE, |sum, &n| sum.saturating_add(driver_memory(n)));
+    let room = avail.checked_sub(held).filter(|&r| r >= DRIVER_LEAST)?;
+    let most = if room >= DRIVER_HUGE {
+        usize::MAX
+    } else if room >= DRIVER_MOST {
+        HUGE
+    } else {
+        (room / DRIVER_PER_BYTE) as usize
+    };
+    let huge = running.iter().filter(|&&n| n > HUGE).count();
+    Some(if huge >= huge_most { most.min(HUGE) } else { most })
+}
+
+/// Work waiting for a slow consumer, handed out biggest first. A push never waits: the queue
+/// holds the translated DXIL until the driver takes it (a retail pack's compute programs come
+/// to a few GB at most, and what they hold is in the free memory `driver_fits` sees).
+struct BiggestFirst<T> {
+    state: Mutex<BiggestState<T>>,
+    cv: std::sync::Condvar,
+}
+
+struct BiggestState<T> {
+    /// by (size, usize::MAX - the order queued): the last is the biggest, queued first
+    items: BTreeMap<(usize, usize), T>,
+    seq: usize,
+    closed: bool,
+}
+
+impl<T> BiggestFirst<T> {
+    fn new() -> Self {
+        BiggestFirst { state: Mutex::new(BiggestState { items: Default::default(), seq: 0, closed: false }), cv: Default::default() }
+    }
+
+    fn push(&self, size: usize, item: T) {
+        let mut g = self.state.lock().unwrap();
+        let key = (size, usize::MAX - g.seq);
+        g.seq += 1;
+        g.items.insert(key, item);
+        self.cv.notify_all();
+    }
+
+    /// The biggest waiting item; None once closed and empty.
+    #[cfg(test)]
+    fn pop(&self) -> Option<T> {
+        self.pop_fitting(|| Some(usize::MAX), |_| ())
+    }
+
+    /// The biggest waiting item no bigger than `limit()` says (None: none may be taken now),
+    /// asked again every 200 ms while nothing fits; `taken(size)` is called for the item
+    /// before another taker is asked for its limit. None once closed and empty.
+    fn pop_fitting(&self, mut limit: impl FnMut() -> Option<usize>, taken: impl FnOnce(usize)) -> Option<T> {
+        let mut g = self.state.lock().unwrap();
+        loop {
+            if g.items.is_empty() {
+                if g.closed {
+                    return None;
+                }
+                g = self.cv.wait(g).unwrap();
+                continue;
+            }
+            let key = limit().and_then(|most| g.items.range(..=(most, usize::MAX)).next_back().map(|(&k, _)| k));
+            if let Some(key) = key {
+                let item = g.items.remove(&key)?;
+                taken(key.0);
+                return Some(item);
+            }
+            g = self.cv.wait_timeout(g, std::time::Duration::from_millis(200)).unwrap().0;
+        }
+    }
+
+    /// No more pushes: a pop returns None once the rest is taken.
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.cv.notify_all();
+    }
+
+    fn len(&self) -> usize {
+        self.state.lock().unwrap().items.len()
+    }
+}
 
 impl Pipelines {
     fn new() -> Result<Pipelines, String> {
@@ -760,13 +886,15 @@ impl Pipelines {
             let sel = crate::gpu::adapter::Selector::from_env_or("auto");
             let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
-            let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+            let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+            let threads = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores / 2).max(1);
+            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), running: Mutex::new(Vec::new()), threads })
         }
     }
 
-    /// The compute pipeline of `c` (made and released).
-    fn make(&self, c: &recomp::pso::Compiled) {
+    /// The compute pipeline of `c` (made and released), from the driver's `blob` when given.
+    /// None: its root signature was refused (counted).
+    fn create(&self, c: &recomp::pso::Compiled, blob: Option<&[u8]>) -> Option<windows::core::Result<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState>> {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
@@ -780,7 +908,7 @@ impl Pipelines {
                     }
                     Err(_) => {
                         self.refused.fetch_add(1, Ordering::Relaxed);
-                        return;
+                        return None;
                     }
                 },
             }
@@ -790,47 +918,103 @@ impl Pipelines {
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
             ..Default::default()
         };
-        {
-            let mut n = self.running.0.lock().unwrap();
-            while *n >= self.most {
-                n = self.running.1.wait(n).unwrap();
-            }
-            *n += 1;
-        }
-        use crate::hle::d3d12x::real::driver_cache;
-        let path = driver_cache::path(&c.dxil, desc.Flags.0);
-        let cached = path.as_deref().and_then(driver_cache::load);
-        let from_cache = cached.as_ref().and_then(|bytes| {
+        if let Some(bytes) = blob {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
-            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.ok()
-        });
-        let r = if let Some(pso) = from_cache {
-            self.reused.fetch_add(1, Ordering::Relaxed);
-            Ok(pso)
-        } else {
-            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-            let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
-            if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
-                if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
-                    let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
-                    let len = unsafe { blob.GetBufferSize() };
-                    if !bytes.is_null() && len != 0 {
-                        driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
-                    }
+        }
+        let r = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        Some(r)
+    }
+
+    /// On a translating thread: the pipeline of `c` from the driver cache (a cheap create; also
+    /// true when its root signature was refused). False: it needs the driver's compile (`compile`).
+    fn from_cache(&self, c: &recomp::pso::Compiled) -> bool {
+        use crate::hle::d3d12x::real::driver_cache;
+        use windows::Win32::Graphics::Direct3D12::D3D12_PIPELINE_STATE_FLAG_NONE;
+        let Some(bytes) = driver_cache::path(&c.dxil, D3D12_PIPELINE_STATE_FLAG_NONE.0).as_deref().and_then(driver_cache::load) else { return false };
+        match self.create(c, Some(&bytes)) {
+            None => true,
+            Some(Ok(_)) => {
+                self.reused.fetch_add(1, Ordering::Relaxed);
+                self.count(true);
+                true
+            }
+            Some(Err(_)) => false,
+        }
+    }
+
+    /// On a driver thread: the driver's compile of `c`, its blob saved for the runtime.
+    fn compile(&self, c: &recomp::pso::Compiled) {
+        use crate::hle::d3d12x::real::driver_cache;
+        use windows::Win32::Graphics::Direct3D12::D3D12_PIPELINE_STATE_FLAG_NONE;
+        let Some(r) = self.create(c, None) else { return };
+        if let (Some(path), Ok(pso)) = (driver_cache::path(&c.dxil, D3D12_PIPELINE_STATE_FLAG_NONE.0), &r) {
+            if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
+                let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
+                let len = unsafe { blob.GetBufferSize() };
+                if !bytes.is_null() && len != 0 {
+                    driver_cache::write(&path, unsafe { std::slice::from_raw_parts(bytes, len) });
                 }
             }
-            pso
-        };
-        *self.running.0.lock().unwrap() -= 1;
-        self.running.1.notify_one();
-        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-        let done = match r {
-            Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
-            Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
-        };
+        }
+        self.count(r.is_ok());
+    }
+
+    fn count(&self, made: bool) {
+        let done = if made { self.made.fetch_add(1, Ordering::Relaxed) + 1 } else { self.refused.fetch_add(1, Ordering::Relaxed) + 1 };
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
+    }
+
+    /// The most DXIL bytes of a program whose driver compile may start now (`driver_fits`).
+    fn fits(&self, huge_most: usize) -> Option<usize> {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        let avail = if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 { u64::MAX } else { m.ullAvailPhys.min(m.ullAvailPageFile) };
+        let running: Vec<usize> = self.running.lock().unwrap().iter().map(|r| r.1).collect();
+        driver_fits(&running, avail, huge_most)
+    }
+
+    /// A driver thread: pipelines from `queue`, the biggest that `fits` first, until it is
+    /// closed and empty.
+    fn drain(&self, queue: &BiggestFirst<recomp::pso::Compiled>) {
+        let huge_most = huge_most(self.threads);
+        loop {
+            let mut mark = None;
+            let taken = |size| {
+                let m = (std::time::Instant::now(), size);
+                self.running.lock().unwrap().push(m);
+                mark = Some(m);
+            };
+            let Some(c) = queue.pop_fitting(|| self.fits(huge_most), taken) else { return };
+            self.compile(&c);
+            let Some((started, size)) = mark else { continue };
+            let mut g = self.running.lock().unwrap();
+            if let Some(k) = g.iter().position(|r| *r == (started, size)) {
+                g.swap_remove(k);
+            }
+            drop(g);
+            if started.elapsed().as_secs() >= 60 {
+                eprintln!("  pipeline of a {} KB DXIL program: {:.0} s in the driver", size / 1024, started.elapsed().as_secs_f64());
+            }
+        }
+    }
+
+    /// Where the driver's compiles are, for a line every few seconds (None: nothing to say).
+    fn status(&self, waiting: usize) -> Option<String> {
+        let g = self.running.lock().unwrap();
+        if g.is_empty() && waiting == 0 {
+            return None;
+        }
+        let longest = g.iter().min_by_key(|r| r.0).map_or(String::new(), |r| format!(" (the longest for {:.0} s, {} KB DXIL)", r.0.elapsed().as_secs_f64(), r.1 / 1024));
+        Some(format!(
+            "pipelines: {} made, {} refused, {} in the driver{longest}, {waiting} waiting",
+            self.made.load(Ordering::Relaxed),
+            self.refused.load(Ordering::Relaxed),
+            g.len()
+        ))
     }
 }
 
@@ -865,9 +1049,43 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         recomp::dxc::compile_threads(),
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
+    if let Some(p) = pipelines {
+        println!(
+            "pipelines: {} driver threads{}, biggest program first, at most {} over {} MB at once, while {} GB of commit and memory stay free",
+            p.threads,
+            if std::env::var_os("XCL_PIPELINE_THREADS").is_some() { " (XCL_PIPELINE_THREADS)" } else { "" },
+            huge_most(p.threads),
+            HUGE >> 20,
+            DRIVER_RESERVE >> 30
+        );
+    }
+    // translated compute programs waiting for the driver's compiles
+    let queue: BiggestFirst<recomp::pso::Compiled> = BiggestFirst::new();
+    let drivers_done = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|s| {
+        let (queue, drivers_done) = (&queue, &drivers_done);
+        let mut drivers = Vec::new();
+        if let Some(p) = pipelines {
+            for _ in 0..p.threads {
+                drivers.push(s.spawn(move || p.drain(queue)));
+            }
+            // the driver says nothing while it compiles: a line every 15 s
+            s.spawn(move || {
+                let mut last = std::time::Instant::now();
+                while !drivers_done.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    if last.elapsed().as_secs() >= 15 {
+                        last = std::time::Instant::now();
+                        if let Some(line) = p.status(queue.len()) {
+                            eprintln!("  {line} ({:.0} s)", t0.elapsed().as_secs_f64());
+                        }
+                    }
+                }
+            });
+        }
+        let mut workers = Vec::new();
         for _ in 0..threads {
-            s.spawn(|| loop {
+            workers.push(s.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
@@ -884,8 +1102,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
-                            if let Some(p) = pipelines {
-                                p.make(&c);
+                            // a cached driver blob is a cheap create; the rest go to the driver
+                            // threads, so this thread translates on at once
+                            if pipelines.is_some_and(|p| !p.from_cache(&c)) {
+                                queue.push(c.dxil.len(), c);
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
@@ -944,8 +1164,22 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 if d % 200 == 0 {
                     eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
                 }
-            });
+            }));
         }
+        for w in workers {
+            let _ = w.join();
+        }
+        queue.close();
+        if let Some(p) = pipelines {
+            let left = queue.len() + p.running.lock().unwrap().len();
+            if left > 0 {
+                eprintln!("  shaders done ({:.0} s); {left} pipelines left for the driver", t0.elapsed().as_secs_f64());
+            }
+        }
+        for d in drivers {
+            let _ = d.join();
+        }
+        drivers_done.store(true, Ordering::Release);
     });
     println!(
         "compiled {}, already cached {}, errors {}, skipped (GS – paired at pipeline creation) {}, time {:.1} s",
@@ -1255,6 +1489,90 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 mod tests {
     use super::*;
     use crate::gpu::xbox::tests::{fssm, sample, CODE};
+
+    /// `--pipelines`: the driver gets the biggest program waiting (the earlier of two the same
+    /// size), and the drained queue ends once closed.
+    #[test]
+    fn driver_queue_hands_out_the_biggest_first() {
+        let q = BiggestFirst::new();
+        for (size, name) in [(10, "a"), (300, "b"), (50, "c"), (300, "d"), (1, "e")] {
+            q.push(size, name);
+        }
+        q.close();
+        let order: Vec<_> = std::iter::from_fn(|| q.pop()).collect();
+        assert_eq!(order, ["b", "d", "c", "a", "e"]);
+        assert_eq!(q.len(), 0);
+    }
+
+    /// A pop waits for a push while the queue is open, and the drivers stop once it is closed.
+    #[test]
+    fn driver_queue_waits_until_closed() {
+        let q = BiggestFirst::new();
+        std::thread::scope(|s| {
+            let got = s.spawn(|| std::iter::from_fn(|| q.pop()).collect::<Vec<i32>>());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            q.push(1, 7);
+            q.close();
+            assert_eq!(got.join().unwrap(), [7]);
+        });
+    }
+
+    /// With a limit, the biggest item that fits is taken and bigger ones stay for later; with
+    /// none fitting the taker waits and asks again.
+    #[test]
+    fn driver_queue_hands_out_the_biggest_that_fits() {
+        let q = BiggestFirst::new();
+        for (size, name) in [(10, "a"), (300, "b"), (50, "c"), (1, "d")] {
+            q.push(size, name);
+        }
+        q.close();
+        let taken = std::cell::Cell::new(0);
+        assert_eq!(q.pop_fitting(|| Some(60), |size| taken.set(size)), Some("c"));
+        assert_eq!(taken.get(), 50);
+        assert_eq!(q.pop_fitting(|| Some(usize::MAX), |_| ()), Some("b"));
+        // nothing fits twice, then room for the smallest only
+        let mut asked = 0;
+        let limit = || {
+            asked += 1;
+            (asked > 2).then_some(5)
+        };
+        assert_eq!(q.pop_fitting(limit, |_| ()), Some("d"));
+        assert_eq!(asked, 3);
+        assert_eq!((q.pop(), q.pop()), (Some("a"), None));
+    }
+
+    #[test]
+    fn driver_compiles_start_while_memory_allows() {
+        const GB: u64 = 1 << 30;
+        const MB: usize = 1 << 20;
+        assert_eq!(driver_memory(1000), 64 << 20);
+        assert_eq!(driver_memory(MB / 2), 768 << 20);
+        assert_eq!((driver_memory(MB), driver_memory(8 * MB)), (3 << 29, 3 << 29));
+        assert_eq!(driver_memory(28 * MB), 3 * GB);
+        assert_eq!(driver_fits(&[], 0, 1), Some(usize::MAX), "the first one always");
+        // one 1 MB program running holds 8 + 1.5 GB: with 13 GB free anything may start
+        assert_eq!(driver_fits(&[MB], 13 * GB, 2), Some(usize::MAX));
+        // with 12 GB free, 2.5 GB is left: any but a huge one
+        assert_eq!(driver_fits(&[MB], 12 * GB, 2), Some(HUGE));
+        // with 10 GB free, 0.5 GB is left: programs up to a third of a MB
+        assert_eq!(driver_fits(&[MB], 10 * GB, 2), Some((GB / 2 / 1536) as usize));
+        // with 9.5 GB free none
+        assert_eq!(driver_fits(&[MB], 9 * GB + GB / 2, 2), None);
+    }
+
+    /// Huge programs never hold every driver thread: at most `huge_most` at once, and with two
+    /// threads or more one is left for the rest.
+    #[test]
+    fn huge_programs_leave_driver_threads_free() {
+        const MB: usize = 1 << 20;
+        assert_eq!([0, 1, 2, 3, 8, 16].map(huge_most), [1, 1, 1, 2, 2, 2]);
+        let plenty = 100u64 << 30;
+        assert_eq!(driver_fits(&[28 * MB], plenty, 2), Some(usize::MAX));
+        assert_eq!(driver_fits(&[28 * MB, MB, 13 * MB], plenty, 2), Some(HUGE));
+        assert_eq!(driver_fits(&[28 * MB], plenty, huge_most(2)), Some(HUGE));
+        // a program of exactly `HUGE` bytes is not huge
+        assert_eq!(driver_fits(&[HUGE, HUGE], plenty, 2), Some(usize::MAX));
+    }
 
     #[test]
     fn aggregates_console_shaders() {
