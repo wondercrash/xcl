@@ -76,6 +76,8 @@ struct Entry {
     call: bool,
     /// the PC list it is on
     list: usize,
+    /// where an indirect op's arguments are in unified memory (0: not there, or no such op)
+    args: usize,
 }
 
 struct Event {
@@ -191,8 +193,8 @@ impl Crumbs {
     /// Mark `id` as a report shows it.
     fn view(&self, id: u32) -> OpView {
         match self.entry(id) {
-            Some(e) => OpView { id, what: e.what.clone(), pso: e.pso, state: self.state(e), call: e.call, list: e.list },
-            None => OpView { id, what: "(overwritten)".to_owned(), pso: 0, state: "unknown", call: false, list: 0 },
+            Some(e) => OpView { id, what: e.what.clone(), pso: e.pso, state: self.state(e), call: e.call, list: e.list, args: e.args },
+            None => OpView { id, what: "(overwritten)".to_owned(), pso: 0, state: "unknown", call: false, list: 0, args: 0 },
         }
     }
 }
@@ -200,6 +202,20 @@ impl Crumbs {
 /// After the PC call of an op of console code on `list` (`pso`: its pipeline as bound).
 pub(super) unsafe fn after(list: *mut c_void, pso: usize, what: impl FnOnce() -> String) {
     record(list, pso, what, true);
+}
+
+/// `after` for an ExecuteIndirect whose arguments are at `args` in unified memory (0: not
+/// there): a report of the op not finished says what they hold then – counts the GPU made,
+/// which no line of the recording has.
+pub(super) unsafe fn after_indirect(list: *mut c_void, pso: usize, args: usize, what: impl FnOnce() -> String) {
+    let Some(id) = record(list, pso, what, true) else { return };
+    if args != 0 {
+        let _ = with_state(|| None, |s| {
+            if let Some(e) = s.entries[id as usize % SLOTS].as_mut().filter(|e| e.id == id) {
+                e.args = args;
+            }
+        });
+    }
 }
 
 /// An op console code skipped (nothing went to the PC list).
@@ -269,13 +285,13 @@ fn call_name(slot: usize) -> &'static str {
     }
 }
 
-unsafe fn record(list: *mut c_void, pso: usize, what: impl FnOnce() -> String, gpu: bool) {
+unsafe fn record(list: *mut c_void, pso: usize, what: impl FnOnce() -> String, gpu: bool) -> Option<u32> {
     if !on() || list.is_null() {
-        return;
+        return None;
     }
     let real_pso = super::pso_async::resolve(pso);
     let stand_in = if super::pso_async::is_pending(pso) { " [stand-in: pipeline still being built]" } else { "" };
-    push(list, real_pso, format!("{}{stand_in}", what()), gpu, false);
+    push(list, real_pso, format!("{}{stand_in}", what()), gpu, false)
 }
 
 unsafe fn device_of_list(list: *mut c_void) -> Option<ID3D12Device> {
@@ -300,7 +316,7 @@ unsafe fn push(list: *mut c_void, pso: usize, what: String, gpu: bool, call: boo
         for k in 0..2 {
             (*(s.words as *const AtomicU32).add(2 * slot + k)).store(0, Ordering::Release);
         }
-        s.entries[slot] = Some(Entry { id, pso, what, gpu, call, list: list as usize });
+        s.entries[slot] = Some(Entry { id, pso, what, gpu, call, list: list as usize, args: 0 });
         let ops = s.pending.entry(list as usize).or_default();
         if ops.len() >= SLOTS {
             // a list recorded and reset without ever being executed
@@ -431,16 +447,31 @@ struct OpView {
     state: &'static str,
     call: bool,
     list: usize,
+    args: usize,
 }
 
 impl OpView {
     fn text(&self) -> String {
         if self.call {
             format!("#{} {} ({})", self.id, self.what, self.state)
+        } else if self.args != 0 && !finished(self.state) {
+            format!("#{} {} ({}, {}; {})", self.id, self.what, shaders(self.pso), self.state, arguments_now(self.args))
         } else {
             format!("#{} {} ({}, {})", self.id, self.what, shaders(self.pso), self.state)
         }
     }
+}
+
+/// The first words of an indirect op's arguments at `at` as the CPU reads them now (a
+/// dispatch's three group counts first). A coherent window is the GPU's memory too; a sparse
+/// window's CPU view can be behind what the GPU wrote.
+fn arguments_now(at: usize) -> String {
+    if !crate::gpu::shader::readable(at, 20) {
+        return format!("its arguments at {at:#x} cannot be read");
+    }
+    let w = unsafe { (at as *const [u32; 5]).read_unaligned() };
+    let view = if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) { ", a sparse window's CPU view" } else { "" };
+    format!("its arguments at {at:#x} now hold [{:#x}, {:#x}, {:#x}, {:#x}, {:#x}]{view}", w[0], w[1], w[2], w[3], w[4])
 }
 
 /// The work of a mark is behind the GPU: an op finished or skipped, a call mark passed.
@@ -754,7 +785,7 @@ mod tests {
     }
 
     fn mark(id: u32, state: &'static str, call: bool) -> OpView {
-        OpView { id, what: if call { "CopyBufferRegion (console #15)".into() } else { "Dispatch 1x1x1".into() }, pso: 0, state, call, list: 0x10 }
+        OpView { id, what: if call { "CopyBufferRegion (console #15)".into() } else { "Dispatch 1x1x1".into() }, pso: 0, state, call, list: 0x10, args: 0 }
     }
 
     /// The GPU is put in the call whose mark it passed last, not at the next op: a dispatch
@@ -775,6 +806,19 @@ mod tests {
         let ops = [mark(1, "not reached", true)];
         assert!(culprit(&ops).unwrap().starts_with("the GPU is in the commands before the first mark"));
         assert!(culprit(&[mark(1, "passed", true), mark(2, "done", false)]).is_none());
+    }
+
+    /// An ExecuteIndirect the GPU has not finished says what its arguments hold now (group
+    /// counts the GPU made: a wrong one is a dispatch that does not end); a finished one does not.
+    #[test]
+    fn an_unfinished_indirect_op_shows_its_arguments() {
+        let args = [0xFFFF_FFF0u32, 1, 1, 0, 0];
+        let op = |state| OpView { args: args.as_ptr() as usize, what: "ExecuteIndirect max 1".into(), ..mark(7, state, false) };
+        for state in ["not started", "running"] {
+            assert!(op(state).text().ends_with(&format!("{state}; its arguments at {:#x} now hold [0xfffffff0, 0x1, 0x1, 0x0, 0x0])", args.as_ptr() as usize)), "{}", op(state).text());
+        }
+        assert!(!op("done").text().contains("arguments"));
+        assert!(!mark(7, "running", false).text().contains("arguments"), "an op with no arguments in unified memory");
     }
 
     fn on(list: usize, mut m: OpView) -> OpView {

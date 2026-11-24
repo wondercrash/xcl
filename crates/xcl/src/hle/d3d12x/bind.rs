@@ -250,6 +250,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
+    // (where the arguments are in unified memory: a stalled op's breadcrumb reads them)
+    let args_at = super::real::title_address(args).map_or(0, |p| p + args_off as usize);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
         // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
@@ -272,7 +274,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             list.SetGraphicsRootSignature(r);
         }
         pc(this, sig, max, args, args_off, count_buf, count_off);
-        super::breadcrumbs::after(this, with(this, |s| s.pso), || format!("ExecuteIndirect max {max} with a PC pipeline (args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
+        super::breadcrumbs::after_indirect(this, with(this, |s| s.pso), args_at, || format!("ExecuteIndirect max {max} with a PC pipeline (args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
         return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -289,7 +291,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             count(if gfx { DRAWS } else { DISPATCHES });
             pc(this, sig, max, args, args_off, count_buf, count_off);
             let kind = if gfx { "draws" } else { "dispatches" };
-            super::breadcrumbs::after(this, with(this, |s| s.pso), || format!("ExecuteIndirect max {max} ({kind}; args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
+            super::breadcrumbs::after_indirect(this, with(this, |s| s.pso), args_at, || format!("ExecuteIndirect max {max} ({kind}; args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
