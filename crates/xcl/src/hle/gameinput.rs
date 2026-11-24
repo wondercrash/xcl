@@ -11,13 +11,16 @@
 //! thread for an asynchronous one); reading callbacks get a reading when the state changes
 //! (polled at 250 Hz). Methods not listed log their slot once and fail.
 //!
-//! `XCL_PRESS_A_AT=s1,s2…`: press A for 200 ms at those seconds after start (tests).
+//! `XCL_PRESS_AT=s:BUTTON,…` / `XCL_PRESS_A_AT=s1,s2…`: scripted presses (tests): a button goes
+//! down at those seconds after start and stays down for at least 200 ms AND until two readings
+//! the title took saw it, then up for 100 ms / two readings before the next press of that button.
+//! Each press logs once when a reading first sees it.
 
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -218,28 +221,34 @@ fn start() -> Instant {
     *T.get_or_init(Instant::now)
 }
 
+/// The buttons by their names in `XCL_PRESS_AT`.
+const BUTTON_NAMES: [(&str, u32); 12] = [
+    ("A", A),
+    ("B", B),
+    ("X", X),
+    ("Y", Y),
+    ("UP", DPAD_UP),
+    ("DOWN", DPAD_DOWN),
+    ("LEFT", DPAD_LEFT),
+    ("RIGHT", DPAD_RIGHT),
+    ("MENU", MENU),
+    ("VIEW", VIEW),
+    ("LB", LEFT_SHOULDER),
+    ("RB", RIGHT_SHOULDER),
+];
+
 /// A button by its name in `XCL_PRESS_AT`.
 fn button_named(name: &str) -> Option<u32> {
-    Some(match name.to_ascii_uppercase().as_str() {
-        "A" => A,
-        "B" => B,
-        "X" => X,
-        "Y" => Y,
-        "UP" => DPAD_UP,
-        "DOWN" => DPAD_DOWN,
-        "LEFT" => DPAD_LEFT,
-        "RIGHT" => DPAD_RIGHT,
-        "MENU" => MENU,
-        "VIEW" => VIEW,
-        "LB" => LEFT_SHOULDER,
-        "RB" => RIGHT_SHOULDER,
-        _ => return None,
-    })
+    BUTTON_NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|&(_, b)| b)
+}
+
+fn button_label(button: u32) -> &'static str {
+    BUTTON_NAMES.iter().find(|&&(_, b)| b == button).map_or("?", |&(n, _)| n)
 }
 
 /// `XCL_PRESS_AT=s:BUTTON,…` ("14:A,18.5:DOWN,20:A"; buttons A B X Y UP DOWN LEFT RIGHT MENU
-/// VIEW LB RB) and `XCL_PRESS_A_AT=s,…`: buttons held for 200 ms at those seconds after the
-/// host started (the log's times) – a title's menus walked without a person at the controls.
+/// VIEW LB RB) and `XCL_PRESS_A_AT=s,…`: buttons pressed from those seconds after the host
+/// started (the log's times) – a title's menus walked without a person at the controls.
 fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
     let mut v: Vec<(f64, u32)> = a_only.split(',').filter_map(|s| s.trim().parse().ok()).map(|s| (s, A)).collect();
     for item in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -251,15 +260,125 @@ fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
     v
 }
 
-fn scripted() -> u32 {
-    static AT: OnceLock<Vec<(f64, u32)>> = OnceLock::new();
-    let at = AT.get_or_init(|| {
-        let var = |n: &str| std::env::var(n).unwrap_or_default();
-        parse_presses(&var("XCL_PRESS_AT"), &var("XCL_PRESS_A_AT"))
-    });
-    // seconds since the host started, as the log's times (not since the title first polled)
+/// How long a scripted press is held at least.
+const PRESS_HOLD_S: f64 = 0.2;
+/// How many readings must see a press down before it is let go.
+const PRESS_MIN_READS: u32 = 2;
+/// How long, and in how many readings, a button is up between two presses of it.
+const PRESS_GAP_S: f64 = 0.1;
+const PRESS_GAP_READS: u32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PressPhase {
+    /// not yet due, or waiting for the earlier press of the same button to be let go
+    Pending,
+    /// held; `reads` readings have seen it down
+    Down { reads: u32 },
+    /// let go at `since`; `reads` readings have seen it up
+    Up { since: f64, reads: u32 },
+    Done,
+}
+
+#[derive(Debug)]
+struct Press {
+    at: f64,
+    button: u32,
+    phase: PressPhase,
+}
+
+/// Scripted presses as a latch: a press goes down at its time and stays down until
+/// [`PRESS_HOLD_S`] have passed AND [`PRESS_MIN_READS`] readings saw it – a title whose reading
+/// thread stalls for longer than a fixed window would otherwise never see it – then stays up for
+/// [`PRESS_GAP_S`] and [`PRESS_GAP_READS`] readings before the next press of the same button, so
+/// two presses never merge. Pure over (time, reading): the clock is the caller's.
+struct PressLatch {
+    presses: Vec<Press>,
+}
+
+impl PressLatch {
+    fn new(mut script: Vec<(f64, u32)>) -> Self {
+        script.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Self { presses: script.into_iter().map(|(at, button)| Press { at, button, phase: PressPhase::Pending }).collect() }
+    }
+
+    /// Move presses along at time `t` and return the buttons now down.
+    fn advance(&mut self, t: f64) -> u32 {
+        let mut down = 0;
+        for i in 0..self.presses.len() {
+            let Press { at, button, phase } = self.presses[i];
+            let mut phase = phase;
+            if phase == PressPhase::Pending && t >= at && !self.presses[..i].iter().any(|p| p.button == button && p.phase != PressPhase::Done) {
+                phase = PressPhase::Down { reads: 0 };
+            }
+            if let PressPhase::Down { reads } = phase {
+                if t >= at + PRESS_HOLD_S && reads >= PRESS_MIN_READS {
+                    phase = PressPhase::Up { since: t, reads: 0 };
+                }
+            }
+            if let PressPhase::Up { since, reads } = phase {
+                if t >= since + PRESS_GAP_S && reads >= PRESS_GAP_READS {
+                    phase = PressPhase::Done;
+                }
+            }
+            if matches!(phase, PressPhase::Down { .. }) {
+                down |= button;
+            }
+            self.presses[i].phase = phase;
+        }
+        down
+    }
+
+    /// Readings of weight `n` were taken (or handed over): count them for every press down or up.
+    /// `first_seen(i, at, button)` is called for press `i` (0-based) when its first reading sees it.
+    fn count_reads(&mut self, n: u32, mut first_seen: impl FnMut(usize, f64, u32)) {
+        for (i, p) in self.presses.iter_mut().enumerate() {
+            match &mut p.phase {
+                PressPhase::Down { reads } => {
+                    if *reads == 0 {
+                        first_seen(i, p.at, p.button);
+                    }
+                    *reads += n;
+                }
+                PressPhase::Up { reads, .. } => *reads += n,
+                _ => {}
+            }
+        }
+    }
+
+    /// A reading at `t`: the buttons down in it.
+    fn read(&mut self, t: f64, first_seen: impl FnMut(usize, f64, u32)) -> u32 {
+        let down = self.advance(t);
+        self.count_reads(1, first_seen);
+        down
+    }
+}
+
+static PRESS_LATCH: LazyLock<Mutex<PressLatch>> = LazyLock::new(|| {
+    let var = |n: &str| std::env::var(n).unwrap_or_default();
+    Mutex::new(PressLatch::new(parse_presses(&var("XCL_PRESS_AT"), &var("XCL_PRESS_A_AT"))))
+});
+
+fn log_press_seen(n: usize, at: f64, button: u32, t: f64) {
+    crate::xlog_info!("GameInput: scripted press {} ({} at {at} s) seen at {t:.2} s", n + 1, button_label(button));
+}
+
+/// The scripted buttons now; `counted` when the title is handed the result as a reading.
+/// Seconds since the host started, as the log's times (not since the title first polled).
+fn scripted(counted: bool) -> u32 {
     let t = crate::log::uptime();
-    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
+    let mut l = PRESS_LATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if counted {
+        l.read(t, |n, at, b| log_press_seen(n, at, b, t))
+    } else {
+        l.advance(t)
+    }
+}
+
+/// A state made by an uncounted [`poll_peek`] was pushed to the title's reading callbacks: a
+/// callback delivery is not skipped by a stalled reader, so it counts as enough readings.
+fn scripted_delivered() {
+    let t = crate::log::uptime();
+    PRESS_LATCH.lock().unwrap_or_else(|e| e.into_inner()).count_reads(PRESS_MIN_READS, |n, at, b| log_press_seen(n, at, b, t));
 }
 
 #[link(name = "user32")]
@@ -299,8 +418,20 @@ fn merge_host_inputs(
     s.buttons |= read_scripted();
 }
 
-/// the gamepad now
+/// the gamepad now, as a reading the title is handed (scripted presses count it)
 pub fn poll() -> GamepadState {
+    let s = sample(true);
+    note_first_presses(s.buttons);
+    s
+}
+
+/// the gamepad now without counting it as a reading: for the poller, whose states reach the
+/// title only if a reading callback takes them (see [`scripted_delivered`])
+fn poll_peek() -> GamepadState {
+    sample(false)
+}
+
+fn sample(counted: bool) -> GamepadState {
     let mut s = xinput_pad().unwrap_or_default();
     merge_host_inputs(
         &mut s,
@@ -310,17 +441,18 @@ pub fn poll() -> GamepadState {
             unsafe { keyboard() }
         },
         super::kbm::apply,
-        scripted,
+        || scripted(counted),
     );
-    {
-        // the first presses of each button: worth a line (is input arriving at all?)
-        static SEEN: AtomicU32 = AtomicU32::new(0);
-        let new = s.buttons & !SEEN.fetch_or(s.buttons, Ordering::Relaxed);
-        if new != 0 {
-            crate::xlog_info!("GameInput: gamepad buttons {new:#x} pressed for the first time");
-        }
-    }
     s
+}
+
+/// the first presses of each button the title was handed: worth a line (is input arriving at all?)
+fn note_first_presses(buttons: u32) {
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    let new = buttons & !SEEN.fetch_or(buttons, Ordering::Relaxed);
+    if new != 0 {
+        crate::xlog_info!("GameInput: gamepad buttons {new:#x} pressed for the first time");
+    }
 }
 
 fn now_us() -> u64 {
@@ -798,12 +930,14 @@ fn start_poller() {
             let mut last = GamepadState::default();
             loop {
                 std::thread::sleep(Duration::from_millis(4));
-                let s = poll();
+                let s = poll_peek();
                 if s == last {
                     continue;
                 }
                 last = s;
                 dispatch_reading_callbacks(s);
+                scripted_delivered();
+                note_first_presses(s.buttons);
             }
         });
     });
@@ -1025,6 +1159,47 @@ mod tests {
             assert_eq!(reading_release(r), 0);
             assert_eq!(get_current_reading(g, 0x10, std::ptr::null_mut(), &mut r), GAMEINPUT_E_READING_NOT_FOUND, "keyboard kind");
         }
+    }
+
+    /// reads at `times`: (buttons per read, (read time, press index) per first sighting)
+    fn drive(script: Vec<(f64, u32)>, times: impl IntoIterator<Item = f64>) -> (Vec<u32>, Vec<(f64, usize)>) {
+        let mut latch = PressLatch::new(script);
+        let mut seen = Vec::new();
+        let mut out = Vec::new();
+        for t in times {
+            out.push(latch.read(t, |n, _, _| seen.push((t, n))));
+        }
+        (out, seen)
+    }
+
+    #[test]
+    fn slow_readings_still_see_every_press_and_presses_do_not_merge() {
+        // readings 500 ms apart: a 200 ms window would fall between two of them
+        let (down, seen) = drive(vec![(1.0, A), (1.5, A), (1.0, B)], (0..11).map(|i| i as f64 * 0.5));
+        // sorted: 0 = A@1.0, 1 = B@1.0, 2 = A@1.5
+        assert_eq!(down, vec![0, 0, A | B, A | B, 0, 0, A, A, 0, 0, 0]);
+        assert_eq!(seen, vec![(1.0, 0), (1.0, 1), (3.0, 2)]);
+    }
+
+    #[test]
+    fn a_press_between_two_distant_readings_is_seen_by_the_next_ones() {
+        // the title's reader stalls from 5.0 to 20.0: the press due at 10 is down in the first
+        // reading after it, and in the next one
+        let (down, seen) = drive(vec![(10.0, A)], [5.0, 20.0, 20.05, 20.1]);
+        assert_eq!(down, vec![0, A, A, 0]);
+        assert_eq!(seen, vec![(20.0, 0)]);
+    }
+
+    #[test]
+    fn fast_readings_hold_a_press_for_200_ms_and_a_second_press_follows_after_a_gap() {
+        let (down, seen) = drive(vec![(1.0, A), (1.25, A)], (0..2000).map(|ms| ms as f64 / 1000.0));
+        assert_eq!(down[999], 0);
+        assert_eq!(down[1000], A);
+        let last = (1000..2000).find(|&i| down[i + 1] != A).unwrap();
+        assert!((1199..=1201).contains(&last), "first press let go after {last} ms");
+        // the second press waits for the first to be up 100 ms and two readings
+        assert_eq!(seen.len(), 2);
+        assert!((1.3..1.32).contains(&seen[1].0), "second press first seen at {}", seen[1].0);
     }
 
     #[test]
