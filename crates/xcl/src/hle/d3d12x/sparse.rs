@@ -444,6 +444,11 @@ static WORK: Mutex<Option<Gpu>> = Mutex::new(None);
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// `Gpu::queue`, for `queue` (`late_release` asks for it from inside a release)
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
+/// `Gpu::fence` and `Gpu::rb_fence` once more: `hub_state` reads their completed values while a
+/// submission holds `WORK` (it can sleep there for 5 s in `wait_for`).
+static STATUS_FENCES: Mutex<Option<(ID3D12Fence, ID3D12Fence)>> = Mutex::new(None);
+/// The fence value a submission sleeps on in `wait_for` right now (0: none does).
+static WAIT_FOR_TARGET: AtomicU64 = AtomicU64::new(0);
 
 fn work() -> std::sync::MutexGuard<'static, Option<Gpu>> {
     WORK.lock().unwrap()
@@ -606,6 +611,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     match made {
         Ok((gpu, state)) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
+            *STATUS_FENCES.lock().unwrap() = Some((gpu.fence.clone(), gpu.rb_fence.clone()));
             // what this replaces (the windows set up again) goes after the locks: the release of
             // its last buffers reaches `forget_buffer`, which takes the state (#344)
             let queue = gpu.queue.clone();
@@ -966,7 +972,9 @@ impl Gpu {
             return;
         }
         let _ = self.fence.SetEventOnCompletion(target, self.event);
+        WAIT_FOR_TARGET.store(target, Ordering::Relaxed);
         windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
+        WAIT_FOR_TARGET.store(0, Ordering::Relaxed);
         if self.fence.GetCompletedValue() < target {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
         }
@@ -1553,7 +1561,16 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
 pub fn hub_state() -> String {
     let g = match WORK.try_lock() {
         Ok(g) => g,
-        Err(std::sync::TryLockError::WouldBlock) => return "sparse queue held by a submission".to_owned(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // (the fences' completed values, and the value a submission sleeps on in `wait_for`)
+            let Some((fence, rb)) = STATUS_FENCES.lock().unwrap().clone() else { return "sparse queue held by a submission".to_owned() };
+            let (done, rb_done) = unsafe { (fence.GetCompletedValue(), rb.GetCompletedValue()) };
+            let sleeps = match WAIT_FOR_TARGET.load(Ordering::Relaxed) {
+                0 => String::new(),
+                t => format!(", which waits for {t}"),
+            };
+            return format!("sparse queue held by a submission{sleeps}: at {done}, readback fence at {rb_done}");
+        }
         Err(std::sync::TryLockError::Poisoned(_)) => return "sparse queue poisoned".to_owned(),
     };
     let Some(gpu) = g.as_ref() else { return "no sparse queue".to_owned() };

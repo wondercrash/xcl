@@ -1718,6 +1718,16 @@ pub(super) fn register_rect_list_gs_for_test(pso: usize) {
 }
 
 #[cfg(test)]
+pub(super) fn register_two_pass_for_test(pso: usize) {
+    if pso != 0 {
+        TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+            pso,
+            std::sync::Arc::new(TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" }),
+        );
+    }
+}
+
+#[cfg(test)]
 pub(super) fn register_translated_graphics_for_test(pso: usize) {
     if pso != 0 {
         TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
