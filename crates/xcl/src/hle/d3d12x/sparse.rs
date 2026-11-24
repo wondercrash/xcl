@@ -2173,7 +2173,9 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     let tiles: Vec<(usize, (u32, u32))> = {
         let mut b = gpu.st();
         let s = &mut *b;
-        let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| (t, e.pool))).collect();
+        // (one decommitted since `ensure_mapped` is parked: still mapped, and the pin keeps
+        // `flush_parked` from freeing its pool tile)
+        let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| e.pool).or_else(|| s.parked.get(&t).copied()).map(|p| (t, p))).collect();
         for &(_, tile) in &tiles {
             *s.pinned.entry(tile).or_default() += 1;
         }
