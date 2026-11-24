@@ -39,13 +39,38 @@ fn journal_of(target: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// This binary (size and time written): what `pipelines.done` is valid for.
-fn binary_key() -> u64 {
+/// This binary (size and time written) on this GPU and driver (`gpu`): what `pipelines.done` is
+/// valid for. A driver update drops the driver's cached pipelines, so they are made again.
+fn binary_key(gpu: u64) -> u64 {
     let m = std::env::current_exe().and_then(std::fs::metadata);
     m.map_or(0, |m| {
         let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64);
-        crate::gpu::shader::fnv64(&[m.len().to_le_bytes(), t.to_le_bytes()].concat())
+        crate::gpu::shader::fnv64(&[m.len().to_le_bytes(), t.to_le_bytes(), gpu.to_le_bytes()].concat())
     })
+}
+
+/// A worker's stack: the driver's compile of a title's biggest compute programs (up to ~1.2 MB of
+/// DXIL) runs on it, and a translation layer's (vkd3d-proton under Wine) went past 64 MB.
+/// Address space only: pages are committed as used.
+const WARM_STACK: usize = 512 << 20;
+
+/// `pipelines.trying`: the pipelines in the making now, written whole at each change, so a run cut
+/// short (a crash, or Ctrl+C) leaves the next run exactly those.
+struct Trying {
+    file: std::fs::File,
+    now: Vec<u64>,
+}
+
+impl Trying {
+    fn set(&mut self, hash: u64, on: bool) {
+        if on {
+            self.now.push(hash);
+        } else {
+            self.now.retain(|&h| h != hash);
+        }
+        let bytes: Vec<u8> = self.now.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let _ = self.file.set_len(0).and_then(|_| self.file.rewind()).and_then(|_| self.file.write_all(&bytes));
+    }
 }
 
 #[derive(Default)]
@@ -159,7 +184,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    let dev = match device(&adapter_setting(&journal)) {
+    let (dev, gpu_key) = match device(&adapter_setting(&journal)) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("xcl pipelines: no GPU device: {e}");
@@ -192,7 +217,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     let q = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
     // what an earlier run of this binary finished
     let done_path = journal.with_extension("done");
-    let key = binary_key();
+    let key = binary_key(gpu_key);
     let mut done_file = match open_done(&done_path, key) {
         Ok((f, done)) => {
             q.0.lock().unwrap().taken.extend(done);
@@ -218,7 +243,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         eprintln!("xcl pipelines: the last run ended while making {} pipelines: left to the title", crashed.len());
     }
     let trying = match std::fs::File::create(&trying_path) {
-        Ok(f) => Mutex::new(f),
+        Ok(f) => Mutex::new(Trying { file: f, now: Vec::new() }),
         Err(e) => {
             eprintln!("xcl pipelines: {}: {e}", trying_path.display());
             return 2;
@@ -266,9 +291,10 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
                 }
             });
         }
+        let mut workers = Vec::new();
         for k in 0..threads {
             let (q, dev, made, failed, skipped, reasons, done_tx, gpu, started, trying) = (&q, &dev, &made, &failed, &skipped, &reasons, &done_tx, &gpu, &started, &trying);
-            let _ = std::thread::Builder::new().name(format!("xcl-warm-{k}")).stack_size(64 << 20).spawn_scoped(s, move || loop {
+            let w = std::thread::Builder::new().name(format!("xcl-warm-{k}")).stack_size(WARM_STACK).spawn_scoped(s, move || loop {
                 let item = {
                     let mut g = q.0.lock().unwrap();
                     loop {
@@ -288,7 +314,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
                     }
                 };
                 let (hash, replay) = item;
-                let _ = trying.lock().unwrap().write_all(&hash.to_le_bytes());
+                trying.lock().unwrap().set(hash, true);
                 let r = match &replay {
                     None => Err("not readable from the journal".to_string()),
                     // the driver's compiles, few at once (the biggest take ~1.5 GB each)
@@ -314,13 +340,26 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
                 if done {
                     let _ = done_tx.lock().unwrap().write_all(&hash.to_le_bytes());
                 }
-                let n = made.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed);
-                if n % 100 == 0 {
-                    let left = q.0.lock().unwrap().left();
-                    let rate = n as f64 / t0.elapsed().as_secs_f64().max(0.001);
-                    eprintln!("  {n} done, {left} left ({rate:.1}/s, ~{:.0} min to go)", left as f64 / rate.max(0.001) / 60.0);
-                }
+                trying.lock().unwrap().set(hash, false);
             });
+            workers.extend(w);
+        }
+        // progress every 10 s, also while the driver takes long over the biggest programs
+        let (mut last, mut said) = (0, false);
+        while !workers.iter().all(|w| w.is_finished()) {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if t0.elapsed().as_secs() < last + 10 {
+                continue;
+            }
+            last = t0.elapsed().as_secs();
+            let n = made.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed) + skipped.load(Ordering::Relaxed);
+            let (left, busy) = (q.0.lock().unwrap().left(), trying.lock().unwrap().now.len());
+            let rate = n as f64 / t0.elapsed().as_secs_f64().max(0.001);
+            eprintln!("  {n} done, {busy} being made, {left} left ({rate:.1}/s)");
+            if rate < 1.0 && busy > 0 && !said {
+                said = true;
+                eprintln!("  (the biggest compute programs take 30 s or more each in the driver; stopping is safe, a re-run goes on from here)");
+            }
         }
     });
     // ended by itself: nothing was cut short
@@ -376,14 +415,17 @@ fn adapter_setting(journal: &Path) -> String {
     }
 }
 
-fn device(adapter: &str) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Device, String> {
+/// The device, and its adapter's vendor, device and driver version (for `binary_key`).
+fn device(adapter: &str) -> Result<(windows::Win32::Graphics::Direct3D12::ID3D12Device, u64), String> {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Dxgi::*;
     unsafe {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
         let sel = crate::gpu::adapter::Selector::from_env_or(adapter);
-        let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
-        crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())
+        let (adapter, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+        let umd = adapter.CheckInterfaceSupport(&<IDXGIDevice as windows::core::Interface>::IID).unwrap_or(0);
+        let key = crate::gpu::shader::fnv64(&[(desc.VendorId as u64) << 32 | desc.DeviceId as u64, umd as u64].map(u64::to_le_bytes).concat());
+        Ok((crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?, key))
     }
 }
 
@@ -435,6 +477,26 @@ mod tests {
         assert_eq!(q.ingest(&mut f), 2, "3 and 4, read from where the torn frame began");
         drop(f);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn trying_holds_only_the_pipelines_being_made() {
+        let path = std::env::temp_dir().join(format!("xcl-trying-test-{}.trying", std::process::id()));
+        let mut t = Trying { file: std::fs::File::create(&path).unwrap(), now: Vec::new() };
+        t.set(1, true);
+        t.set(2, true);
+        t.set(3, true);
+        t.set(1, false); // made
+        t.set(3, false); // failed: tried again by the next run, not left to the title
+        drop(t);
+        assert_eq!(std::fs::read(&path).unwrap(), 2u64.to_le_bytes());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn another_gpu_or_driver_starts_the_done_file_over() {
+        assert_eq!(binary_key(5), binary_key(5));
+        assert_ne!(binary_key(5), binary_key(6));
     }
 
     #[test]
