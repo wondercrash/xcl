@@ -5906,6 +5906,53 @@ fn gpu_split_wave64_cross_half_operations() {
     }
 }
 
+/// Scalar loads in the split form: in a group of one console wave every one is exchanged
+/// (half 0's words for all 64 threads), GLC or not, so memory written during the dispatch
+/// cannot give the halves different branches; with several console waves per group only GLC
+/// ones are. One-wave programs meet at group barriers from 1 MiB of HLSL on, smaller ones and
+/// multi-wave ones through the bounded counters. On the GPU both forms give the loaded words.
+#[test]
+fn gpu_split_wave64_scalar_loads_and_the_barrier_form() {
+    use super::{dxc, CsInterface};
+    type Inst<'a> = (&'a str, &'a str, &'a [(&'a str, u64)], Option<u32>);
+    // s[8:9] = 0: the test memory
+    let plain: Inst = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 4), ("OFFSET", 0), ("SOFFSET", 125)], None);
+    let glc: Inst = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 4), ("OFFSET", 0), ("SOFFSET", 125), ("GLC", 1)], None);
+    let add: Inst = ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 5), ("VSRC1", 5)], None);
+    let small = prog(&[plain, glc]);
+    let mut list = vec![plain, glc];
+    list.extend(std::iter::repeat(add).take(20_000));
+    let big = prog(&list);
+    let split = |code: &[u8], threads: u32| {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        let t = translate(code, &Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl
+    };
+    let spin = |h: &str| if h.contains("\n#define XCL_X_SPIN 1\n") { 1 } else { assert!(h.contains("\n#define XCL_X_SPIN 0\n")); 0 };
+    if std::env::var_os("XCL_WAVE64_SPIN").is_none() {
+        for (code, threads, words, want_spin) in [(&small, 64, 8, 1), (&small, 128, 4, 1), (&big, 64, 8, 0), (&big, 128, 4, 1)] {
+            let h = split(code, threads);
+            assert_eq!(h.len() >= 1 << 20, code.len() > small.len(), "{} B of HLSL", h.len());
+            assert_eq!(h.matches("= xcl_x_get0(").count(), words, "{threads} threads, {} B: exchanged load words", h.len());
+            assert_eq!(spin(&h), want_spin, "{threads} threads, {} B: XCL_X_SPIN", h.len());
+        }
+    }
+    if !gpu_ready() || !runner::split_wave64() {
+        return;
+    }
+    // a one-wave kernel: as translated (small: counters) and in the group-barrier form
+    let t = translate(&small, &runner::options(Mode::Kernel)).unwrap();
+    assert_eq!(spin(&t.hlsl), 1);
+    let mem = [0xABCDu32, 0x1234, 0x5678, 0x9ABC];
+    for h in [t.hlsl.clone(), t.hlsl.replacen("\n#define XCL_X_SPIN 1\n", "\n#define XCL_X_SPIN 0\n", 1)] {
+        let dxil = dxc::compile(&h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let r = runner::run(&dxil, &KernelState::default(), &mem).unwrap();
+        assert_eq!(&r.sgpr[12..16], &mem, "s_load_dwordx4, spin {}", spin(&h));
+        assert_eq!(&r.sgpr[16..20], &mem, "s_load_dwordx4 glc, spin {}", spin(&h));
+    }
+}
+
 /// Masks only read lane by lane (`x64_masks`): a v_cndmask selector and a 64-bit carry chain,
 /// both with bits in the two halves, need no exchange in the split form – and give the same
 /// lanes as a whole-wave mask.
