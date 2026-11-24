@@ -4824,8 +4824,10 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 /// `xcl pipelines`: a journal's pipeline made on `dev` (a plain device of this process) as
 /// `translated_graphics_pso` / `translated_compute_pso` make it, which fills the DXIL cache
 /// and the driver's, and released. `driver` is held around the driver's compile only (few of
-/// those at once; translation and DXC run freely). Err: what kept it from being made.
-pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay, driver: impl FnOnce() -> G) -> Result<(), String> {
+/// those at once; translation and DXC run freely). A compute program over `max_dxil` bytes of
+/// DXIL (`XCL_PRECOMPILE_MAX_DXIL`) is translated but left to the title (`over_max_dxil`), as
+/// `xcl shaders --precompile --pipelines` does. Err: what kept it from being made.
+pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay, max_dxil: Option<usize>, driver: impl FnOnce() -> G) -> Result<(), String> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     use windows::core::Interface;
     let this = dev.as_raw();
@@ -4860,6 +4862,7 @@ pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay,
             if disk.as_deref().is_some_and(std::path::Path::is_file) {
                 return Ok(());
             }
+            over_max_dxil(compiled.dxil.len(), max_dxil)?;
             // a big one as the title's background makes it: one at a time (huge ones in a lane of
             // their own), within the commit left
             let _big = (compiled.dxil.len() >= BIG_DRIVER_COMPILE).then(|| big_compile_turn(big_compile_lane(compiled.dxil.len()).0, big_compile_commit_free, || false));
@@ -4875,6 +4878,29 @@ pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay,
         }
     };
     made.map(drop).map_err(|e| format!("the driver refused it: {e}"))
+}
+
+/// `warm`'s size cap: Err (with "left to the title", which `xcl pipelines` counts as done) when
+/// `dxil` bytes are over `most`; a program the driver may never finish (a retail title's
+/// 9.8 MB ray-shadow program) would hold a big-compile lane, and every later one, for good.
+fn over_max_dxil(dxil: usize, most: Option<usize>) -> Result<(), String> {
+    match most {
+        Some(most) if dxil > most => Err(format!("{dxil} B of DXIL, over XCL_PRECOMPILE_MAX_DXIL ({most}) – left to the title")),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod over_max_dxil_tests {
+    /// Only programs over the cap are left to the title, and the reason says so in the words
+    /// `xcl pipelines` counts as done.
+    #[test]
+    fn only_programs_over_the_cap_are_left_to_the_title() {
+        assert_eq!(super::over_max_dxil(9 << 20, None), Ok(()));
+        assert_eq!(super::over_max_dxil(8 << 20, Some(8 << 20)), Ok(()));
+        let e = super::over_max_dxil((8 << 20) + 1, Some(8 << 20)).unwrap_err();
+        assert!(e.contains("left to the title"), "{e}");
+    }
 }
 
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {

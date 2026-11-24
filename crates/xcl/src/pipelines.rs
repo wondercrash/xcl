@@ -19,7 +19,8 @@ xcl pipelines <game folder | title data folder | pipelines.bin> [--watch] [--thr
   Compiles the pipelines a run of the title asked for (<data>\\cache\\pipelines.bin) outside
   the title: the DXIL cache and the driver's cache. --watch: also while the title runs,
   following what it adds (stop with Ctrl+C). --threads: pipelines at once (default: half the
-  cores, at below-normal priority; XCL_PIPELINE_THREADS caps the driver compiles, default 4, 2 with --watch).";
+  cores, at below-normal priority; XCL_PIPELINE_THREADS caps the driver compiles, default 4, 2 with --watch).
+  XCL_PRECOMPILE_MAX_DXIL (bytes, e.g. 8M): compute programs with more DXIL are left to the title.";
 
 /// The journal of `target`: the file itself, a data folder with one, or a game folder.
 fn journal_of(target: &Path) -> Result<PathBuf, String> {
@@ -206,6 +207,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     crate::gpu::recomp::dxc::set_memory_reserve(6);
     let gpu_most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(if watch { 2 } else { 4usize }).max(1);
     let threads = opt("--threads").unwrap_or(half).max(1);
+    let max_dxil = crate::shaders::max_dxil("xcl pipelines");
 
     let mut file = match std::fs::File::open(&journal) {
         Ok(f) => f,
@@ -259,11 +261,12 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     {
         let g = q.0.lock().unwrap();
         println!(
-            "{}: {first} pipelines to make ({} the title used), {already} done before, {} shaders; {} memory windows; {threads} threads, {gpu_most} driver compiles at once{}",
+            "{}: {first} pipelines to make ({} the title used), {already} done before, {} shaders; {} memory windows; {threads} threads, {gpu_most} driver compiles at once{}{}",
             journal.display(),
             g.used.len(),
             g.shaders.len(),
             g.windows,
+            max_dxil.map_or(String::new(), |most| format!("; compute programs over {most} B of DXIL left to the title")),
             if watch { "; following the journal (Ctrl+C stops)" } else { "" }
         );
     }
@@ -293,7 +296,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         }
         let mut workers = Vec::new();
         for k in 0..threads {
-            let (q, dev, made, failed, skipped, reasons, done_tx, gpu, started, trying) = (&q, &dev, &made, &failed, &skipped, &reasons, &done_tx, &gpu, &started, &trying);
+            let (q, dev, made, failed, skipped, reasons, done_tx, gpu, started, trying, max_dxil) = (&q, &dev, &made, &failed, &skipped, &reasons, &done_tx, &gpu, &started, &trying, max_dxil);
             let w = std::thread::Builder::new().name(format!("xcl-warm-{k}")).stack_size(WARM_STACK).spawn_scoped(s, move || loop {
                 let item = {
                     let mut g = q.0.lock().unwrap();
@@ -318,7 +321,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
                 let r = match &replay {
                     None => Err("not readable from the journal".to_string()),
                     // the driver's compiles, few at once (the biggest take ~1.5 GB each)
-                    Some(r) => unsafe { crate::hle::d3d12x::real::warm(dev, r, || DriverSlot::take(gpu, gpu_most)) },
+                    Some(r) => unsafe { crate::hle::d3d12x::real::warm(dev, r, max_dxil, || DriverSlot::take(gpu, gpu_most)) },
                 };
                 // done: made, or left to the title; a failure is tried again by the next run
                 let done = match r {

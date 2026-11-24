@@ -830,6 +830,17 @@ pub(crate) fn parse_bytes(s: &str) -> Option<usize> {
     digits.trim_end().parse::<usize>().ok()?.checked_mul(1 << shift)
 }
 
+/// `XCL_PRECOMPILE_MAX_DXIL` (`parse_bytes`): the most DXIL bytes a compute program `tool` sends
+/// to the driver may have; None (no cap) when unset or not a byte count (said on stderr).
+pub(crate) fn max_dxil(tool: &str) -> Option<usize> {
+    let v = std::env::var("XCL_PRECOMPILE_MAX_DXIL").ok()?;
+    let most = parse_bytes(&v);
+    if most.is_none() {
+        eprintln!("{tool}: XCL_PRECOMPILE_MAX_DXIL={v} is not a byte count (e.g. 8388608 or 8M): no cap");
+    }
+    most
+}
+
 /// Work waiting for a slow consumer, handed out biggest first. A push never waits: the queue
 /// holds the translated DXIL until the driver takes it (a retail pack's compute programs come
 /// to a few GB at most, and what they hold is in the free memory `driver_fits` sees).
@@ -909,13 +920,7 @@ impl Pipelines {
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
             let threads = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores / 2).max(1);
-            let max_dxil = std::env::var("XCL_PRECOMPILE_MAX_DXIL").ok().and_then(|v| {
-                let most = parse_bytes(&v);
-                if most.is_none() {
-                    eprintln!("xcl shaders: XCL_PRECOMPILE_MAX_DXIL={v} is not a byte count (e.g. 8388608 or 8M): no cap");
-                }
-                most
-            });
+            let max_dxil = max_dxil("xcl shaders");
             Ok(Pipelines {
                 dev,
                 signatures: Mutex::new(Default::default()),
