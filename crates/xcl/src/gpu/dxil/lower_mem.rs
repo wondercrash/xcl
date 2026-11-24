@@ -114,84 +114,271 @@ enum At {
     Lds(Value),
 }
 
+/// Hoisted descriptor-level format info for `FormatLoad` / `FormatStore`.
+#[derive(Clone, Copy)]
+pub struct FmtDesc {
+    pub info: Value,
+    pub n: Value,
+    pub ty: Value,
+    pub isint: Value,
+    pub nb: Value,
+    pub has: Value,
+    pub t: [Value; 6],
+}
+
+/// Hoisted single-component format decode parameters for `BUFFER_LOAD_FORMAT_X`
+/// (and 1-component `d16` format loads), computed once in `d3`'s defining block.
+#[derive(Clone, Copy)]
+pub struct FmtComp1 {
+    pub desc: FmtDesc,
+    pub s0: Value,
+    pub s1: Value,
+    pub one_val: Value,
+    pub off_bytes: Value,
+    pub off_bits: Value,
+    pub big: Value,
+    pub sh: Value,
+    pub mu: Value,
+    pub maxu: Value,
+    pub maxs: Value,
+    pub w16: Value,
+    pub w32: Value,
+    pub mb: Value,
+    pub mmask: Value,
+    pub mshift: Value,
+    pub den_scale: Value,
+    pub cge: Value,
+    pub dflt: Value,
+}
+
 impl Lw {
-    /// Runs `f` on the memory window the last `window` selected (`mem`, `mem1`.. at u2..):
-    /// a switch over the windows when the program may address several, as the HLSL kernel's
-    /// `xcl_m*` accessors; returns `f`'s value (i32 or i64).
-    fn with_mem(&mut self, f: &mut dyn FnMut(&mut Lw, RawUav) -> Option<Value>) -> Option<Value> {
-        if let Some(coherent) = self.heap_mem {
-            return self.with_heap_mem(coherent, f);
-        }
-        if self.mems.len() <= 1 {
-            let m = self.mems[0];
-            return f(self, m);
-        }
-        let w = self.rd(super::lower::VAR_WIN);
-        let (tl, th) = (self.tmp_var(), self.tmp_var());
-        let z = self.c(0);
-        self.wr(tl, z);
-        self.wr(th, z);
-        let mut kind = 0u8; // 0 none, 1 i32, 2 i64
-        let mems = self.mems.clone();
-        for (k, &m) in mems.iter().enumerate() {
-            // a window outside them matches none (the `switch` default: reads 0, stores
-            // and atomics dropped)
-            let is = self.cmpc(Pred::Eq, w, k as u32);
-            let _ = self.guarded(is, &mut |lw| {
-                if let Some(v) = f(lw, m) {
-                    let t = lw.s.m.type_of(v);
-                    if t == lw.s.m.i64() {
-                        let (l, h) = lw.unpack64(v);
-                        lw.wr(tl, l);
-                        lw.wr(th, h);
-                        kind = 2;
-                    } else {
-                        lw.wr(tl, v);
-                        kind = 1;
-                    }
-                }
-                Ok(())
-            });
-        }
-        match kind {
-            0 => None,
-            1 => Some(self.rd(tl)),
-            _ => {
-                let (l, h) = (self.rd(tl), self.rd(th));
-                Some(self.pack64(l, h))
+    /// Runs `f` on the active memory window (`mem`, `mem1`.. at u2.., or descriptor heap
+    /// when `self.heap_mem` is set via `XCL_HEAP_WINDOWS`), returning `out_tys.len()` values
+    /// merged across the window arms via a single `switch` (or single guarded heap lookup)
+    /// and direct phis (`f` must not write SSA variables). Out-of-range windows (`w >= n`)
+    /// jump to `join` (reads 0, stores and atomics dropped), matching `#1693` semantics.
+    pub(crate) fn with_mem_many_tys(
+        &mut self,
+        mut guard: Option<Value>,
+        out_tys: &[super::module::Ty],
+        f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>,
+    ) -> Vec<Value> {
+        if let Some(c) = guard {
+            match self.s.m.const_u64(c) {
+                Some(1) => guard = None,
+                Some(0) => return out_tys.iter().map(|&t| self.s.m.const_int(t, 0)).collect(),
+                _ => {}
             }
         }
+        // Descriptor-heap windows (`#1693`, `XCL_HEAP_WINDOWS=1`): single guarded heap lookup
+        // combined with `guard`, stacking cleanly with vector loads/stores & FormatLoad opt.
+        if let Some(coherent) = self.heap_mem {
+            let windows = self.mems.len() as u32;
+            let w = self.rd(super::lower::VAR_WIN);
+            let inside = self.cmpc(Pred::ULt, w, windows);
+            let cond = match guard {
+                Some(g) => self.and(g, inside),
+                None => inside,
+            };
+            if self.s.m.const_u64(cond) == Some(0) {
+                return out_tys.iter().map(|&t| self.s.m.const_int(t, 0)).collect();
+            }
+            if self.s.m.const_u64(cond) == Some(1) {
+                let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
+                let m = self.s.heap_raw_buffer_uav(i, coherent);
+                let vals = f(self, m);
+                debug_assert_eq!(vals.len(), out_tys.len());
+                return vals;
+            }
+            let from = self.cur();
+            let then = self.block(None);
+            let join = self.block(None);
+            self.cond_br(cond, then, join);
+            self.seal(then);
+            self.s.m.set_block(then);
+            #[cfg(debug_assertions)]
+            self.ssa.begin_log();
+            let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
+            let m = self.s.heap_raw_buffer_uav(i, coherent);
+            let vals = f(self, m);
+            #[cfg(debug_assertions)]
+            debug_assert!(self.ssa.end_log().is_empty(), "with_mem closure wrote SSA var");
+            debug_assert_eq!(vals.len(), out_tys.len());
+            let end = self.cur();
+            self.s.m.br(join);
+            self.ssa.seal_region_join(join, from, from, Vec::new());
+            self.s.m.set_block(join);
+            let mut out = Vec::with_capacity(out_tys.len());
+            for (j, &ty) in out_tys.iter().enumerate() {
+                let z = self.s.m.const_int(ty, 0);
+                let phi = self.s.m.phi(ty);
+                self.s.m.add_incoming(phi, z, from);
+                self.s.m.add_incoming(phi, vals[j], end);
+                out.push(phi);
+            }
+            return out;
+        }
+        // Single window, or window known at translation time: at most one branch for `guard`.
+        let fixed_mem = if self.mems.len() <= 1 {
+            Some(self.mems[0])
+        } else {
+            let w = self.rd(super::lower::VAR_WIN);
+            if let Some(k) = self.s.m.const_u64(w) {
+                if (k as usize) < self.mems.len() {
+                    Some(self.mems[k as usize])
+                } else {
+                    return out_tys.iter().map(|&t| self.s.m.const_int(t, 0)).collect();
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(m) = fixed_mem {
+            let Some(cond) = guard else {
+                let vals = f(self, m);
+                debug_assert_eq!(vals.len(), out_tys.len());
+                return vals;
+            };
+            let from = self.cur();
+            let then = self.block(None);
+            let join = self.block(None);
+            self.cond_br(cond, then, join);
+            self.seal(then);
+            self.s.m.set_block(then);
+            #[cfg(debug_assertions)]
+            self.ssa.begin_log();
+            let vals = f(self, m);
+            #[cfg(debug_assertions)]
+            debug_assert!(self.ssa.end_log().is_empty(), "with_mem closure wrote SSA var");
+            debug_assert_eq!(vals.len(), out_tys.len());
+            let end = self.cur();
+            self.s.m.br(join);
+            self.ssa.seal_region_join(join, from, from, Vec::new());
+            self.s.m.set_block(join);
+            let mut out = Vec::with_capacity(out_tys.len());
+            for (j, &ty) in out_tys.iter().enumerate() {
+                let z = self.s.m.const_int(ty, 0);
+                let phi = self.s.m.phi(ty);
+                self.s.m.add_incoming(phi, z, from);
+                self.s.m.add_incoming(phi, vals[j], end);
+                out.push(phi);
+            }
+            return out;
+        }
+        // Multi-window dispatch via a single LLVM `switch` (default -> `join` for out-of-range
+        // or inactive lane, matching `#1693` window semantics).
+        let w = self.rd(super::lower::VAR_WIN);
+        let mems = self.mems.clone();
+        let n = mems.len();
+        let from = self.cur();
+        let arms: Vec<super::module::Block> = (0..n).map(|_| self.block(None)).collect();
+        let join = self.block(None);
+        let w_eff = if let Some(cond) = guard {
+            let skip = self.c(n as u32);
+            self.sel(cond, w, skip)
+        } else {
+            w
+        };
+        let cases: Vec<(Value, super::module::Block)> = (0..n).map(|k| (self.c(k as u32), arms[k])).collect();
+        self.s.m.switch(w_eff, join, &cases);
+        for &arm in &arms {
+            self.edge(from, arm);
+            self.seal(arm);
+        }
+        let mut arm_vals: Vec<Vec<Value>> = Vec::with_capacity(n);
+        let mut arm_ends: Vec<super::module::Block> = Vec::with_capacity(n);
+        for (k, &m) in mems.iter().enumerate() {
+            self.s.m.set_block(arms[k]);
+            #[cfg(debug_assertions)]
+            self.ssa.begin_log();
+            let vals = f(self, m);
+            #[cfg(debug_assertions)]
+            debug_assert!(self.ssa.end_log().is_empty(), "with_mem closure wrote SSA var");
+            debug_assert_eq!(vals.len(), out_tys.len());
+            arm_ends.push(self.cur());
+            arm_vals.push(vals);
+            self.s.m.br(join);
+        }
+        self.ssa.seal_region_join(join, from, from, Vec::new());
+        self.s.m.set_block(join);
+        let mut out = Vec::with_capacity(out_tys.len());
+        for (j, &ty) in out_tys.iter().enumerate() {
+            let phi = self.s.m.phi(ty);
+            let z = self.s.m.const_int(ty, 0);
+            self.s.m.add_incoming(phi, z, from);
+            for k in 0..n {
+                self.s.m.add_incoming(phi, arm_vals[k][j], arm_ends[k]);
+            }
+            out.push(phi);
+        }
+        out
+    }
+
+    pub(crate) fn with_mem_i32s(
+        &mut self,
+        guard: Option<Value>,
+        n: usize,
+        f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>,
+    ) -> Vec<Value> {
+        let i32 = self.s.m.i32();
+        let tys = vec![i32; n];
+        self.with_mem_many_tys(guard, &tys, f)
+    }
+
+    pub(crate) fn with_mem_void(
+        &mut self,
+        guard: Option<Value>,
+        f: &mut dyn FnMut(&mut Lw, RawUav),
+    ) {
+        let _ = self.with_mem_many_tys(guard, &[], &mut |lw, m| {
+            f(lw, m);
+            Vec::new()
+        });
     }
     fn mraw_atomic(&mut self, op: AtomicOp, a: Value, v: Value) -> Value {
-        self.with_mem(&mut |lw, m| Some(lw.s.raw_atomic(m, op, a, v))).expect("atomic value")
+        let ty = self.s.m.type_of(v);
+        self.with_mem_many_tys(None, &[ty], &mut |lw, m| vec![lw.s.raw_atomic(m, op, a, v)])[0]
     }
     fn mraw_cmpxchg(&mut self, a: Value, c: Value, n: Value) -> Value {
-        self.with_mem(&mut |lw, m| Some(lw.s.raw_cmpxchg(m, a, c, n))).expect("cmpxchg value")
+        let ty = self.s.m.type_of(c);
+        self.with_mem_many_tys(None, &[ty], &mut |lw, m| vec![lw.s.raw_cmpxchg(m, a, c, n)])[0]
     }
     /// `mem.Load(a & ~3)`
     pub fn mem_ld(&mut self, a: Value) -> Value {
         let a = self.andc(a, !3);
-        self.with_mem(&mut |lw, m| Some(lw.s.raw_load(m, a, 1)[0])).expect("load value")
+        self.with_mem_i32s(None, 1, &mut |lw, m| lw.s.raw_load(m, a, 1))[0]
+    }
+    /// `mem.Load2/3/4(a & ~3)` (1..=4 consecutive dwords in one window switch).
+    pub(crate) fn mem_ld_n(&mut self, guard: Option<Value>, a: Value, count: u32) -> Vec<Value> {
+        debug_assert!((1..=4).contains(&count));
+        let a = self.andc(a, !3);
+        let mask = ((1u32 << count) - 1) as u8;
+        self.with_mem_i32s(guard, count as usize, &mut |lw, m| lw.s.raw_load(m, a, mask))
     }
     /// `mem.Store(a & ~3, v)`
     pub fn mem_st(&mut self, a: Value, v: Value) {
         let a = self.andc(a, !3);
-        self.with_mem(&mut |lw, m| {
-            lw.s.raw_store(m, a, &[v]);
-            None
-        });
+        self.with_mem_void(None, &mut |lw, m| lw.s.raw_store(m, a, &[v]));
+    }
+    /// `mem.Store1..4(a & ~3, vals)` in one window switch.
+    fn mem_st_n(&mut self, guard: Option<Value>, a: Value, vals: &[Value]) {
+        debug_assert!((1..=4).contains(&vals.len()));
+        let a = self.andc(a, !3);
+        self.with_mem_void(guard, &mut |lw, m| lw.s.raw_store(m, a, vals));
     }
 
-    /// `ld_raw`: four dwords from an unaligned byte address.
-    fn ld_raw(&mut self, a: Value) -> [Value; 4] {
+    /// `ld_raw`: four dwords from an unaligned byte address (one Load4 + one Load1
+    /// in a single window switch, optionally combined with a lane guard).
+    fn ld_raw_guarded(&mut self, guard: Option<Value>, a: Value) -> [Value; 4] {
         let b = self.andc(a, !3);
+        let b16 = self.addc(b, 16);
         let s = self.andc(a, 3);
         let s = self.shlc(s, 3);
-        let mut w = Vec::new();
-        for k in 0..5 {
-            let at = self.addc(b, 4 * k);
-            w.push(self.mem_ld(at));
-        }
+        let w = self.with_mem_i32s(guard, 5, &mut |lw, m| {
+            let mut v = lw.s.raw_load(m, b, 0xF);
+            v.push(lw.s.raw_load(m, b16, 1)[0]);
+            v
+        });
         let k32 = self.c(32);
         let inv = self.sub(k32, s);
         let inv = self.andc(inv, 31);
@@ -204,6 +391,22 @@ impl Lw {
             r[i] = self.sel(sz, w[i], x);
         }
         r
+    }
+
+    /// One unaligned dword from byte address `a` (one Load2 in a single window switch).
+    fn ld_raw_u32_guarded(&mut self, guard: Option<Value>, a: Value) -> Value {
+        let b = self.andc(a, !3);
+        let s = self.andc(a, 3);
+        let s = self.shlc(s, 3);
+        let w = self.with_mem_i32s(guard, 2, &mut |lw, m| lw.s.raw_load(m, b, 0x3));
+        let k32 = self.c(32);
+        let inv = self.sub(k32, s);
+        let inv = self.andc(inv, 31);
+        let sz = self.cmpc(Pred::Eq, s, 0);
+        let lo = self.bin(BinOp::LShr, w[0], s);
+        let hi = self.bin(BinOp::Shl, w[1], inv);
+        let x = self.or(lo, hi);
+        self.sel(sz, w[0], x)
     }
     /// `st_part`: atomically replace the bits `m` of the dword at `b` by `v`.
     fn st_part(&mut self, b: Value, m: Value, v: Value) {
@@ -272,8 +475,12 @@ impl Lw {
 
     // ------------------------------------------------------------ formats
 
-    /// `FMT_INFO[min(fmt, 77)]` (a constant table) for a dynamic format.
+    /// `FMT_INFO[min(fmt, 77)]` (a constant table) for a dynamic format; constant-folded
+    /// when `fmt` is known at translation time.
     pub(crate) fn fmt_info(&mut self, fmt: Value) -> Value {
+        if let Some(k) = self.s.m.const_u64(fmt) {
+            return self.c(buf_format_info(k.min(77) as usize));
+        }
         let i32 = self.s.m.i32();
         let g = match self.fmt_table {
             Some(g) => g,
@@ -291,6 +498,128 @@ impl Lw {
         let z = self.c(0);
         let p = self.s.m.gep(g, &[z, i]);
         self.s.m.load(p, 4)
+    }
+    /// Emits pure instructions into `v`'s defining block (before its terminator if already
+    /// terminated) so every use of `v` can share them without duplicating across branches.
+    fn in_def_block<T>(&mut self, v: Value, f: impl FnOnce(&mut Lw) -> T) -> T {
+        let Some(b) = self.s.m.def_block(v) else {
+            return f(self);
+        };
+        let cur = self.cur();
+        if b == cur {
+            return f(self);
+        }
+        let prev_ins = self.s.m.set_insert_before_term(true);
+        self.s.m.set_block(b);
+        let r = f(self);
+        self.s.m.set_block(cur);
+        self.s.m.set_insert_before_term(prev_ins);
+        r
+    }
+    fn fmt_desc(&mut self, d3: Value, mtbuf_fmt: Option<u32>) -> FmtDesc {
+        let key = (d3, mtbuf_fmt);
+        if let Some(&cached) = self.fmt_desc_cache.get(&key) {
+            return cached;
+        }
+        let anchor = if mtbuf_fmt.is_some() { self.c(0) } else { d3 };
+        let desc = self.in_def_block(anchor, |lw| {
+            let fmt = match mtbuf_fmt {
+                Some(k) => lw.c(k),
+                None => {
+                    let x = lw.lshrc(d3, 12);
+                    lw.andc(x, 0x7F)
+                }
+            };
+            let info = lw.fmt_info(fmt);
+            let n = lw.andc(info, 7);
+            let ty = lw.lshrc(info, 3);
+            let ty = lw.andc(ty, 7);
+            let t = [0, 1, 2, 3, 4, 5].map(|k| lw.cmpc(Pred::Eq, ty, k));
+            let isint = lw.lor(t[4], t[5]);
+            let nb = lw.fmt_bytes(info);
+            let has = lw.nz(n);
+            FmtDesc { info, n, ty, isint, nb, has, t }
+        });
+        self.fmt_desc_cache.insert(key, desc);
+        desc
+    }
+    fn fmt_comp1(&mut self, d3: Value, mtbuf_fmt: Option<u32>) -> FmtComp1 {
+        let key = (d3, mtbuf_fmt);
+        if let Some(&cached) = self.fmt_comp1_cache.get(&key) {
+            return cached;
+        }
+        let desc = self.fmt_desc(d3, mtbuf_fmt);
+        let c1 = self.in_def_block(d3, |lw| {
+            let sel = lw.andc(d3, 7);
+            let s0 = lw.cmpc(Pred::Eq, sel, 0);
+            let s1 = lw.cmpc(Pred::Eq, sel, 1);
+            let one = lw.c(1);
+            let onef = lw.c(0x3F80_0000);
+            let one_val = lw.sel(desc.isint, one, onef);
+            let k4 = lw.c(4);
+            let ci = lw.sub(sel, k4);
+            let ci = lw.andc(ci, 3);
+            let z = lw.c(0);
+            let w0 = lw.lshrc(desc.info, 8);
+            let w0 = lw.andc(w0, 63);
+            let w1 = lw.lshrc(desc.info, 14);
+            let w1 = lw.andc(w1, 63);
+            let w2 = lw.lshrc(desc.info, 20);
+            let w2 = lw.andc(w2, 63);
+            let gt0 = lw.cmpc(Pred::UGt, ci, 0);
+            let gt1 = lw.cmpc(Pred::UGt, ci, 1);
+            let gt2 = lw.cmpc(Pred::UGt, ci, 2);
+            let o0 = lw.sel(gt0, w0, z);
+            let o1 = lw.sel(gt1, w1, z);
+            let o2 = lw.sel(gt2, w2, z);
+            let off = lw.add(o0, o1);
+            let off = lw.add(off, o2);
+            let off_bytes = lw.lshrc(off, 3);
+            let off_bits = lw.andc(off, 7);
+            let k6 = lw.c(6);
+            let c6 = lw.mul(ci, k6);
+            let sh_info = lw.addc(c6, 8);
+            let sh_info = lw.andc(sh_info, 31);
+            let w = lw.bin(BinOp::LShr, desc.info, sh_info);
+            let w = lw.andc(w, 63);
+            let big = lw.cmpc(Pred::UGe, w, 32);
+            let k32 = lw.c(32);
+            let sh = lw.sub(k32, w);
+            let sh = lw.andc(sh, 31);
+            let w31 = lw.andc(w, 31);
+            let mu = lw.bin(BinOp::Shl, one, w31);
+            let mu = lw.sub(mu, one);
+            let maxu = lw.uitof(mu);
+            let fmaxu = lw.fc(4294967295.0);
+            let maxu = lw.sel(big, fmaxu, maxu);
+            let wm1 = lw.sub(w, one);
+            let wm1 = lw.andc(wm1, 31);
+            let ms = lw.bin(BinOp::Shl, one, wm1);
+            let ms = lw.sub(ms, one);
+            let maxs = lw.uitof(ms);
+            let fmaxs = lw.fc(2147483647.0);
+            let maxs = lw.sel(big, fmaxs, maxs);
+            let w11 = lw.cmpc(Pred::Eq, w, 11);
+            let w16 = lw.cmpc(Pred::Eq, w, 16);
+            let w32 = lw.cmpc(Pred::Eq, w, 32);
+            let k5 = lw.c(5);
+            let mb = lw.sel(w11, k6, k5);
+            let k63 = lw.c(63);
+            let k31 = lw.c(31);
+            let mmask = lw.sel(w11, k63, k31);
+            let k17 = lw.c(17);
+            let k18 = lw.c(18);
+            let mshift = lw.sel(w11, k17, k18);
+            let sc6 = lw.s.m.f32c(0x3580_0000); // 2^-20
+            let sc5 = lw.s.m.f32c(0x3600_0000); // 2^-19
+            let den_scale = lw.sel(w11, sc6, sc5);
+            let cge = lw.cmp(Pred::ULe, desc.n, ci);
+            let is3 = lw.cmpc(Pred::Eq, ci, 3);
+            let dflt = lw.sel(is3, one_val, z);
+            FmtComp1 { desc, s0, s1, one_val, off_bytes, off_bits, big, sh, mu, maxu, maxs, w16, w32, mb, mmask, mshift, den_scale, cge, dflt }
+        });
+        self.fmt_comp1_cache.insert(key, c1);
+        c1
     }
     fn fmt_bytes(&mut self, info: Value) -> Value {
         let mut t = self.c(0);
@@ -340,74 +669,48 @@ impl Lw {
         let big = self.cmpc(Pred::UGe, w, 32);
         self.sel(big, v, vm)
     }
-    fn exp2f(&mut self, x: Value) -> Value {
-        self.un(super::ops_core::op::EXP, x)
-    }
-    fn uf_small(&mut self, v: Value, mb: Value) -> Value {
+    /// Exact IEEE-754 conversion of 10-bit (mb=5) or 11-bit (mb=6) unsigned float to f32 bits.
+    fn uf_small_bits(&mut self, v: Value, mb: Value, mmask: Value, mshift: Value, den_scale: Value) -> Value {
         let e = self.bin(BinOp::LShr, v, mb);
-        let one = self.c(1);
-        let p = self.bin(BinOp::Shl, one, mb);
-        let pm = self.sub(p, one);
-        let m = self.and(v, pm);
-        let fm = self.uitof(m);
-        let fp = self.uitof(p);
-        let fm = self.fdiv(fm, fp);
+        let m = self.and(v, mmask);
         let mnz = self.nz(m);
-        let qn = self.s.m.f32c(0x7FC0_0000);
-        let inf = self.s.m.f32c(0x7F80_0000);
+        let qn = self.c(0x7FC0_0000);
+        let inf = self.c(0x7F80_0000);
         let special = self.sel(mnz, qn, inf);
-        let m14 = self.fc(-14.0);
-        let p14 = self.exp2f(m14);
-        let den = self.fmul(fm, p14);
-        let ef = self.uitof(e);
-        let k15 = self.fc(15.0);
-        let eb = self.fsub(ef, k15);
-        let pe = self.exp2f(eb);
-        let one_f = self.fc(1.0);
-        let mant = self.fadd(one_f, fm);
-        let norm = self.fmul(pe, mant);
+        let fm = self.uitof(m);
+        let den = self.fmul(fm, den_scale);
+        let den = self.bits(den);
+        let eb = self.addc(e, 112);
+        let exp_bits = self.shlc(eb, 23);
+        let mant_bits = self.bin(BinOp::Shl, m, mshift);
+        let norm = self.or(exp_bits, mant_bits);
         let e0 = self.cmpc(Pred::Eq, e, 0);
         let r = self.sel(e0, den, norm);
         let e31 = self.cmpc(Pred::Eq, e, 31);
         self.sel(e31, special, r)
     }
-    fn fmt_comp(&mut self, r: &[Value; 4], info: Value, c: u32) -> Value {
-        let n = self.andc(info, 7);
-        let ty = self.lshrc(info, 3);
-        let ty = self.andc(ty, 7);
-        let t4 = self.cmpc(Pred::Eq, ty, 4);
-        let t5 = self.cmpc(Pred::Eq, ty, 5);
-        let isint = self.lor(t4, t5);
-        let mut off = self.c(0);
-        for k in 0..c {
-            let w = self.lshrc(info, 8 + 6 * k);
-            let w = self.andc(w, 63);
-            off = self.add(off, w);
-        }
-        let w = self.lshrc(info, (8 + 6 * c) & 31);
-        let w = self.andc(w, 63);
-        let v = self.bits_at(r, off, w);
-        let k32 = self.c(32);
-        let sh = self.sub(k32, w);
-        let sh = self.andc(sh, 31);
+    /// Decodes raw component bits `v` using pre-computed format parameters.
+    #[allow(clippy::too_many_arguments)]
+    fn fmt_decode_val(
+        &mut self,
+        v: Value,
+        desc: &FmtDesc,
+        big: Value,
+        sh: Value,
+        maxu: Value,
+        maxs: Value,
+        w16: Value,
+        w32: Value,
+        mb: Value,
+        mmask: Value,
+        mshift: Value,
+        den_scale: Value,
+        cge: Value,
+        dflt: Value,
+    ) -> Value {
         let x = self.bin(BinOp::Shl, v, sh);
         let x = self.bin(BinOp::AShr, x, sh);
-        let big = self.cmpc(Pred::UGe, w, 32);
         let sv = self.sel(big, v, x);
-        let w31 = self.andc(w, 31);
-        let one = self.c(1);
-        let mu = self.bin(BinOp::Shl, one, w31);
-        let mu = self.sub(mu, one);
-        let maxu = self.uitof(mu);
-        let fmaxu = self.fc(4294967295.0);
-        let maxu = self.sel(big, fmaxu, maxu);
-        let wm1 = self.sub(w, one);
-        let wm1 = self.andc(wm1, 31);
-        let ms = self.bin(BinOp::Shl, one, wm1);
-        let ms = self.sub(ms, one);
-        let maxs = self.uitof(ms);
-        let fmaxs = self.fc(2147483647.0);
-        let maxs = self.sel(big, fmaxs, maxs);
         let fv = self.uitof(v);
         let fsv = self.sitof(sv);
         let zf = self.fc(0.0);
@@ -428,32 +731,133 @@ impl Lw {
         let f_sn = self.bits(sn);
         let h = self.s.f16_to_f32(v);
         let hb = self.bits(h);
-        let w11 = self.cmpc(Pred::Eq, w, 11);
-        let k6 = self.c(6);
-        let k5 = self.c(5);
-        let mb = self.sel(w11, k6, k5);
-        let uf = self.uf_small(v, mb);
-        let ufb = self.bits(uf);
-        let w16 = self.cmpc(Pred::Eq, w, 16);
-        let w32 = self.cmpc(Pred::Eq, w, 32);
+        let ufb = self.uf_small_bits(v, mb, mmask, mshift, den_scale);
         let flt = self.sel(w16, hb, ufb);
         let flt = self.sel(w32, v, flt);
         let fvb = self.bits(fv);
         let fsvb = self.bits(fsv);
         let mut res = flt;
-        for (k, val) in [(5u32, sv), (4, v), (3, fsvb), (2, fvb), (1, f_sn), (0, f_un)] {
-            let is = self.cmpc(Pred::Eq, ty, k);
-            res = self.sel(is, val, res);
+        for (k, val) in [(5usize, sv), (4, v), (3, fsvb), (2, fvb), (1, f_sn), (0, f_un)] {
+            res = self.sel(desc.t[k], val, res);
         }
-        let cge = self.cmpc(Pred::ULe, n, c);
+        self.sel(cge, dflt, res)
+    }
+    fn fmt_comp(&mut self, r: &[Value; 4], desc: &FmtDesc, c: u32) -> Value {
+        let mut off = self.c(0);
+        for k in 0..c {
+            let w = self.lshrc(desc.info, 8 + 6 * k);
+            let w = self.andc(w, 63);
+            off = self.add(off, w);
+        }
+        let w = self.lshrc(desc.info, (8 + 6 * c) & 31);
+        let w = self.andc(w, 63);
+        let v = self.bits_at(r, off, w);
+        let k32 = self.c(32);
+        let sh = self.sub(k32, w);
+        let sh = self.andc(sh, 31);
+        let big = self.cmpc(Pred::UGe, w, 32);
+        let w31 = self.andc(w, 31);
+        let one = self.c(1);
+        let mu = self.bin(BinOp::Shl, one, w31);
+        let mu = self.sub(mu, one);
+        let maxu = self.uitof(mu);
+        let fmaxu = self.fc(4294967295.0);
+        let maxu = self.sel(big, fmaxu, maxu);
+        let wm1 = self.sub(w, one);
+        let wm1 = self.andc(wm1, 31);
+        let ms = self.bin(BinOp::Shl, one, wm1);
+        let ms = self.sub(ms, one);
+        let maxs = self.uitof(ms);
+        let fmaxs = self.fc(2147483647.0);
+        let maxs = self.sel(big, fmaxs, maxs);
+        let w11 = self.cmpc(Pred::Eq, w, 11);
+        let w16 = self.cmpc(Pred::Eq, w, 16);
+        let w32 = self.cmpc(Pred::Eq, w, 32);
+        let k6 = self.c(6);
+        let k5 = self.c(5);
+        let mb = self.sel(w11, k6, k5);
+        let k63 = self.c(63);
+        let k31 = self.c(31);
+        let mmask = self.sel(w11, k63, k31);
+        let k17 = self.c(17);
+        let k18 = self.c(18);
+        let mshift = self.sel(w11, k17, k18);
+        let sc6 = self.s.m.f32c(0x3580_0000);
+        let sc5 = self.s.m.f32c(0x3600_0000);
+        let den_scale = self.sel(w11, sc6, sc5);
+        let cge = self.cmpc(Pred::ULe, desc.n, c);
         let dflt = if c == 3 {
             let a = self.c(1);
             let b = self.c(0x3F80_0000);
-            self.sel(isint, a, b)
+            self.sel(desc.isint, a, b)
         } else {
             self.c(0)
         };
-        self.sel(cge, dflt, res)
+        self.fmt_decode_val(v, desc, big, sh, maxu, maxs, w16, w32, mb, mmask, mshift, den_scale, cge, dflt)
+    }
+    /// Decodes a single dynamically chosen component `ci` (0..3) from `r` (used for
+    /// 2- and 3-component `FormatLoad`s so unused channels are not decoded).
+    fn fmt_comp_dyn(&mut self, r: &[Value; 4], desc: &FmtDesc, ci: Value) -> Value {
+        let z = self.c(0);
+        let w0 = self.lshrc(desc.info, 8);
+        let w0 = self.andc(w0, 63);
+        let w1 = self.lshrc(desc.info, 14);
+        let w1 = self.andc(w1, 63);
+        let w2 = self.lshrc(desc.info, 20);
+        let w2 = self.andc(w2, 63);
+        let gt0 = self.cmpc(Pred::UGt, ci, 0);
+        let gt1 = self.cmpc(Pred::UGt, ci, 1);
+        let gt2 = self.cmpc(Pred::UGt, ci, 2);
+        let o0 = self.sel(gt0, w0, z);
+        let o1 = self.sel(gt1, w1, z);
+        let o2 = self.sel(gt2, w2, z);
+        let off = self.add(o0, o1);
+        let off = self.add(off, o2);
+        let k6 = self.c(6);
+        let c6 = self.mul(ci, k6);
+        let sh_info = self.addc(c6, 8);
+        let sh_info = self.andc(sh_info, 31);
+        let w = self.bin(BinOp::LShr, desc.info, sh_info);
+        let w = self.andc(w, 63);
+        let v = self.bits_at(r, off, w);
+        let k32 = self.c(32);
+        let sh = self.sub(k32, w);
+        let sh = self.andc(sh, 31);
+        let big = self.cmpc(Pred::UGe, w, 32);
+        let w31 = self.andc(w, 31);
+        let one = self.c(1);
+        let mu = self.bin(BinOp::Shl, one, w31);
+        let mu = self.sub(mu, one);
+        let maxu = self.uitof(mu);
+        let fmaxu = self.fc(4294967295.0);
+        let maxu = self.sel(big, fmaxu, maxu);
+        let wm1 = self.sub(w, one);
+        let wm1 = self.andc(wm1, 31);
+        let ms = self.bin(BinOp::Shl, one, wm1);
+        let ms = self.sub(ms, one);
+        let maxs = self.uitof(ms);
+        let fmaxs = self.fc(2147483647.0);
+        let maxs = self.sel(big, fmaxs, maxs);
+        let w11 = self.cmpc(Pred::Eq, w, 11);
+        let w16 = self.cmpc(Pred::Eq, w, 16);
+        let w32 = self.cmpc(Pred::Eq, w, 32);
+        let k5 = self.c(5);
+        let mb = self.sel(w11, k6, k5);
+        let k63 = self.c(63);
+        let k31 = self.c(31);
+        let mmask = self.sel(w11, k63, k31);
+        let k17 = self.c(17);
+        let k18 = self.c(18);
+        let mshift = self.sel(w11, k17, k18);
+        let sc6 = self.s.m.f32c(0x3580_0000);
+        let sc5 = self.s.m.f32c(0x3600_0000);
+        let den_scale = self.sel(w11, sc6, sc5);
+        let cge = self.cmp(Pred::ULe, desc.n, ci);
+        let is3 = self.cmpc(Pred::Eq, ci, 3);
+        let onef = self.c(0x3F80_0000);
+        let one_val = self.sel(desc.isint, one, onef);
+        let dflt = self.sel(is3, one_val, z);
+        self.fmt_decode_val(v, desc, big, sh, maxu, maxs, w16, w32, mb, mmask, mshift, den_scale, cge, dflt)
     }
     fn dst_sel(&mut self, c: &[Value; 4], sel: Value, isint: Value) -> Value {
         let k4 = self.c(4);
@@ -645,8 +1049,7 @@ impl Lw {
         let imm = Self::fv(d, "OFFSET") as u32;
         let soff = rdna2::field_value(d.enc, &d.words, "SOFFSET").unwrap_or(125);
         let soff = if soff == 125 { self.c(0) } else { self.code32(soff, None, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))? };
-        let mut vals = Vec::new();
-        if name.starts_with("s_buffer_load") {
+        let mut vals = if name.starts_with("s_buffer_load") {
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
             let k = self.c(imm);
             let off = self.add(k, soff);
@@ -656,14 +1059,28 @@ impl Lw {
             let sz = self.cmpc(Pred::Eq, st, 0);
             let lim = self.mul(d2, st);
             let lim = self.sel(sz, d2, lim);
-            for i in 0..count {
-                let o = self.addc(off, 4 * i);
-                let ok = self.cmp(Pred::ULt, o, lim);
-                let a = self.add(d0, o);
-                let v = self.mem_ld(a);
-                let z = self.c(0);
-                vals.push(self.sel(ok, v, z));
-            }
+            let base = self.add(d0, off);
+            let base_aligned = self.andc(base, !3);
+            let raw = self.with_mem_i32s(None, count as usize, &mut |lw, m| {
+                let mut out = Vec::with_capacity(count as usize);
+                let mut done = 0u32;
+                while done < count {
+                    let chunk = (count - done).min(4);
+                    let at = lw.addc(base_aligned, 4 * done);
+                    let mask = ((1u32 << chunk) - 1) as u8;
+                    out.extend(lw.s.raw_load(m, at, mask));
+                    done += chunk;
+                }
+                out
+            });
+            let z = self.c(0);
+            (0..count)
+                .map(|i| {
+                    let o = self.addc(off, 4 * i);
+                    let ok = self.cmp(Pred::ULt, o, lim);
+                    self.sel(ok, raw[i as usize], z)
+                })
+                .collect::<Vec<_>>()
         } else {
             let imm = ((imm << 11) as i32 >> 11) as u32;
             let b = self.sreg(sbase);
@@ -672,11 +1089,20 @@ impl Lw {
             self.window_at(hi, b, &[Ea::S(k), Ea::U(soff)], false);
             let a = self.add(b, k);
             let a = self.add(a, soff);
-            for i in 0..count {
-                let at = self.addc(a, 4 * i);
-                vals.push(self.mem_ld(at));
-            }
-        }
+            let base_aligned = self.andc(a, !3);
+            self.with_mem_i32s(None, count as usize, &mut |lw, m| {
+                let mut out = Vec::with_capacity(count as usize);
+                let mut done = 0u32;
+                while done < count {
+                    let chunk = (count - done).min(4);
+                    let at = lw.addc(base_aligned, 4 * done);
+                    let mask = ((1u32 << chunk) - 1) as u8;
+                    out.extend(lw.s.raw_load(m, at, mask));
+                    done += chunk;
+                }
+                out
+            })
+        };
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         if self.split && coherent {
             // both halves take the lower half's values
@@ -752,14 +1178,12 @@ impl Lw {
                 let nv = self.c(n);
                 return self.guarded(c, &mut |lw| lw.st_bytes(a, [data, z, z, z], nv));
             }
-            return self.guarded(act, &mut |lw| {
-                let r = lw.ld_raw(a);
-                let z = lw.c(0);
-                let raw = lw.sel(ok, r[0], z);
-                let nv = lw.d16_merge(v, raw, n, signed, half);
-                lw.vset(vdata, nv);
-                Ok(())
-            });
+            let r0 = self.ld_raw_u32_guarded(Some(act), a);
+            let z = self.c(0);
+            let raw = self.sel(ok, r0, z);
+            let nv = self.d16_merge(v, raw, n, signed, half);
+            self.write32(&Dst::V(vdata), nv);
+            return Ok(());
         }
         if let Some((n, signed, store)) = small {
             let nb = self.c(n);
@@ -771,131 +1195,201 @@ impl Lw {
                 let nv = self.c(n);
                 return self.guarded(c, &mut |lw| lw.st_bytes(a, [v, z, z, z], nv));
             }
-            return self.guarded(act, &mut |lw| {
-                let r = lw.ld_raw(a);
-                let bits = 8 * n;
-                let val = if signed {
-                    let x = lw.shlc(r[0], 32 - bits);
-                    lw.ashrc(x, 32 - bits)
-                } else {
-                    lw.andc(r[0], ((1u64 << bits) - 1) as u32)
-                };
-                let z = lw.c(0);
-                let val = lw.sel(ok, val, z);
-                lw.vset(vdata, val);
-                Ok(())
-            });
+            let r0 = self.ld_raw_u32_guarded(Some(act), a);
+            let bits = 8 * n;
+            let val = if signed {
+                let x = self.shlc(r0, 32 - bits);
+                self.ashrc(x, 32 - bits)
+            } else {
+                self.andc(r0, ((1u64 << bits) - 1) as u32)
+            };
+            let z = self.c(0);
+            let val = self.sel(ok, val, z);
+            self.write32(&Dst::V(vdata), val);
+            return Ok(());
         }
         match kind {
             BufKind::Load => {
-                let oks: Vec<Value> = (0..count).map(|i| {
-                    let b = self.c(4 * i as u32 + 4);
-                    in_range(self, b)
-                }).collect();
-                self.guarded(act, &mut |lw| {
-                    for i in 0..count {
-                        let at = lw.addc(a, 4 * i as u32);
-                        let v = lw.mem_ld(at);
-                        let z = lw.c(0);
-                        let v = lw.sel(oks[i as usize], v, z);
-                        lw.vset(vdata + i, v);
-                    }
-                    Ok(())
-                })
+                let oks: Vec<Value> = (0..count)
+                    .map(|i| {
+                        let b = self.c(4 * i as u32 + 4);
+                        in_range(self, b)
+                    })
+                    .collect();
+                let loaded = self.mem_ld_n(Some(act), a, count as u32);
+                let z = self.c(0);
+                for i in 0..count {
+                    let v = self.sel(oks[i as usize], loaded[i as usize], z);
+                    self.write32(&Dst::V(vdata + i), v);
+                }
+                Ok(())
             }
             BufKind::Store => {
                 let vals: Vec<Value> = (0..count).map(|i| self.vreg(vdata + i)).collect();
-                let oks: Vec<Value> = (0..count).map(|i| {
-                    let b = self.c(4 * i as u32 + 4);
-                    in_range(self, b)
-                }).collect();
-                self.guarded(act, &mut |lw| {
-                    for i in 0..count as usize {
-                        let at = lw.addc(a, 4 * i as u32);
-                        let v = vals[i];
-                        lw.guarded(oks[i], &mut |lw| {
-                            lw.mem_st(at, v);
-                            Ok(())
-                        })?;
-                    }
-                    Ok(())
-                })
+                let oks: Vec<Value> = (0..count)
+                    .map(|i| {
+                        let b = self.c(4 * i as u32 + 4);
+                        in_range(self, b)
+                    })
+                    .collect();
+                for i in 0..count as usize {
+                    let at = self.addc(a, 4 * i as u32);
+                    let c = self.land(act, oks[i]);
+                    self.mem_st_n(Some(c), at, &[vals[i]]);
+                }
+                Ok(())
             }
             BufKind::FormatLoad => {
-                let fmt = if d.enc.name == "ENC_MTBUF" {
-                    self.c(f("FORMAT") as u32)
-                } else {
-                    let x = self.lshrc(d3, 12);
-                    self.andc(x, 0x7F)
+                let mtbuf_fmt = (d.enc.name == "ENC_MTBUF").then_some(f("FORMAT") as u32);
+                let single_comp = match d16_format {
+                    Some((_, components, _)) => components == 1,
+                    None => count == 1,
                 };
-                let info = self.fmt_info(fmt);
-                let ty = self.lshrc(info, 3);
-                let ty = self.andc(ty, 7);
-                let t4 = self.cmpc(Pred::Eq, ty, 4);
-                let t5 = self.cmpc(Pred::Eq, ty, 5);
-                let isint = self.lor(t4, t5);
-                let nb = self.fmt_bytes(info);
-                let rng = in_range(self, nb);
-                let n7 = self.andc(info, 7);
-                let has = self.nz(n7);
-                let ok = self.land(has, rng);
-                let cur: Vec<Value> = (0..count).map(|i| self.vreg(vdata + i)).collect();
-                self.guarded(act, &mut |lw| {
-                    let r = lw.ld_raw(a);
-                    let c = [lw.fmt_comp(&r, info, 0), lw.fmt_comp(&r, info, 1), lw.fmt_comp(&r, info, 2), lw.fmt_comp(&r, info, 3)];
-                    let z = lw.c(0);
-                    if let Some((_, components, high)) = d16_format {
+                if single_comp {
+                    let c1 = self.fmt_comp1(d3, mtbuf_fmt);
+                    let rng = in_range(self, c1.desc.nb);
+                    let ok = self.land(c1.desc.has, rng);
+                    let ea = self.add(a, c1.off_bytes);
+                    let eb = self.andc(ea, !3);
+                    let ea3 = self.andc(ea, 3);
+                    let ea3_8 = self.shlc(ea3, 3);
+                    let s = self.or(ea3_8, c1.off_bits);
+                    let w = self.with_mem_i32s(Some(act), 2, &mut |lw, m| lw.s.raw_load(m, eb, 0x3));
+                    let lo = self.bin(BinOp::LShr, w[0], s);
+                    let k32 = self.c(32);
+                    let inv = self.sub(k32, s);
+                    let inv = self.andc(inv, 31);
+                    let hi = self.bin(BinOp::Shl, w[1], inv);
+                    let x = self.or(lo, hi);
+                    let sz = self.cmpc(Pred::Eq, s, 0);
+                    let v_raw = self.sel(sz, w[0], x);
+                    let vm = self.and(v_raw, c1.mu);
+                    let v = self.sel(c1.big, v_raw, vm);
+                    let dec = self.fmt_decode_val(
+                        v,
+                        &c1.desc,
+                        c1.big,
+                        c1.sh,
+                        c1.maxu,
+                        c1.maxs,
+                        c1.w16,
+                        c1.w32,
+                        c1.mb,
+                        c1.mmask,
+                        c1.mshift,
+                        c1.den_scale,
+                        c1.cge,
+                        c1.dflt,
+                    );
+                    let s_val = self.sel(c1.s1, c1.one_val, dec);
+                    let s_val = self.selc(c1.s0, 0, s_val);
+                    let z = self.c(0);
+                    if let Some((_, _, high)) = d16_format {
+                        let cur0 = self.vreg(vdata);
+                        let lo16 = self.andc(s_val, 0xFFFF);
+                        let sf = self.f(s_val);
+                        let h16 = self.s.f32_to_f16(sf);
+                        let h = self.sel(c1.desc.isint, lo16, h16);
+                        if high {
+                            let h = self.shlc(h, 16);
+                            let h = self.sel(ok, h, z);
+                            let l = self.andc(cur0, 0xFFFF);
+                            let res = self.or(l, h);
+                            self.write32(&Dst::V(vdata), res);
+                        } else {
+                            let res = self.sel(ok, h, z);
+                            self.write32(&Dst::V(vdata), res);
+                        }
+                    } else {
+                        let res = self.sel(ok, s_val, z);
+                        self.write32(&Dst::V(vdata), res);
+                    }
+                    return Ok(());
+                }
+                let desc = self.fmt_desc(d3, mtbuf_fmt);
+                let rng = in_range(self, desc.nb);
+                let ok = self.land(desc.has, rng);
+                let r = self.ld_raw_guarded(Some(act), a);
+                let z = self.c(0);
+                let num_comp = d16_format.map_or(count, |(_, components, _)| components);
+                if num_comp < 4 {
+                    let decode_sel = |lw: &mut Lw, comp: u64| -> Value {
+                        let sel = lw.lshrc(d3, 3 * comp as u32);
+                        let sel = lw.andc(sel, 7);
+                        let k4 = lw.c(4);
+                        let ci = lw.sub(sel, k4);
+                        let ci = lw.andc(ci, 3);
+                        let dec = lw.fmt_comp_dyn(&r, &desc, ci);
+                        let one = lw.c(1);
+                        let onef = lw.c(0x3F80_0000);
+                        let o = lw.sel(desc.isint, one, onef);
+                        let s1 = lw.cmpc(Pred::Eq, sel, 1);
+                        let v = lw.sel(s1, o, dec);
+                        let s0 = lw.cmpc(Pred::Eq, sel, 0);
+                        lw.selc(s0, 0, v)
+                    };
+                    if let Some((_, components, _)) = d16_format {
                         let half = |lw: &mut Lw, comp: u64| -> Value {
-                            let sel = lw.lshrc(d3, 3 * comp as u32);
-                            let sel = lw.andc(sel, 7);
-                            let s = lw.dst_sel(&c, sel, isint);
+                            let s = decode_sel(lw, comp);
                             let lo = lw.andc(s, 0xFFFF);
                             let sf = lw.f(s);
                             let h = lw.s.f32_to_f16(sf);
-                            lw.sel(isint, lo, h)
+                            lw.sel(desc.isint, lo, h)
                         };
-                        if high {
-                            let h = half(lw, 0);
-                            let h = lw.shlc(h, 16);
-                            let h = lw.sel(ok, h, z);
-                            let l = lw.andc(cur[0], 0xFFFF);
-                            let v = lw.or(l, h);
-                            lw.vset(vdata, v);
-                        } else {
-                            for i in 0..count {
-                                let lo = half(lw, 2 * i);
-                                let hi = if 2 * i + 1 < components { half(lw, 2 * i + 1) } else { z };
-                                let hi = lw.shlc(hi, 16);
-                                let v = lw.or(lo, hi);
-                                let v = lw.sel(ok, v, z);
-                                lw.vset(vdata + i, v);
-                            }
+                        for i in 0..count {
+                            let lo = half(self, 2 * i);
+                            let hi = if 2 * i + 1 < components { half(self, 2 * i + 1) } else { z };
+                            let hi = self.shlc(hi, 16);
+                            let v = self.or(lo, hi);
+                            let v = self.sel(ok, v, z);
+                            self.write32(&Dst::V(vdata + i), v);
                         }
-                        return Ok(());
+                    } else {
+                        for i in 0..count {
+                            let s = decode_sel(self, i);
+                            let v = self.sel(ok, s, z);
+                            self.write32(&Dst::V(vdata + i), v);
+                        }
                     }
-                    for i in 0..count {
-                        let sel = lw.lshrc(d3, 3 * i as u32);
+                    return Ok(());
+                }
+                let c = [self.fmt_comp(&r, &desc, 0), self.fmt_comp(&r, &desc, 1), self.fmt_comp(&r, &desc, 2), self.fmt_comp(&r, &desc, 3)];
+                if let Some((_, components, _)) = d16_format {
+                    let half = |lw: &mut Lw, comp: u64| -> Value {
+                        let sel = lw.lshrc(d3, 3 * comp as u32);
                         let sel = lw.andc(sel, 7);
-                        let s = lw.dst_sel(&c, sel, isint);
-                        let v = lw.sel(ok, s, z);
-                        lw.vset(vdata + i, v);
+                        let s = lw.dst_sel(&c, sel, desc.isint);
+                        let lo = lw.andc(s, 0xFFFF);
+                        let sf = lw.f(s);
+                        let h = lw.s.f32_to_f16(sf);
+                        lw.sel(desc.isint, lo, h)
+                    };
+                    for i in 0..count {
+                        let lo = half(self, 2 * i);
+                        let hi = if 2 * i + 1 < components { half(self, 2 * i + 1) } else { z };
+                        let hi = self.shlc(hi, 16);
+                        let v = self.or(lo, hi);
+                        let v = self.sel(ok, v, z);
+                        self.write32(&Dst::V(vdata + i), v);
                     }
-                    Ok(())
-                })
+                } else {
+                    for i in 0..count {
+                        let sel = self.lshrc(d3, 3 * i as u32);
+                        let sel = self.andc(sel, 7);
+                        let s = self.dst_sel(&c, sel, desc.isint);
+                        let v = self.sel(ok, s, z);
+                        self.write32(&Dst::V(vdata + i), v);
+                    }
+                }
+                Ok(())
             }
             BufKind::FormatStore => {
-                let fmt = if d.enc.name == "ENC_MTBUF" {
-                    self.c(f("FORMAT") as u32)
-                } else {
-                    let x = self.lshrc(d3, 12);
-                    self.andc(x, 0x7F)
-                };
-                let info = self.fmt_info(fmt);
-                let nb = self.fmt_bytes(info);
+                let mtbuf_fmt = (d.enc.name == "ENC_MTBUF").then_some(f("FORMAT") as u32);
+                let desc = self.fmt_desc(d3, mtbuf_fmt);
+                let info = desc.info;
+                let nb = desc.nb;
                 let rng = in_range(self, nb);
-                let n7 = self.andc(info, 7);
-                let has = self.nz(n7);
-                let ok = self.land(has, rng);
+                let ok = self.land(desc.has, rng);
                 let z = self.c(0);
                 let vals: [Value; 4] = if let Some((_, components, high)) = d16_format {
                     let ty = self.lshrc(info, 3);
@@ -1285,12 +1779,10 @@ impl Lw {
             }
             let vd = Self::fv(d, "VDST");
             let v = self.vreg(vd);
-            return self.guarded(act, &mut |lw| {
-                let r = lw.ld_raw(a);
-                let nv = lw.d16_merge(v, r[0], n, signed, half);
-                lw.vset(vd, nv);
-                Ok(())
-            });
+            let r0 = self.ld_raw_u32_guarded(Some(act), a);
+            let nv = self.d16_merge(v, r0, n, signed, half);
+            self.write32(&Dst::V(vd), nv);
+            return Ok(());
         }
         let (store, count) = match op {
             "load_dword" | "load_dword_addtid" => (false, 1),
@@ -1323,23 +1815,15 @@ impl Lw {
         };
         if store {
             let vals: Vec<Value> = (0..count).map(|i| self.vreg(Self::fv(d, "DATA") + i)).collect();
-            self.guarded(act, &mut |lw| {
-                for (i, &v) in vals.iter().enumerate() {
-                    let at = lw.addc(a, 4 * i as u32);
-                    lw.mem_st(at, v);
-                }
-                Ok(())
-            })
+            self.mem_st_n(Some(act), a, &vals);
+            Ok(())
         } else {
             let vd = Self::fv(d, "VDST");
-            self.guarded(act, &mut |lw| {
-                for i in 0..count {
-                    let at = lw.addc(a, 4 * i as u32);
-                    let v = lw.mem_ld(at);
-                    lw.vset(vd + i, v);
-                }
-                Ok(())
-            })
+            let loaded = self.mem_ld_n(Some(act), a, count as u32);
+            for i in 0..count {
+                self.write32(&Dst::V(vd + i), loaded[i as usize]);
+            }
+            Ok(())
         }
     }
 

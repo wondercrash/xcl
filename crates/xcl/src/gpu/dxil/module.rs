@@ -249,8 +249,10 @@ pub struct Module {
     func_ids: HashMap<String, u32>,
     globals: Vec<GlobalDef>,
     insts: Vec<InstDef>,
+    def_block: Vec<Block>,
     blocks: Vec<Vec<u32>>,
     cur: Block,
+    insert_before_term: bool,
     md: Vec<MdDef>,
     named_md: Vec<(String, Vec<Md>)>,
     md_strings: HashMap<String, Md>,
@@ -275,8 +277,10 @@ impl Module {
             func_ids: HashMap::new(),
             globals: Vec::new(),
             insts: Vec::new(),
+            def_block: Vec::new(),
             blocks: vec![Vec::new()],
             cur: Block(0),
+            insert_before_term: false,
             md: Vec::new(),
             named_md: Vec::new(),
             md_strings: HashMap::new(),
@@ -521,6 +525,24 @@ impl Module {
     pub fn current_block(&self) -> Block {
         self.cur
     }
+    /// Block where `v` is defined (entry block for constants, globals and functions).
+    pub fn def_block(&self, v: Value) -> Option<Block> {
+        match v {
+            Value::Inst(i) => {
+                let b = self.def_block[i as usize];
+                (b.0 < self.blocks.len() as u32).then_some(b)
+            }
+            _ => Some(Block(0)),
+        }
+    }
+    /// When enabled, emitting into an already-terminated block inserts immediately
+    /// before its terminator (used for hoisting pure computations to a value's
+    /// defining block). Returns the previous setting.
+    pub fn set_insert_before_term(&mut self, on: bool) -> bool {
+        let prev = self.insert_before_term;
+        self.insert_before_term = on;
+        prev
+    }
     /// Whether the current block already ends in a terminator.
     pub fn terminated(&self) -> bool {
         self.blocks[self.cur.0 as usize].last().is_some_and(|&i| {
@@ -529,12 +551,20 @@ impl Module {
     }
 
     fn push(&mut self, op: Op, ty: Ty) -> Value {
-        if self.terminated() {
+        let terminated = self.terminated();
+        if terminated && !self.insert_before_term {
             self.fail(format!("instruction after a terminator in block {:?}", self.cur));
         }
         let id = self.insts.len() as u32;
         self.insts.push(InstDef { op, ty });
-        self.blocks[self.cur.0 as usize].push(id);
+        self.def_block.push(self.cur);
+        let list = &mut self.blocks[self.cur.0 as usize];
+        if terminated && self.insert_before_term {
+            let at = list.len() - 1;
+            list.insert(at, id);
+        } else {
+            list.push(id);
+        }
         Value::Inst(id)
     }
 
@@ -608,6 +638,7 @@ impl Module {
     pub fn phi_at(&mut self, b: Block, ty: Ty) -> Value {
         let id = self.insts.len() as u32;
         self.insts.push(InstDef { op: Op::Phi(Vec::new()), ty });
+        self.def_block.push(b);
         let list = &mut self.blocks[b.0 as usize];
         let at = list.iter().position(|&i| !matches!(self.insts[i as usize].op, Op::Phi(_))).unwrap_or(list.len());
         list.insert(at, id);
@@ -618,11 +649,13 @@ impl Module {
     pub fn detached_phi(&mut self, ty: Ty) -> Value {
         let id = self.insts.len() as u32;
         self.insts.push(InstDef { op: Op::Phi(Vec::new()), ty });
+        self.def_block.push(Block(u32::MAX));
         Value::Inst(id)
     }
     /// Puts a [`Module::detached_phi`] after the existing phis of block `b`.
     pub fn place_phi(&mut self, b: Block, phi: Value) {
         let Value::Inst(id) = phi else { panic!("not a phi") };
+        self.def_block[id as usize] = b;
         let list = &mut self.blocks[b.0 as usize];
         let at = list.iter().position(|&i| !matches!(self.insts[i as usize].op, Op::Phi(_))).unwrap_or(list.len());
         list.insert(at, id);

@@ -36,7 +36,7 @@ pub struct KernelOptions {
 /// Version of the direct translator's output, part of the on-disk translation cache's
 /// identity (`recomp::pso`): bump it on any change that alters the emitted containers
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 5;
+pub const TRANSLATOR_VERSION: u32 = 6;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -169,6 +169,9 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
         heap_mem,
         res,
         fmt_table: None,
+        fmt_desc_cache: HashMap::new(),
+        fmt_comp1_cache: HashMap::new(),
+        uma_base_val: None,
         ntmp: 0,
         scratch: None,
         static_samplers: Default::default(),
