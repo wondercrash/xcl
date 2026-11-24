@@ -63,6 +63,8 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
 | **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
 
+Queued pipeline builds are discarded when their stand-in has already been released, freeing compiler workers for active pipelines.
+
 ### Media and tools
 
 | Feature | State | What it does | Verified by |

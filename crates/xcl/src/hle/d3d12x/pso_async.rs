@@ -183,6 +183,10 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(p) = next else { return };
+                // A released stand-in no longer needs a queued build (as in preload).
+                if p.orphan.load(Ordering::Acquire) {
+                    continue;
+                }
                 // (None: a bind took it and builds it itself)
                 let job = p.job.lock().unwrap().take();
                 if let Some(job) = job {
@@ -1099,4 +1103,65 @@ fn summary() {
         BUILT.load(Ordering::Relaxed),
         FAILED.load(Ordering::Relaxed)
     );
+}
+
+#[cfg(test)]
+mod queued_release_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    struct OpenGate(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for OpenGate {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+
+    struct Dropped(mpsc::Sender<()>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[test]
+    fn released_queued_pipelines_are_not_built() {
+        let workers = crate::gpu::recomp::dxc::compile_threads();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let open = OpenGate(gate.clone());
+        let (started, waiting) = mpsc::channel();
+        for k in 0..workers {
+            let gate = gate.clone();
+            let started = started.clone();
+            submit(0xcafe_1000 + k, false, Box::new(move || {
+                started.send(()).unwrap();
+                let mut ready = gate.0.lock().unwrap();
+                while !*ready {
+                    ready = gate.1.wait(ready).unwrap();
+                }
+                0
+            }));
+        }
+        for _ in 0..workers {
+            waiting.recv_timeout(Duration::from_secs(10)).expect("worker reached gate");
+        }
+        let called = Arc::new(AtomicBool::new(false));
+        let built = called.clone();
+        let (dropped, finished) = mpsc::channel();
+        let dropped = Dropped(dropped);
+        submit(0xcafe_2000, false, Box::new(move || {
+            built.store(true, Ordering::Release);
+            drop(dropped);
+            0
+        }));
+        assert_eq!(released(0xcafe_2000), 0);
+        drop(open);
+        finished.recv_timeout(Duration::from_secs(10)).expect("queued closure dropped");
+        for k in 0..workers {
+            assert_eq!(released(0xcafe_1000 + k), 0);
+        }
+        assert!(!called.load(Ordering::Acquire), "released job reached the compiler");
+    }
 }
