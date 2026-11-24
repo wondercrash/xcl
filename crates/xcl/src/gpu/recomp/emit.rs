@@ -4312,7 +4312,12 @@ impl Em {
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
-        h.push_str(PRELUDE);
+        // `XCL_LOOP_BUDGET`: only a budget other than the default changes the prelude, so the
+        // HLSL (and the DXIL cache keyed by it) stays as it was without the variable
+        match super::loop_budget() {
+            n if n == 1 << 16 => h.push_str(PRELUDE),
+            n => h.push_str(&PRELUDE.replacen("static uint xcl_budget = 1u << 16;", &format!("static uint xcl_budget = {n}u;"), 1)),
+        }
         if self.x64() {
             self.x64_prelude(&mut h);
         }

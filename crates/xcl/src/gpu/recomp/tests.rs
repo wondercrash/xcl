@@ -7271,6 +7271,53 @@ fn gpu_s_round_mode_controls_f16_rounding_across_modes() {
     }
 }
 
+/// `XCL_LOOP_BUDGET`: a whole number from 1, else the default 65 536.
+#[test]
+fn loop_budget_reads_a_whole_number_from_one() {
+    use super::loop_budget_from as f;
+    assert_eq!(f(None), 65_536);
+    assert_eq!(f(Some("4096")), 4096);
+    assert_eq!(f(Some(" 17 ")), 17);
+    assert_eq!(f(Some("0")), 65_536);
+    assert_eq!(f(Some("-5")), 65_536);
+    assert_eq!(f(Some("lots")), 65_536);
+}
+
+/// The prelude's loop budget (`XCL_LOOP_BUDGET`, 65 536 unset) caps a loop whose trip count
+/// never comes (`s_cmp_lg` against 0 after the first increment) stops after that many
+/// iterations, 4096 as well as 65 536.
+#[test]
+fn gpu_loop_budget_caps_a_loop() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 1)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 10)], None),
+    ]);
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let hlsl = translate(&p, &opt).unwrap().hlsl;
+    // without the variable the prelude is the one of before it existed
+    let line = format!("static uint xcl_budget = {};", if super::loop_budget() == 1 << 16 { "1u << 16".to_string() } else { format!("{}u", super::loop_budget()) });
+    assert!(hlsl.contains(&line), "{hlsl}");
+    let mut st = KernelState::default();
+    st.sgpr[1] = 0;
+    let runs: Vec<u32> = [4096u32, 65_536]
+        .iter()
+        .map(|b| {
+            let h = hlsl.replacen(&line, &format!("static uint xcl_budget = {b}u;"), 1);
+            let dxil = super::dxc::compile(&h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{h}"));
+            runner::run(&dxil, &st, &[]).unwrap().vgpr[0][0]
+        })
+        .collect();
+    assert_eq!(runs[1] - runs[0], 65_536 - 4096, "iterations run: {runs:?}");
+    assert!((4096..=4097).contains(&runs[0]), "iterations run: {runs:?}");
+}
+
 #[test]
 fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
     if !gpu_ready() {

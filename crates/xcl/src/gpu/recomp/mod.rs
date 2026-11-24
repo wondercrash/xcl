@@ -623,11 +623,22 @@ impl Conts {
 }
 
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
-/// the prelude: 65 536) – console code that loops on what XCL passed it wrong (an address, a
+/// the prelude: 65 536, or what the variable `XCL_LOOP_BUDGET` sets, `loop_budget`) – console code that loops on what XCL passed it wrong (an address, a
 /// count) must not keep the PC GPU busy for minutes (a process with such work in flight cannot
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
+
+/// The loop iteration budget of a lane (`LOOP_GUARD`): `XCL_LOOP_BUDGET`, a whole number from 1,
+/// or 65 536. A lower one shows whether a GPU busy for seconds is a loop running on data it
+/// was not given (#505); a translation with it set is not cached (`pso::cache_allowed`).
+pub(crate) fn loop_budget() -> u32 {
+    loop_budget_from(std::env::var("XCL_LOOP_BUDGET").ok().as_deref())
+}
+
+fn loop_budget_from(v: Option<&str>) -> u32 {
+    v.and_then(|v| v.trim().parse::<u32>().ok()).filter(|&n| n > 0).unwrap_or(1 << 16)
+}
 
 /// The loops the translator emits: ranges spanned by backward jumps (far jumps included),
 /// partly overlapping ones merged until they nest, sorted. `x64_masks` uses them for the
