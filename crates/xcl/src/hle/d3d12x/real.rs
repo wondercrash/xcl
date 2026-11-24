@@ -5013,6 +5013,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
             let hr = f(this, a1, a2);
             if hr >= 0 {
+                super::breadcrumbs::queue_call(this, if older == 14 { "Signal" } else { "Wait" }, a1 as *mut c_void, a2 as u64);
                 if older == 14 {
                     super::fence_x::note_queue_signal(a1, a2 as u64);
                     super::list_x::note_title_queue_signal(this as usize, a1, a2 as u64);
@@ -5107,6 +5108,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
     let hr = f(this, fence, value);
     if hr >= 0 {
+        super::breadcrumbs::queue_call(this, "SignalX", fence, value);
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
     }
@@ -5142,9 +5144,9 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::breadcrumbs::executed(this, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::breadcrumbs::executed(this, chunk);
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);

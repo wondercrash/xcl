@@ -179,7 +179,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    enqueue(q, writes, |fence, value| q.Signal(fence, value));
+    enqueue(q, writes, |fence, value| super::breadcrumbs::labelled(|| "CPU-write fence".to_owned(), || q.Signal(fence, value)));
 }
 
 unsafe fn enqueue(
