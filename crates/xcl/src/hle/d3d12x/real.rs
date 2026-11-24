@@ -3409,6 +3409,8 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
+    // known before the driver's compile (and its slot): a bind may go on without a huge one now
+    super::pso_async::dxil_known(dxil.len(), cs, cached.is_none());
     let started = std::time::Instant::now();
     // in the background, within the commit left (each ~1.5 GB in the driver): one at a time for
     // the ones built ahead of their first use (huge ones in a lane of their own), and one a bind
@@ -3841,6 +3843,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
+    super::pso_async::dxil_known(vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len), vs, true);
     let hr = retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv));
     if hr < 0 {
         note_translation_error(format!(

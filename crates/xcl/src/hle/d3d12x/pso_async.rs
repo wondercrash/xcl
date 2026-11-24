@@ -36,16 +36,20 @@ struct Pending {
     standin: usize,
     /// where its build is, for the logs of a bind that waits for it
     stage: Mutex<Stage>,
-    /// its DXIL size once its driver compile started (0: not yet)
+    /// its DXIL size once translated (`dxil_known`; 0: not yet)
     dxil: AtomicUsize,
-    /// a hash of its console shader (`shader::fnv64`) once its driver compile started (0: not yet)
+    /// a hash of its console shader (`shader::fnv64`) once translated (0: not yet)
     hash: AtomicU64,
+    /// its DXIL goes to the driver's compiler (no blob of an earlier build), known with `dxil`
+    compiles: AtomicBool,
     /// its place in the workers' queue (`send`; 0: not sent)
     seq: AtomicUsize,
     /// it went to a list of `Preload`
     listed: AtomicBool,
     /// a bind's long wait for it was logged (once a pipeline)
     wait_logged: AtomicBool,
+    /// a bind went on without it for `XCL_PSO_SKIP_HUGE` (logged once a pipeline)
+    skip_logged: AtomicBool,
 }
 
 impl Pending {
@@ -161,9 +165,11 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         stage: Mutex::new(Stage::Queued),
         dxil: AtomicUsize::new(0),
         hash: AtomicU64::new(0),
+        compiles: AtomicBool::new(false),
         seq: AtomicUsize::new(0),
         listed: AtomicBool::new(false),
         wait_logged: AtomicBool::new(false),
+        skip_logged: AtomicBool::new(false),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -507,17 +513,66 @@ mod used_tests {
         }));
         let budget = Some(std::time::Duration::from_millis(30));
         let t = std::time::Instant::now();
-        assert_eq!(resolve_wait_for(standin, budget), standin, "not built within the budget: the stand-in");
+        assert_eq!(resolve_wait_for(standin, budget, None), standin, "not built within the budget: the stand-in");
         assert!(t.elapsed() < std::time::Duration::from_millis(400), "waited {:?}", t.elapsed());
         let t = std::time::Instant::now();
-        assert_eq!(resolve_wait_for(standin, budget), standin);
+        assert_eq!(resolve_wait_for(standin, budget, None), standin);
         assert!(t.elapsed() < std::time::Duration::from_millis(20), "a late pipeline is not waited for again ({:?})", t.elapsed());
         let start = std::time::Instant::now();
         while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(resolve_wait_for(standin, budget), 0x5151, "built by a worker");
+        assert_eq!(resolve_wait_for(standin, budget, None), 0x5151, "built by a worker");
         let _ = released(standin);
+    }
+
+    /// With a size limit (`XCL_PSO_SKIP_HUGE`) a bind waits for a pipeline until its DXIL is known
+    /// to go to the driver's compiler with that many bytes or more, then goes on with the stand-in
+    /// – with or without a budget, and later binds do not wait – while the build goes on; once
+    /// built it is the real one. A smaller one, and a huge one the driver has a blob of, are
+    /// waited for until built.
+    #[test]
+    fn a_bind_does_not_wait_for_a_huge_pipeline() {
+        let limit = Some(8 << 20);
+        let (huge, small, blob) = (0x7E57_9001usize, 0x7E57_9002usize, 0x7E57_9003usize);
+        let (go, driver) = mpsc::channel::<()>();
+        submit_lazy(huge, true, Box::new(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            dxil_known(29_750_144, b"huge", true);
+            // the driver's compile, until the test lets it end
+            let _ = driver.recv_timeout(std::time::Duration::from_secs(10));
+            0x9001
+        }), 0);
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait_for(huge, None, limit), huge, "the stand-in once its size is known");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "waited {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait_for(huge, None, limit), huge);
+        assert_eq!(resolve_wait_for(huge, Some(std::time::Duration::from_secs(5)), limit), huge);
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "not waited for again ({:?})", t.elapsed());
+        let p = entry(huge).unwrap();
+        assert!(is_pending(huge) && !p.late.load(Ordering::Acquire), "still being built; no budget ran out");
+        assert!(p.skip_logged.load(Ordering::Acquire));
+        go.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while is_pending(huge) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(resolve_wait_for(huge, None, limit), 0x9001, "built in the background");
+        let slow = |dxil: usize, compiles: bool, real: usize| -> Job {
+            Box::new(move || {
+                dxil_known(dxil, b"console", compiles);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                real
+            })
+        };
+        submit_lazy(small, true, slow(1 << 20, true, 0x9002), 0);
+        submit_lazy(blob, true, slow(29_750_144, false, 0x9003), 0);
+        assert_eq!(resolve_wait_for(small, None, limit), 0x9002, "a smaller one is waited for");
+        assert_eq!(resolve_wait_for(blob, None, limit), 0x9003, "one with a driver blob is waited for");
+        released(huge);
+        released(small);
+        released(blob);
     }
 
     #[test]
@@ -610,7 +665,7 @@ mod used_tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert!(p.job.lock().unwrap().is_none(), "its job is taken: the bind cannot build it itself");
-        let bind = std::thread::spawn(move || resolve_wait_for(bound, None));
+        let bind = std::thread::spawn(move || resolve_wait_for(bound, None, None));
         while !bind.is_finished() {
             // (the slot is given back on the failure's unwinding, and the bind ends then)
             assert!(start.elapsed() < std::time::Duration::from_secs(10), "the bind waits for the slot a pipeline built ahead holds");
@@ -668,18 +723,21 @@ pub fn resolve(pso: usize) -> usize {
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget())
+    resolve_wait_for(pso, wait_budget(), skip_huge())
 }
 
-/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
-fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
+/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built), and not once its
+/// DXIL is known to go to the driver's compiler with `huge` bytes or more (None: no limit).
+fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>, huge: Option<usize>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     want(&p);
     if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
+        return resolve_within(&p, pso, budget, huge);
     }
-    let job = p.job.lock().unwrap().take();
+    // (with a size limit, built on a thread of its own: this one may go on without it)
+    let aside = huge.is_some() && p.job.lock().unwrap().is_some() && build_aside(&p);
+    let job = if aside { None } else { p.job.lock().unwrap().take() };
     if let Some(job) = job {
         // built on this thread: as long a wait
         let start = Instant::now();
@@ -697,11 +755,28 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
             );
         }
     }
-    wait_built(&p, None);
+    wait_built(&p, None, huge);
     match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
     }
+}
+
+/// The build of `p` a bind would run on its own thread, on a new thread instead (named so that it
+/// takes no big-compile slot, as on the binding thread): whether one was started.
+fn build_aside(p: &Arc<Pending>) -> bool {
+    let p = p.clone();
+    std::thread::Builder::new()
+        .name("xcl-bind-build".into())
+        .stack_size(64 << 20)
+        .spawn(move || {
+            // (None: a worker took it meanwhile)
+            let job = p.job.lock().unwrap().take();
+            if let Some(job) = job {
+                complete(&p, build(&p, job));
+            }
+        })
+        .is_ok()
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
@@ -713,10 +788,22 @@ fn wait_budget() -> Option<std::time::Duration> {
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }
 
+/// A bring-up switch (`XCL_PSO_SKIP_HUGE=<bytes>`, e.g. `8M`; `shaders::parse_bytes`; unset: off):
+/// a bind does not wait for a pipeline not built yet whose DXIL (known once translated, before
+/// the driver's compile) is at least this big and goes to the driver's compiler (no blob of an
+/// earlier build) – it goes on with the stand-in (its dispatches or draws are skipped) while the
+/// build goes on in the background, and a later bind uses it once built. Smaller ones are waited
+/// for as before; with `XCL_PSO_WAIT_MS` both apply. On an NVIDIA GPU the driver never finished
+/// a retail title's 29.75 MB compute program, and its bind at a cutscene waited for good.
+fn skip_huge() -> Option<usize> {
+    static H: OnceLock<Option<usize>> = OnceLock::new();
+    *H.get_or_init(|| std::env::var("XCL_PSO_SKIP_HUGE").ok().and_then(|v| crate::shaders::parse_bytes(&v)).filter(|&n| n > 0))
+}
+
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
 /// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
 /// dispatches are skipped) until a worker has built it.
-fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
+fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration, huge: Option<usize>) -> usize {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
@@ -730,8 +817,12 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if p.late.load(Ordering::Acquire) {
         return pso;
     }
-    if wait_built(p, Some(budget)) {
+    if wait_built(p, Some(budget), huge) {
         return built(p);
+    }
+    if p.too_big(huge) {
+        // (logged by `wait_built`; not late: the budget did not run out)
+        return pso;
     }
     p.late.store(true, Ordering::Release);
     static N: AtomicUsize = AtomicUsize::new(0);
@@ -852,6 +943,12 @@ impl Pending {
         *self.stage.lock().unwrap() = stage;
     }
 
+    /// Its DXIL goes to the driver's compiler and is `huge` bytes or more (None: no limit;
+    /// `skip_huge`).
+    fn too_big(&self, huge: Option<usize>) -> bool {
+        huge.is_some_and(|h| self.compiles.load(Ordering::Acquire) && self.dxil.load(Ordering::Relaxed) >= h)
+    }
+
     /// "compute pipeline 0x… (shader set …, console shader …, N B DXIL)": what is known of it.
     fn describe(&self) -> String {
         let mut parts = Vec::new();
@@ -925,9 +1022,10 @@ impl Pending {
     }
 }
 
-/// Waits until `p` is built or `budget` has passed (None: no limit): whether it was built.
+/// Waits until `p` is built or `budget` has passed (None: no limit), or until it is known to be
+/// `huge` (`Pending::too_big`; logged once a pipeline): whether it was built.
 /// A wait of `LONG_WAIT` logs where the build is (the first for a pipeline) and, then, its end.
-fn wait_built(p: &Arc<Pending>, budget: Option<Duration>) -> bool {
+fn wait_built(p: &Arc<Pending>, budget: Option<Duration>, huge: Option<usize>) -> bool {
     let mut done = p.done.lock().unwrap();
     if *done {
         return true;
@@ -937,12 +1035,12 @@ fn wait_built(p: &Arc<Pending>, budget: Option<Duration>) -> bool {
     let (mut long, mut logged) = (false, false);
     loop {
         let waited = start.elapsed();
-        if budget.is_some_and(|b| waited >= b) {
+        if budget.is_some_and(|b| waited >= b) || p.too_big(huge) {
             break;
         }
         let tick = if long { Duration::from_secs(1) } else { LONG_WAIT.saturating_sub(waited) }.max(Duration::from_millis(1));
         let step = budget.map_or(tick, |b| tick.min(b - waited));
-        done = p.cv.wait_timeout_while(done, step, |d| !*d).unwrap().0;
+        done = p.cv.wait_timeout_while(done, step, |d| !*d && !p.too_big(huge)).unwrap().0;
         if *done {
             break;
         }
@@ -963,8 +1061,20 @@ fn wait_built(p: &Arc<Pending>, budget: Option<Duration>) -> bool {
     let built = *done;
     drop(done);
     WAITING.fetch_sub(1, Ordering::Relaxed);
+    let skipped = !built && p.too_big(huge);
+    if skipped && !p.skip_logged.swap(true, Ordering::AcqRel) {
+        crate::xlog_warn!(
+            "D3D12.X: XCL_PSO_SKIP_HUGE: {} pipeline {:#x} (console shader {:016x}, {} B DXIL) is not waited for; its {} are skipped until it is built",
+            if p.compute { "compute" } else { "graphics" },
+            p.standin,
+            p.hash.load(Ordering::Relaxed),
+            p.dxil.load(Ordering::Relaxed),
+            if p.compute { "dispatches" } else { "draws" }
+        );
+    }
     if logged {
         let end = match (built, p.real.load(Ordering::Acquire)) {
+            (false, _) if skipped => "its DXIL is at least XCL_PSO_SKIP_HUGE: its binds go on without it",
             (false, _) => "not built within XCL_PSO_WAIT_MS: its binds go on without it",
             (true, 0) => "its build failed",
             (true, _) => "built",
@@ -974,8 +1084,23 @@ fn wait_built(p: &Arc<Pending>, budget: Option<Duration>) -> bool {
     built
 }
 
+/// The pipeline this thread builds is translated: `dxil` bytes of DXIL (all its shaders) for
+/// console shader `console` (a graphics one's VS); `compiles`: the driver's compiler takes it
+/// next (no blob of an earlier build). A bind waiting for it may go on without it now
+/// (`skip_huge`).
+pub fn dxil_known(dxil: usize, console: &[u8], compiles: bool) {
+    let Some(p) = BUILDING.with(|b| b.borrow().clone()) else { return };
+    p.dxil.store(dxil, Ordering::Relaxed);
+    p.hash.store(crate::gpu::shader::fnv64(console), Ordering::Relaxed);
+    p.compiles.store(compiles, Ordering::Release);
+    // under `done`: a bind checks `too_big` under it before it sleeps
+    let _g = p.done.lock().unwrap();
+    p.cv.notify_all();
+}
+
 /// A driver compile of a compute program of `dxil` bytes (console shader `console`) starts on
-/// this thread now, with `slot` (None: without one); a `big` one is logged.
+/// this thread now, with `slot` (None: without one); a `big` one is logged. (A pipeline's build
+/// told `dxil_known` its DXIL first.)
 pub fn driver_start(dxil: usize, console: &[u8], slot: Option<&SlotGuard>, big: bool) {
     let mine = BUILDING.with(|b| b.borrow().clone());
     if mine.is_none() && !big {
@@ -983,10 +1108,7 @@ pub fn driver_start(dxil: usize, console: &[u8], slot: Option<&SlotGuard>, big: 
     }
     let who = Who::me();
     let slot = slot.map(|s| (s.slots, s.wanted));
-    let hash = crate::gpu::shader::fnv64(console);
     if let Some(p) = &mine {
-        p.dxil.store(dxil, Ordering::Relaxed);
-        p.hash.store(hash, Ordering::Relaxed);
         p.set_stage(Stage::Driver(Instant::now(), who.clone(), slot));
     }
     if !big {
@@ -994,7 +1116,7 @@ pub fn driver_start(dxil: usize, console: &[u8], slot: Option<&SlotGuard>, big: 
     }
     let (what, waits) = match &mine {
         Some(p) => (p.describe(), if p.wanted.load(Ordering::Acquire) { "yes" } else { "no" }),
-        None => (format!("a compute program in the title's call (console shader {hash:016x}, {dxil} B DXIL)"), "the title's call does"),
+        None => (format!("a compute program in the title's call (console shader {:016x}, {dxil} B DXIL)", crate::gpu::shader::fnv64(console)), "the title's call does"),
     };
     crate::xlog_info!("D3D12.X: driver compile of {what} starts on {who}, {}; a bind waits for it: {waits}", slot_text(slot));
 }
