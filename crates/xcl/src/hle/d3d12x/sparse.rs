@@ -624,11 +624,12 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             *STATUS_FENCES.lock().unwrap() = Some((gpu.fence.clone(), gpu.rb_fence.clone()));
             // what this replaces (the windows set up again) goes after the locks: the release of
             // its last buffers reaches `forget_buffer`, which takes the state (#344)
+            // (the queue first: `queue()` never answers with one older than the state's)
             let queue = gpu.queue.clone();
             let old = {
                 let mut g = WORK.lock().unwrap();
                 let mut s = STATE.lock().unwrap();
-                (g.replace(gpu), s.replace(state), QUEUE.lock().unwrap().replace(queue))
+                (QUEUE.lock().unwrap().replace(queue), g.replace(gpu), s.replace(state))
             };
             drop(old);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
@@ -1571,7 +1572,8 @@ pub unsafe fn free(p: usize) -> bool {
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes.
-/// The queue tile mappings go out on, once there is one.
+/// The queue tile mappings go out on, once there is one. Answered without `WORK` or `STATE`
+/// (`QUEUE`): a caller may be inside a D3D12 call that a holder of `WORK` waits for.
 pub fn queue() -> Option<ID3D12CommandQueue> {
     QUEUE.lock().unwrap().clone()
 }
@@ -2315,6 +2317,23 @@ mod tests {
         rb_list.Close().expect("rb_list close");
         *book.lock().unwrap() = Some(State::new(windows.iter().map(|w| w.0).collect()));
         Gpu::new(book, dev, queue, fence, rb_fence, event, windows, Vec::new(), rb_alloc, rb_list)
+    }
+
+    /// `queue()` does not take the state either (`QUEUE`): a resource's last `Release` asks for
+    /// it (`late_release::drain_known`) from inside a D3D12 call of its own (a list's `Reset`,
+    /// with `XCL_DRED=1`), and nothing here may wait on the state from there (#968).
+    #[test]
+    fn the_queue_is_answered_while_the_state_is_locked() {
+        let held = STATE.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = std::thread::spawn(move || {
+            let _ = queue();
+            let _ = tx.send(());
+        });
+        let answered = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        drop(held);
+        asked.join().unwrap();
+        assert!(answered, "queue() waited for the sparse state's lock");
     }
 
     /// A block freed on one thread while another allocates: its address goes back to the
