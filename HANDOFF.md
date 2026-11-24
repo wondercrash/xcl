@@ -653,7 +653,8 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
   name @0x40), RetrieveErrorRecord 0x290, Query 0x1C. A worker thread per queue runs the submitted requests in order:
   file reads through the VFS (as the title's own CreateFileW), memory copies, zlib (miniz_oxide); a status entry gets
   the first failure since the previous one, a signal sets the D3D12 fence from the CPU; a half-full queue submits by
-  itself. BCPack (and other console formats) are refused; the unlisted interface slots are logged E_NOTIMPL. The test
+  itself. BCPack BC1/BC3/BC4/BC5/BC6H/BC7 are unpacked by `hle/bcpack` (parity test with `XCL_SAMPLE_BCPACK`);
+  BC2 and the swizzle are refused; the unlisted interface slots are logged E_NOTIMPL. The test
   title reads the start of its own exe through it and waits on the fence. Not yet: cancelling submitted requests,
   multi-stage (intermediate-size) decompression, destinations that are not plain memory.
 - **Texture layout library (`xg_xs.dll`, `hle/xg.rs`)** – Fortnite imports `XGCreateTextureComputer`. XCL's own GFX10
