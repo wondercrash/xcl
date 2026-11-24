@@ -252,7 +252,25 @@ pub struct BcpackUnpackStats {
 fn bcpack_unpack(r: &Request, packed: &[u8], n: usize) -> Result<Vec<u8>, HRESULT> {
     let bc = r.bcpack();
     let i = bc as usize & 0xF;
-    match super::bcpack::decode(bc, packed, n) {
+    // A panic in the decoder would end the queue's worker thread: the sender stays alive but
+    // every later batch is dropped, statuses stay pending and fences are never signalled.
+    // Fail this request like an unsupported stream instead, leaving the destination untouched.
+    let decoded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::bcpack::decode(bc, packed, n))) {
+        Ok(decoded) => decoded,
+        Err(payload) => {
+            let why = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("panic payload is not a string");
+            warn_once(
+                &format!("BCPack {} decoder panic", bcpack_name(bc)),
+                format_args!("{why} (bc={bc}, src={}, dst={n}); the request fails with E_DECOMPRESSION", packed.len()),
+            );
+            return Err(E_DECOMPRESSION);
+        }
+    };
+    match decoded {
         Ok(blocks) => {
             if UNPACKED.requests[i].fetch_add(1, Ordering::Relaxed) == 0 {
                 crate::xlog_info!("DirectStorage: BCPack {}: first request unpacked ({} to {n} bytes)", bcpack_name(bc), packed.len());
