@@ -35,6 +35,9 @@ pub(super) struct Em {
     ps_done: bool,
     /// LDS used (compute): declare the groupshared array
     uses_lds: bool,
+    /// compute: why the memory windows are `globallycoherent` (`MemoryUse::coherent_because`);
+    /// None: the cached view
+    pub coherent_mem: Option<&'static str>,
     /// scratch_* used: declare the per-lane private memory
     uses_scratch: bool,
     /// buffer / tbuffer format loads: define `fmt_sel` (`PRELUDE_FMT_SEL`)
@@ -480,6 +483,7 @@ impl Em {
             ps_modes: BTreeMap::new(),
             ps_done: false,
             uses_lds: false,
+            coherent_mem: None,
             uses_scratch: false,
             uses_fmt_sel: false,
             x64_words: 1,
@@ -4285,10 +4289,13 @@ impl Em {
             h.push_str("#define XCL_PIXEL 1\n");
         }
         h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
-        // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
-        // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
-        // memory coherent across the GPU there; graphics keeps the cached (faster) view
-        let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+        // memory other groups write during the dispatch (bottom-up BVH builds: atomics, then
+        // reading what other groups wrote) relies on GLC / cache invalidation on the console:
+        // such compute programs (`coherent_mem`) keep the flat memory coherent across the GPU;
+        // the rest, and graphics, get the cached (much faster) view. (No comment saying why in
+        // the HLSL: the coherent programs' HLSL, and so their DXC and driver caches, stay as
+        // they were.)
+        let coherent = if self.coherent_mem.is_some() { "globallycoherent " } else { "" };
         let windows = self.opt.mem_windows.clamp(1, 4);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
         if windows > 1 {

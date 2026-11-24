@@ -118,11 +118,6 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
-    // (the translated cache is keyed by the program, not by its HLSL: one translated otherwise
-    // is not taken from it; DXC's cache and the driver blobs are keyed by HLSL / DXIL)
-    if stage == Stage::Compute && noncoherent(blob) {
-        return compile_one();
-    }
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one();
     }
@@ -279,11 +274,6 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
         t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
     }
-    if stage == Stage::Compute && noncoherent(blob) {
-        let n = t.hlsl.matches("globallycoherent RWByteAddressBuffer mem").count();
-        t.hlsl = t.hlsl.replace("globallycoherent RWByteAddressBuffer mem", "RWByteAddressBuffer mem");
-        crate::xlog_info!("[SHADER] XCL_CS_NONCOHERENT: compute program {:016x}: {n} memory window(s) without globallycoherent", crate::gpu::shader::fnv64(blob));
-    }
     // `XCL_DEBUG_LOD0=hash,…`: those pixel shaders sample at LOD 0 instead of with implicit
     // derivatives – tells derivative (helper lane) trouble apart from the rest
     if stage == Stage::Pixel && std::env::var("XCL_DEBUG_LOD0").is_ok_and(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).any(|h| h == crate::gpu::shader::fnv64(blob))) {
@@ -312,20 +302,6 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
     Ok(Compiled { dxil, samplers: t.static_samplers })
-}
-
-/// `XCL_CS_NONCOHERENT=hash,…` (diagnostic): those compute programs (console hashes as
-/// `XCL_GPU_PROFILE` names them) declare `mem`…`mem3` without `globallycoherent`, as graphics
-/// programs do. Measured on an RTX 5090: loads from a heap opened over process memory (the
-/// coherent window) bypass the GPU's caches when globallycoherent – 24 dependent wave-uniform
-/// 16-byte loads (a translated `s_load` chain) over a 2560x1440 pass: 75 ms, 2.3 ms without,
-/// 0.03 ms in video memory. Loads may then see stale data written by other groups of the same
-/// dispatch.
-fn noncoherent(blob: &[u8]) -> bool {
-    static LIST: std::sync::LazyLock<Vec<u64>> = std::sync::LazyLock::new(|| {
-        std::env::var("XCL_CS_NONCOHERENT").map_or_else(|_| Vec::new(), |v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect())
-    });
-    !LIST.is_empty() && LIST.contains(&crate::gpu::shader::fnv64(blob))
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
@@ -481,7 +457,7 @@ fn cached_shader(
 }
 
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN"]
+    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_CS_COHERENT"]
         .iter()
         .any(|name| present(name))
         && (stage != Stage::Pixel
@@ -984,7 +960,7 @@ mod shader_cache_tests {
 
     #[test]
     fn shader_cache_bypasses_debug_overrides() {
-        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN"] {
+        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_CS_COHERENT"] {
             assert!(!cache_allowed(Stage::Compute, |v| v == name));
             assert!(!cache_allowed(Stage::Vertex, |v| v == name));
             assert!(!cache_allowed(Stage::Pixel, |v| v == name));
