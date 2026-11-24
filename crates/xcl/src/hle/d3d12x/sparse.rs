@@ -399,6 +399,35 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// What a resource release could not do because `STATE` was held: done by the next thread that
+/// takes it (`lock`). A release can run inside the D3D12 runtime with a lock of its own held
+/// (DRED's breadcrumb allocator, while it drops a queue reference), and a thread holding
+/// `STATE` calls into the runtime (an allocator Reset frees DRED breadcrumb buffers under that
+/// lock): waiting for `STATE` there deadlocked both, and every thread that took `STATE` after.
+enum Deferred {
+    /// `forget_buffer`
+    Forget(usize),
+    /// `free`: the reservation `(start, len)` (decommitted and given back)
+    Free(usize, usize),
+}
+
+static DEFERRED: Mutex<Vec<Deferred>> = Mutex::new(Vec::new());
+
+/// `STATE`, with the releases deferred meanwhile done first.
+fn lock() -> std::sync::MutexGuard<'static, Option<State>> {
+    let mut g = STATE.lock().unwrap();
+    let deferred = std::mem::take(&mut *DEFERRED.lock().unwrap());
+    if let Some(s) = g.as_mut() {
+        for d in deferred {
+            match d {
+                Deferred::Forget(res) => s.forget_buffer(res),
+                Deferred::Free(start, len) => unsafe { s.free_reservation(start, len) },
+            }
+        }
+    }
+    g
+}
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
     let g = STATE.lock().unwrap();
@@ -1205,12 +1234,21 @@ pub unsafe fn free(p: usize) -> bool {
     if !u.is_sparse(p) {
         return false;
     }
-    // decommitted before the address goes back: once released, another thread may get it,
-    // commit it and write there
     let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return false };
-    decommitted(start, len);
-    VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
-    u.sparse_release(p).is_some()
+    // (held: possibly by a thread inside the D3D12 runtime this release came from – `Deferred`)
+    match STATE.try_lock() {
+        Ok(mut g) => match g.as_mut() {
+            Some(s) => s.free_reservation(start, len),
+            None => {
+                drop(g);
+                decommitted(start, len);
+                VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
+                u.sparse_release(p);
+            }
+        },
+        Err(_) => DEFERRED.lock().unwrap().push(Deferred::Free(start, len)),
+    }
+    true
 }
 
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
@@ -1239,7 +1277,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock();
     let Some(s) = g.as_mut() else { return };
     let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
     if filtered.is_empty() {
@@ -1272,7 +1310,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock();
     let Some(s) = g.as_mut() else { return };
     if s.window_index(va).is_none() {
         return;
@@ -1316,7 +1354,7 @@ pub unsafe fn committed(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_add(&mut EARLY.lock().unwrap(), start, end);
@@ -1332,13 +1370,39 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
         return;
     };
     s.decommit_range(a, n);
+}
+
+impl State {
+    /// `free` with the state locked: decommitted before the address goes back (once released,
+    /// another thread may get it, commit it and write there).
+    unsafe fn free_reservation(&mut self, start: usize, len: usize) {
+        self.decommit_range(start, len);
+        VirtualFree(start as *mut c_void, len, MEM_DECOMMIT);
+        if let Some(u) = crate::gpu::uma::get() {
+            u.sparse_release(start);
+        }
+    }
+
+    /// `forget_buffer` with the state locked.
+    fn forget_buffer(&mut self, res: usize) {
+        let Some(tiles) = self.buffers.remove(&res) else { return };
+        for tile in tiles {
+            if let Some(c) = self.pinned.get_mut(&tile) {
+                *c -= 1;
+                if *c == 0 {
+                    self.pinned.remove(&tile);
+                    self.release_if_unused(tile);
+                }
+            }
+        }
+    }
 }
 
 impl State {
@@ -1430,7 +1494,7 @@ impl State {
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
         let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
@@ -1462,7 +1526,7 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock();
     let Some(s) = g.as_mut() else { return };
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
@@ -1550,7 +1614,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock();
     let s = g.as_mut()?;
     let start = va & !(TILE - 1);
     let delta = va - start;
@@ -1588,25 +1652,41 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     Some((hr, delta))
 }
 
-/// A placed buffer is gone: its tiles are not pinned by it any more.
+/// A placed buffer is gone: its tiles are not pinned by it any more. Deferred while the state
+/// is held (`Deferred`).
 pub fn forget_buffer(res: usize) {
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(tile);
+    match STATE.try_lock() {
+        Ok(mut g) => {
+            if let Some(s) = g.as_mut() {
+                s.forget_buffer(res);
             }
         }
+        Err(_) => DEFERRED.lock().unwrap().push(Deferred::Forget(res)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A buffer released while another thread holds the state (inside the D3D12 runtime, which
+    /// holds a lock of its own that the state's holder waits for) does not wait for it: what it
+    /// has to do is left for the next thread that takes the state.
+    #[test]
+    fn a_release_while_the_state_is_held_does_not_wait_for_it() {
+        const RES: usize = 0x7E57_F0E7;
+        let held = STATE.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            forget_buffer(RES);
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "forget_buffer waited for the state");
+        assert!(DEFERRED.lock().unwrap().iter().any(|d| matches!(d, Deferred::Forget(RES))), "the release was dropped, not deferred");
+        drop(held);
+        drop(lock());
+        assert!(!DEFERRED.lock().unwrap().iter().any(|d| matches!(d, Deferred::Forget(RES))), "the next holder did not do the deferred release");
+    }
 
     /// A block freed on one thread while another allocates: its address goes back to the
     /// windows only once it is decommitted (released first, the decommit came after another
