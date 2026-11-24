@@ -379,10 +379,15 @@ mod used {
     }
 }
 
-/// The shader sets (`real::shaders_key`) the earlier runs used, as kept on disk: what `xcl shaders
-/// --precompile --used` builds between runs.
-pub(crate) fn used_on_disk() -> std::collections::HashSet<u64> {
-    used::parse(&std::fs::read_to_string(used::path()).unwrap_or_default())
+/// The file the runs keep the shader sets they used in (`used-pipelines.txt` in the DXIL cache).
+pub(crate) fn used_path() -> std::path::PathBuf {
+    used::path()
+}
+
+/// The shader sets (`real::shaders_key`) in a used-pipelines file (none when it cannot be read):
+/// what `xcl shaders --precompile --used [file]` builds between runs.
+pub(crate) fn used_in(file: &std::path::Path) -> std::collections::HashSet<u64> {
+    used::parse(&std::fs::read_to_string(file).unwrap_or_default())
 }
 
 /// The workers that build the pipelines of an earlier run ahead of their first use

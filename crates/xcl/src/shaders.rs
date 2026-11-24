@@ -715,12 +715,19 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
-        let used = args.iter().any(|a| a == "--used");
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used, t0);
+        let used = used_file(args, crate::hle::d3d12x::pso_async::used_path);
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_deref(), t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
     print(path, &what, agg, top, json, t0, compile)
+}
+
+/// `--used [file]`: the used-pipelines file given after it, else `default` (the DXIL cache's,
+/// which the title reads and appends to); None without `--used`.
+fn used_file(args: &[String], default: impl FnOnce() -> PathBuf) -> Option<PathBuf> {
+    let i = args.iter().position(|a| a == "--used")?;
+    Some(args.get(i + 1).filter(|a| !a.starts_with("--")).map_or_else(default, PathBuf::from))
 }
 
 /// `--precompile`: translate every VS / PS / MS / CS program and compile it into the DXIL cache
@@ -748,8 +755,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// at most `huge_most` programs over `HUGE` at once, so those never hold every thread.
 /// `XCL_PRECOMPILE_MAX_DXIL` (bytes, `parse_bytes`): a program with more DXIL is translated
 /// (its DXIL cached) but its driver compile is left to the runtime (`over_cap`).
-/// `--used`: only the compute programs whose pipeline an earlier run of the title used
-/// (`used_compute`): the ones its next run binds and would wait for, built between runs.
+/// `--used [file]`: only the compute programs whose pipeline an earlier run of the title used
+/// (`used_compute`, keys from `file`, by default the cache's `used-pipelines.txt`): the ones its
+/// next run binds and would wait for, built between runs.
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
@@ -1068,11 +1076,13 @@ fn used_compute(used: &std::collections::HashSet<u64>, blob: &Vec<u8>) -> bool {
     used.contains(&crate::hle::d3d12x::real::shaders_key(std::slice::from_ref(blob)))
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: bool, t0: std::time::Instant) -> i32 {
-    let used = used.then(crate::hle::d3d12x::pso_async::used_on_disk);
-    if used.as_ref().is_some_and(|u| u.is_empty()) {
-        eprintln!("xcl shaders --used: no pipelines in {} (a title run writes them)", recomp::dxc::cache_dir().join("used-pipelines.txt").display());
-        return 2;
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used_list: Option<&Path>, t0: std::time::Instant) -> i32 {
+    let used = used_list.map(crate::hle::d3d12x::pso_async::used_in);
+    if let (Some(u), Some(file)) = (&used, used_list) {
+        if u.is_empty() {
+            eprintln!("xcl shaders --used: no pipelines in {} (a title run writes them)", file.display());
+            return 2;
+        }
     }
     let used = used.as_ref();
     let pipelines = if pipelines {
@@ -1089,7 +1099,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let pipelines = pipelines.as_ref();
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
-    let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let (done, compiled, cached, failed, skipped, picked) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
@@ -1118,8 +1128,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             println!("pipelines: programs over {most} bytes of DXIL left for the runtime (XCL_PRECOMPILE_MAX_DXIL)");
         }
     }
-    if let Some(u) = used {
-        println!("only the compute programs of the {} shader sets earlier runs used (used-pipelines.txt)", u.len());
+    if let (Some(u), Some(file)) = (used, used_list) {
+        println!("only the compute programs of the {} shader sets earlier runs used ({})", u.len(), file.display());
     }
     // translated compute programs waiting for the driver's compiles
     let queue: BiggestFirst<recomp::pso::Compiled> = BiggestFirst::new();
@@ -1158,6 +1168,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) || used.is_some_and(|u| !used_compute(u, &blob)) {
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
+                }
+                if used.is_some() {
+                    picked.fetch_add(1, Ordering::Relaxed);
                 }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
@@ -1256,6 +1269,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    if used.is_some() {
+        println!("--used: {} programs picked", picked.load(Ordering::Relaxed));
+    }
     if let Some(p) = pipelines {
         let over = if p.max_dxil.is_some() { format!(", {} over the size cap (XCL_PRECOMPILE_MAX_DXIL) left for the runtime", p.over_cap.load(Ordering::Relaxed)) } else { String::new() };
         println!("pipelines made on the GPU {}, refused {}{over}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
@@ -1584,6 +1600,18 @@ mod tests {
         assert!(!used_compute(&used, &vs));
         assert!(!used_compute(&used, &ps));
         assert!(!used_compute(&used, &other));
+    }
+
+    /// `--used [file]`: the file after it, the default when none follows (the end, or another
+    /// option), nothing without `--used`.
+    #[test]
+    fn used_takes_a_file_or_the_default() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let default = || PathBuf::from("cache/used-pipelines.txt");
+        assert_eq!(used_file(&args(&["--precompile", "--used", "F:\\sets.txt", "--pipelines"]), default), Some(PathBuf::from("F:\\sets.txt")));
+        assert_eq!(used_file(&args(&["--precompile", "--used", "--pipelines"]), default), Some(default()));
+        assert_eq!(used_file(&args(&["--precompile", "--used"]), default), Some(default()));
+        assert_eq!(used_file(&args(&["--precompile", "--pipelines"]), default), None);
     }
 
     /// A pop waits for a push while the queue is open, and the drivers stop once it is closed.
