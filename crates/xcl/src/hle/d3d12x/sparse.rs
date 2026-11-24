@@ -624,7 +624,8 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             *STATUS_FENCES.lock().unwrap() = Some((gpu.fence.clone(), gpu.rb_fence.clone()));
             // what this replaces (the windows set up again) goes after the locks: the release of
             // its last buffers reaches `forget_buffer`, which takes the state (#344)
-            // (the queue first: `queue()` never answers with one older than the state's)
+            // (all three are replaced under `WORK` and `STATE`: whoever sees the new state sees
+            // the new GPU side and queue too)
             let queue = gpu.queue.clone();
             let old = {
                 let mut g = WORK.lock().unwrap();
