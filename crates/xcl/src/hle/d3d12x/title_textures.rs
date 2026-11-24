@@ -721,8 +721,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 let size = e.tex.size() as usize;
                 (0..16usize)
                     .map(|k| e.src + (size.saturating_sub(4096)) * k / 15)
-                    .filter(|&a| crate::gpu::shader::readable(a, 4096))
-                    .map(|a| std::slice::from_raw_parts(a as *const u8, 4096).iter().filter(|&&b| b != 0).count())
+                    .map(|a| with_title_bytes(a, 4096, |s| s.iter().filter(|&&b| b != 0).count()))
                     .sum()
             };
             let (mut with, mut without) = (0, 0);
@@ -840,7 +839,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
             // a presented frame where ~3 MB had changed, and the submits waited here.
             if unchanged_skip() {
-                let h = content_hash(&title_bytes(va, tex.size() as usize));
+                let h = with_title_bytes(va, tex.size() as usize, content_hash);
                 if same_as_last_upload(r.as_raw() as usize, h) {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
@@ -1039,11 +1038,11 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
     out
 }
 
-/// Copy `[src, src + len)` into `dst` (pre-zeroed) without faulting if another thread unmaps or
+/// Copy `[src, src + len)` into `dst` without faulting if another thread unmaps or
 /// decommits a page concurrently: `ReadProcessMemory` catches the fault in kernel mode and returns
 /// `0`. Because Windows may return `read == 0` when a fault occurs later in the span, binary-split
 /// failed multi-page ranges at 4 KiB boundaries so all still-committed pages are copied in O(log N)
-/// calls and only unreadable pages stay zeroed.
+/// calls and only unreadable pages are zeroed.
 unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1063,6 +1062,7 @@ unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
         let len = len - read;
         let page_end = (src & !(PAGE - 1)).saturating_add(PAGE).min(src + len);
         if page_end == src + len {
+            std::ptr::write_bytes(dst, 0, len);
             return;
         }
         let mid = ((src + len / 2) & !(PAGE - 1)).max(page_end);
@@ -1077,14 +1077,21 @@ unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
 /// has only some of its pages mapped).
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut out = vec![0u8; len];
-    let Some(limit) = at.checked_add(len) else { return out };
+    read_committed_into(at, &mut out);
+    out
+}
+
+/// `read_committed` of `out.len()` bytes at `at` into `out` (every byte of it written).
+unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let len = out.len();
+    let Some(limit) = at.checked_add(len) else { return out.fill(0) };
     // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
     // walking it)
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
-        return out;
+        return;
     }
     let mut p = at;
     while p < limit {
@@ -1099,10 +1106,12 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
         let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
         if readable {
             copy_committed_region(p, out.as_mut_ptr().add(p - at), end - p);
+        } else {
+            out[p - at..end - at].fill(0);
         }
         p = end;
     }
-    out
+    out[p - at..].fill(0);
 }
 
 /// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
@@ -1149,14 +1158,40 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
     out
 }
 
-/// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
-/// as much as the detile of a video frame), else read page run by page run.
-unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    if crate::gpu::shader::readable(at, len) {
-        std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
-    } else {
-        std::borrow::Cow::Owned(read_committed(at, len))
+thread_local! {
+    /// Reusable copy of title bytes for `with_title_bytes` (a fresh one per texture cost its
+    /// allocation and page faults – as much as the detile of a video frame).
+    static TITLE_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A `TITLE_BYTES` buffer grown past this is let go after its read (a thread does not keep the
+/// size of the largest texture it ever read)
+const TITLE_BYTES_KEPT: usize = 64 << 20;
+
+/// `f` of the title's `len` bytes at `at`: where they are in the coherent window (committed as a
+/// whole, never decommitted), else as `read_committed` reads them, into a buffer reused on this
+/// thread – the title can decommit its other memory from another thread at any moment, and a
+/// read in place then faults.
+unsafe fn with_title_bytes<R>(at: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
+        return f(std::slice::from_raw_parts(at as *const u8, len));
     }
+    TITLE_BYTES.with(|b| match b.try_borrow_mut() {
+        Ok(mut buf) => {
+            if buf.len() < len {
+                buf.resize(len, 0);
+            }
+            // (`read_committed_into` writes every byte: what an earlier read left does not show
+            // through a hole)
+            read_committed_into(at, &mut buf[..len]);
+            let r = f(&buf[..len]);
+            if buf.capacity() > TITLE_BYTES_KEPT {
+                *buf = Vec::new();
+            }
+            r
+        }
+        Err(_) => f(&read_committed(at, len)),
+    })
 }
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
@@ -1165,15 +1200,15 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
     if tex.depth > 0 {
-        let mem = title_bytes(va, tex.size() as usize);
-        return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
+        return with_title_bytes(va, tex.size() as usize, |mem| c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(mem, i) }).collect());
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
-        let slice = title_bytes(va + s * c.slice_bytes, c.slice_bytes);
-        for (i, l) in c.levels.iter().enumerate() {
-            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
-        }
+        with_title_bytes(va + s * c.slice_bytes, c.slice_bytes, |slice| {
+            for (i, l) in c.levels.iter().enumerate() {
+                out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(slice, i, s) });
+            }
+        });
     }
     out
 }
@@ -1508,28 +1543,55 @@ mod tests {
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
     }
 
-    /// The title's bytes are used where they are when all of them are readable, and read with the
-    /// pages that are not committed as zeros otherwise – the same bytes either way.
+    /// The title's bytes outside the coherent window are read as `read_committed` reads them (the
+    /// pages that are not committed as zeros, never what an earlier read on the thread left);
+    /// inside it they are used where they are.
     #[test]
-    fn title_bytes_are_used_in_place_when_all_are_readable() {
-        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+    fn title_bytes_are_copied_outside_the_coherent_window() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
         unsafe {
             let base = VirtualAlloc(std::ptr::null(), 3 << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
             assert_ne!(base, 0);
-            for page in [0usize, 2] {
-                VirtualAlloc((base + (page << 12)) as *const c_void, 1 << 12, MEM_COMMIT, PAGE_READWRITE);
+            assert!(!VirtualAlloc(base as *const c_void, 3 << 12, MEM_COMMIT, PAGE_READWRITE).is_null());
+            for page in 0..3usize {
                 std::ptr::write_bytes((base + (page << 12)) as *mut u8, 0xA0 + page as u8, 1 << 12);
             }
-            let whole = title_bytes(base, 1 << 12);
-            assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "a committed page is not copied");
-            assert_eq!(whole.as_ptr() as usize, base);
-            assert!(whole.iter().all(|&b| b == 0xA0));
-            let holed = title_bytes(base, 3 << 12);
-            assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
-            assert_eq!(&holed[..], &read_committed(base, 3 << 12)[..]);
-            assert!(holed[..1 << 12].iter().all(|&b| b == 0xA0) && holed[1 << 12..2 << 12].iter().all(|&b| b == 0) && holed[2 << 12..].iter().all(|&b| b == 0xA2));
+            with_title_bytes(base, 3 << 12, |b| {
+                assert_ne!(b.as_ptr() as usize, base, "memory outside the coherent window is not read in place");
+                assert_eq!(b, &read_committed(base, 3 << 12)[..]);
+                assert!((0..3usize).all(|p| b[p << 12..(p + 1) << 12].iter().all(|&x| x == 0xA0 + p as u8)));
+            });
+            VirtualFree((base + (1 << 12)) as *mut c_void, 1 << 12, MEM_DECOMMIT);
+            // the hole reads as zeros, not as the page the last (as large) read copied
+            with_title_bytes(base, 3 << 12, |b| {
+                assert_eq!(b, &read_committed(base, 3 << 12)[..]);
+                assert!(b[..1 << 12].iter().all(|&x| x == 0xA0) && b[1 << 12..2 << 12].iter().all(|&x| x == 0) && b[2 << 12..].iter().all(|&x| x == 0xA2));
+            });
+            // a shorter read after a longer one: its hole too, and only its length
+            with_title_bytes(base + (1 << 12), 1 << 12, |b| assert!(b.len() == 1 << 12 && b.iter().all(|&x| x == 0)));
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+            // a read of more than `TITLE_BYTES_KEPT` does not stay with the thread
+            let big = (65 << 20) + 1;
+            let at = VirtualAlloc(std::ptr::null(), big, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            if at != 0 {
+                std::ptr::write_bytes(at as *mut u8, 0x6D, big);
+                with_title_bytes(at, big, |b| assert!(b.len() == big && b.iter().all(|&x| x == 0x6D)));
+                assert!(TITLE_BYTES.with(|b| b.borrow().capacity()) <= TITLE_BYTES_KEPT, "the buffer of a large read is let go");
+                VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
+            }
         }
+        let Some(u) = crate::gpu::uma::get() else { return println!("title_bytes_are_copied_outside_the_coherent_window: no UMA, in-place read not checked") };
+        let Some(p) = u.committed_window().and_then(|k| u.alloc_in(k, 1 << 16, 1 << 16)) else {
+            return println!("title_bytes_are_copied_outside_the_coherent_window: no coherent window, in-place read not checked");
+        };
+        unsafe {
+            std::ptr::write_bytes(p, 0x5C, 1 << 16);
+            with_title_bytes(p as usize, 1 << 16, |b| {
+                assert_eq!(b.as_ptr(), p as *const u8, "the coherent window is read in place");
+                assert!(b.len() == 1 << 16 && b.iter().all(|&x| x == 0x5C));
+            });
+        }
+        u.free(p as usize);
     }
 
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.
@@ -1977,6 +2039,39 @@ mod tests {
                 assert!(out[len - (off + 0x0500)..].iter().all(|&b| b == 0xA5));
             }
 
+            stop.store(true, Ordering::Relaxed);
+            mutator.join().unwrap();
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Hashing the title's bytes must not fault with 0xC0000005 when another thread decommits
+    /// and commits pages of them meanwhile (memory outside the coherent window is not read in
+    /// place).
+    #[test]
+    fn title_bytes_survive_concurrent_decommit() {
+        use std::sync::atomic::AtomicBool;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PAGE: usize = 0x10000;
+        const PAGES: usize = 16;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            assert_ne!(VirtualAlloc(base as *const c_void, PAGES * PAGE, MEM_COMMIT, PAGE_READWRITE), std::ptr::null_mut());
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_w = Arc::clone(&stop);
+            let mutator = std::thread::spawn(move || {
+                let mut i = 0usize;
+                while !stop_w.load(Ordering::Relaxed) {
+                    let p = (base + (1 + i % (PAGES - 2)) * PAGE) as *mut c_void;
+                    VirtualFree(p, PAGE, MEM_DECOMMIT);
+                    VirtualAlloc(p, PAGE, MEM_COMMIT, PAGE_READWRITE);
+                    i = i.wrapping_add(1);
+                }
+            });
+            for _ in 0..2000 {
+                std::hint::black_box(with_title_bytes(base, PAGES * PAGE, content_hash));
+            }
             stop.store(true, Ordering::Relaxed);
             mutator.join().unwrap();
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
