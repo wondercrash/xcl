@@ -1180,6 +1180,20 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
     STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
 }
 
+/// For a stuck queue's warning: how far the sparse queue is (every title queue waits for its
+/// fence before new work), and whether it waits for a title queue's readback signal.
+pub fn hub_state() -> String {
+    let g = match STATE.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => return "sparse state held by a submission".to_owned(),
+        Err(std::sync::TryLockError::Poisoned(_)) => return "sparse state poisoned".to_owned(),
+    };
+    let Some(s) = g.as_ref() else { return "no sparse queue".to_owned() };
+    let (done, rb_done) = unsafe { (s.fence.GetCompletedValue(), s.rb_fence.GetCompletedValue()) };
+    let rb = if rb_done < s.rb_value { "waits for a title queue's readback signal" } else { "waits for no title queue" };
+    format!("sparse queue at {done}/{}, readback fence {rb_done}/{} ({rb})", s.value, s.rb_value)
+}
+
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;

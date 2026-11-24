@@ -1,7 +1,13 @@
 //! Queue-side gates for recorded waits on CPU-visible progress values.
+//!
+//! A gate the CPU never sees satisfied (its producer was skipped, never submitted, or is itself
+//! held behind this queue) is opened on the CPU once the queue has stood at it for
+//! `XCL_WAIT_GATE_RELEASE_MS` (default 5000; `0` keeps the queue blocked for good). The work
+//! after it then runs before its producer, as with the GPU wait watchdog of bridged waits.
 
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of, transmute, ManuallyDrop};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -17,6 +23,20 @@ const OPEN: u64 = 2;
 const RETIRED: u64 = 3;
 const POLL: Duration = Duration::from_millis(1);
 const WARN_AFTER: Duration = Duration::from_secs(2);
+const DEFAULT_RELEASE: Duration = Duration::from_secs(5);
+
+/// How long a queue stands at a gate whose value the CPU does not see before the CPU opens it
+/// (`XCL_WAIT_GATE_RELEASE_MS`; `0`: never).
+fn release_after() -> Option<Duration> {
+    static R: LazyLock<Option<Duration>> = LazyLock::new(|| {
+        match std::env::var("XCL_WAIT_GATE_RELEASE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(0) => None,
+            Some(ms) => Some(Duration::from_millis(ms)),
+            None => Some(DEFAULT_RELEASE),
+        }
+    });
+    *R
+}
 
 static TX: LazyLock<Result<mpsc::Sender<Gate>, String>> = LazyLock::new(|| {
     let (tx, rx) = mpsc::channel();
@@ -25,14 +45,23 @@ static TX: LazyLock<Result<mpsc::Sender<Gate>, String>> = LazyLock::new(|| {
     Ok(tx)
 });
 
+/// What a gate waits for, for its warnings: `true` once the queue stands at the gate.
+type Describe = Box<dyn Fn(bool) -> String + Send>;
+
 struct Gate {
     queue: usize,
+    /// arm order, to count the gates queued earlier on the same queue
+    seq: u64,
     device: ID3D12Device,
     // D3D12 can still be using this fence until the queue passes the retirement signal.
     // Only release it on confirmed retirement/removal, even if the worker exits unexpectedly.
     fence: ManuallyDrop<ID3D12Fence>,
     ready: Option<Box<dyn Fn() -> bool + Send>>,
+    describe: Describe,
     warn_at: Option<Instant>,
+    /// when the monitor first saw the queue at the gate
+    reached_at: Option<Instant>,
+    release_after: Option<Duration>,
     retire_at: Option<u64>,
 }
 
@@ -54,7 +83,13 @@ impl Gate {
         }
     }
 
-    fn poll(&mut self) -> Poll {
+    fn warn_due(&self) -> bool {
+        self.ready.is_some() && self.warn_at.is_some_and(|at| Instant::now() >= at)
+    }
+
+    /// `earlier`: gates armed before this one on the same queue and not opened yet (counted
+    /// only when a warning is due).
+    fn poll(&mut self, earlier: usize) -> Poll {
         let value = match unsafe { fence::completed_value(&self.fence, &self.device) } {
             Ok(value) => value,
             Err(e) => return self.failed(e),
@@ -63,14 +98,42 @@ impl Gate {
             return Poll::Retired;
         }
         let Some(ready) = &self.ready else { return Poll::Pending };
-        if value < REACHED || !ready() {
+        let reached = value >= REACHED;
+        if reached && self.reached_at.is_none() {
+            self.reached_at = Some(Instant::now());
+        }
+        if !reached || !ready() {
+            let held = self.reached_at.map(|at| at.elapsed());
+            if let (Some(held), Some(after)) = (held, self.release_after) {
+                if held >= after {
+                    static RELEASED: AtomicU64 = AtomicU64::new(0);
+                    let n = RELEASED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 32 || n.is_power_of_two() {
+                        crate::xlog_warn!("D3D12.X: Wait64BitValueX gate on queue {:#x} opened on the CPU after {} ms at the gate without its value ({}) – the work after it runs before its producer ({n} so far)", self.queue, held.as_millis(), (self.describe)(true));
+                    }
+                    return self.open();
+                }
+            }
             if self.warn_at.is_some_and(|at| Instant::now() >= at) {
                 self.warn_at = None;
-                let waiting_on = if value < REACHED { "preceding queue work" } else { "the memory condition" };
-                crate::xlog_warn!("D3D12.X: Wait64BitValueX gate on queue {:#x} still waiting on {waiting_on} after {} s; leaving the queue blocked", self.queue, WARN_AFTER.as_secs());
+                static WARNED: AtomicU64 = AtomicU64::new(0);
+                let n = WARNED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 64 || n.is_power_of_two() {
+                    let waiting_on = if reached { "the memory condition" } else { "preceding queue work" };
+                    let earlier = if earlier > 0 { format!("; {earlier} earlier gate(s) on this queue still closed") } else { String::new() };
+                    let action = match self.release_after {
+                        None => "leaving the queue blocked".to_owned(),
+                        Some(after) => format!("the CPU opens it {} ms after the queue reaches it", after.as_millis()),
+                    };
+                    crate::xlog_warn!("D3D12.X: Wait64BitValueX gate on queue {:#x} still waiting on {waiting_on} after {} s ({}{earlier}); {action}", self.queue, WARN_AFTER.as_secs(), (self.describe)(reached));
+                }
             }
             return Poll::Pending;
         }
+        self.open()
+    }
+
+    fn open(&mut self) -> Poll {
         if let Err(e) = unsafe { self.fence.Signal(OPEN) } {
             return self.failed(unsafe { fence::api_error(&self.device, "ID3D12Fence::Signal", e) });
         }
@@ -80,7 +143,7 @@ impl Gate {
 }
 
 fn monitor(rx: mpsc::Receiver<Gate>) {
-    let mut pending = Vec::new();
+    let mut pending: Vec<Gate> = Vec::new();
     loop {
         if pending.is_empty() {
             let Ok(gate) = rx.recv() else { return };
@@ -89,7 +152,13 @@ fn monitor(rx: mpsc::Receiver<Gate>) {
         pending.extend(rx.try_iter());
         let mut i = 0;
         while i < pending.len() {
-            match pending[i].poll() {
+            let earlier = if pending[i].warn_due() {
+                let (queue, seq) = (pending[i].queue, pending[i].seq);
+                pending.iter().filter(|g| g.queue == queue && g.seq < seq && g.ready.is_some()).count()
+            } else {
+                0
+            };
+            match pending[i].poll(earlier) {
                 Poll::Pending => i += 1,
                 Poll::Retired => drop(ManuallyDrop::into_inner(pending.swap_remove(i).fence)),
                 Poll::KeepFence => { pending.swap_remove(i); }
@@ -119,11 +188,22 @@ unsafe fn private_fence(device: &ID3D12Device) -> windows::core::Result<ID3D12Fe
 }
 
 /// Insert a GPU queue wait at this submission point. After the queue reaches it, the monitor
-/// opens it only when `ready` observes the requested value; the submitter is free to submit the
-/// producer on another queue.
+/// opens it when `ready` observes the requested value, or after `XCL_WAIT_GATE_RELEASE_MS` at
+/// the gate; the submitter is free to submit the producer on another queue. `describe` says
+/// what the gate waits for in its warnings.
 ///
-/// `queue` must be a live native D3D12 command queue. `ready` must be safe to call on the monitor.
-pub(super) unsafe fn arm(queue: *mut c_void, ready: impl Fn() -> bool + Send + 'static) -> Result<(), String> {
+/// `queue` must be a live native D3D12 command queue. `ready` and `describe` must be safe to
+/// call on the monitor.
+pub(super) unsafe fn arm(
+    queue: *mut c_void, ready: impl Fn() -> bool + Send + 'static, describe: impl Fn(bool) -> String + Send + 'static,
+) -> Result<(), String> {
+    arm_with(queue, ready, Box::new(describe), release_after())
+}
+
+unsafe fn arm_with(
+    queue: *mut c_void, ready: impl Fn() -> bool + Send + 'static, describe: Describe, release_after: Option<Duration>,
+) -> Result<(), String> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let q = ID3D12CommandQueue::from_raw_borrowed(&queue).ok_or("missing D3D12 command queue")?;
     let mut device: Option<ID3D12Device> = None;
     q.GetDevice(&mut device).map_err(|e| format!("GetDevice: {e}"))?;
@@ -163,11 +243,86 @@ pub(super) unsafe fn arm(queue: *mut c_void, ready: impl Fn() -> bool + Send + '
     let wait = wait.map_err(|e| fence::api_error(&device, "ID3D12CommandQueue::Wait", e).to_string());
     tx.send(Gate {
         queue: queue as usize,
+        seq: SEQ.fetch_add(1, Ordering::Relaxed),
         device,
         fence: ManuallyDrop::new(fence),
         ready: armed.then(|| Box::new(ready) as Box<dyn Fn() -> bool + Send>),
+        describe,
         warn_at: Some(Instant::now() + WARN_AFTER),
+        reached_at: None,
+        release_after,
         retire_at,
     }).map_err(|_| "Wait64BitValueX monitor stopped after submitting to the queue; cannot service the gate".to_owned())?;
     wait
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::recomp::runner::skip_test;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    fn until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while !done() {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    unsafe fn device_and_queue() -> Option<(ID3D12Device, ID3D12CommandQueue)> {
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            skip_test("no GPU");
+            return None;
+        }
+        let dev = dev.unwrap();
+        let queue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+        Some((dev, queue))
+    }
+
+    #[test]
+    fn gate_without_its_value_opens_after_the_release_time_at_the_gate() {
+        const RELEASE: Duration = Duration::from_millis(400);
+        unsafe {
+            let Some((dev, queue)) = device_and_queue() else { return };
+            let new_fence = || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (ahead, tail) = (new_fence(), new_fence());
+            let reached = |f: &ID3D12Fence| fence::completed_value(f, &dev).is_ok_and(|v| v >= 1);
+            // Earlier work holds the queue before the gate: the release clock must not run yet.
+            queue.Wait(&ahead, 1).unwrap();
+            arm_with(queue.as_raw(), || false, Box::new(|_| "test gate".to_owned()), Some(RELEASE)).unwrap();
+            queue.Signal(&tail, 1).unwrap();
+            let held_behind = !until(RELEASE + Duration::from_millis(300), || reached(&tail));
+            ahead.Signal(1).unwrap();
+            let held_at_gate = !until(RELEASE / 2, || reached(&tail));
+            let opened = until(Duration::from_secs(5), || reached(&tail));
+            assert!(opened, "the CPU did not open a gate whose value never came");
+            assert!(held_behind, "a gate the queue had not reached was opened");
+            assert!(held_at_gate, "the release time ran before the queue reached the gate");
+        }
+    }
+
+    #[test]
+    fn gate_without_release_stays_closed_until_its_value() {
+        unsafe {
+            let Some((dev, queue)) = device_and_queue() else { return };
+            let tail = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let reached = || fence::completed_value(&tail, &dev).is_ok_and(|v| v >= 1);
+            let value = Arc::new(AtomicBool::new(false));
+            let seen = value.clone();
+            arm_with(queue.as_raw(), move || seen.load(Ordering::Acquire), Box::new(|_| "test gate".to_owned()), None).unwrap();
+            queue.Signal(&tail, 1).unwrap();
+            let held = !until(Duration::from_millis(500), reached);
+            value.store(true, Ordering::Release);
+            let opened = until(Duration::from_secs(5), reached);
+            assert!(opened, "the gate did not open once its value came");
+            assert!(held, "a gate without a release time opened without its value");
+        }
+    }
 }

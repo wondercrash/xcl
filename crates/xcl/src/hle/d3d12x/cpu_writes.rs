@@ -44,6 +44,8 @@ struct QueueFence {
     fence: ID3D12Fence,
     value: u64,
     tx: mpsc::Sender<Job>,
+    /// address → (job, value) of the latest 64-bit progress write queued, for gate warnings
+    last_u64: HashMap<usize, (u64, u64)>,
 }
 
 static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
@@ -114,6 +116,15 @@ pub(super) fn forget_queue(queue: usize) {
     }
 }
 
+/// The highest 64-bit progress write queued for `va`: (queue, value, its job, the queue's
+/// completed job). The worker has stored it once the completed job reaches its job.
+pub(super) fn queued_u64(va: usize) -> Option<(usize, u64, u64, u64)> {
+    let g = FENCES.lock().unwrap();
+    g.as_ref()?.iter()
+        .filter_map(|(&q, f)| f.last_u64.get(&va).map(|&(job, value)| (q, value, job, unsafe { f.fence.GetCompletedValue() })))
+        .max_by_key(|&(_, value, ..)| value)
+}
+
 /// The dwords at `va`, if the memory is still there and writable.
 unsafe fn write_now(va: usize, words: &[u32]) {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
@@ -182,12 +193,20 @@ unsafe fn enqueue(
                 let Some(dev) = dev else { return false };
                 let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return false };
                 let tx = spawn_queue_worker(dev, fence.clone());
-                v.insert(QueueFence { fence, value: 0, tx })
+                v.insert(QueueFence { fence, value: 0, tx, last_u64: HashMap::new() })
             }
         };
         entry.value += 1;
         if signal(&entry.fence, entry.value).is_err() {
             return false;
+        }
+        if entry.last_u64.len() >= 4096 {
+            entry.last_u64.clear();
+        }
+        for w in &writes {
+            if let Write::ImmediateU64(va, value) = *w {
+                entry.last_u64.insert(va, (entry.value, value));
+            }
         }
         // Keep fence signals and job sends in the same order under concurrent submission.
         entry.tx.send(Job { value: entry.value, writes }).is_ok()

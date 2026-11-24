@@ -1981,9 +1981,69 @@ unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &
     }
     if queue.is_null() || sparse_after {
         wait_all_on(std::ptr::null_mut(), &gated, list_writes);
-    } else if let Err(reason) = super::wait_gate::arm(queue, move || gated.iter().all(|w| w.progress_reached())) {
+        return;
+    }
+    let (q, described) = (queue as usize, gated.clone());
+    let ready = move || gated.iter().all(|w| w.progress_reached());
+    if let Err(reason) = super::wait_gate::arm(queue, ready, move |reached| describe_gate(q, &described, reached)) {
         fail_submission(reason);
     }
+}
+
+/// `q{id}/ty{type}` of a title queue, as the other synchronisation warnings name it.
+fn queue_label(queue: usize) -> String {
+    let ty = LIVE_QUEUES.lock().unwrap().iter().find(|q| q.queue == queue).map_or(-1, |q| q.ty.0);
+    format!("q{}/ty{ty}", queue_id(queue))
+}
+
+/// For a gate's warnings: what the gate on `queue` waits for and what XCL knows of each
+/// producer (its recorded Write64, the GPU signal after it, the deferred CPU write). Before the
+/// queue reaches the gate (`reached` false), also what XCL queued ahead of it there.
+fn describe_gate(queue: usize, waits: &[PendingWait], reached: bool) -> String {
+    use std::fmt::Write as _;
+    let label = |q: Option<usize>, none: &str| q.map_or_else(|| none.to_owned(), queue_label);
+    let mut out = queue_label(queue);
+    for w in waits.iter().filter(|w| unsafe { !w.progress_reached() }) {
+        let at = if real::uma_window_buffer(w.va as usize, 8).is_some() { "unified memory" } else { "title memory" };
+        let _ = write!(out, "; {:#x} >= {:#x}: {at} holds {:x?}, ", w.va, w.value, unsafe { w.read_value() });
+        let cell = SYNC_GRAPH.lock().unwrap().as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| {
+            let done = c.fence.as_ref().map(|f| unsafe { f.GetCompletedValue() });
+            (c.recorded_max, c.recorded_last_queue, c.submitted_max, c.submitted_queue, done, c.cpu_signaled_max, c.non_monotonic)
+        });
+        match cell {
+            Some((rec, rec_q, sub, sub_q, done, cpu, non_mono)) if rec != 0 => {
+                let by = if sub_q.is_none() && sub != 0 { "the CPU".to_owned() } else { label(sub_q, "nobody") };
+                let done = done.map_or_else(|| "no fence".to_owned(), |d| format!("{d:#x}"));
+                let _ = write!(out, "Write64 recorded up to {rec:#x} (list last on {}), signalled up to {sub:#x} by {by}, GPU at {done}", label(rec_q, "no queue"));
+                if cpu != 0 {
+                    let _ = write!(out, ", released on the CPU up to {cpu:#x}");
+                }
+                if non_mono {
+                    out.push_str(", non-monotonic");
+                }
+            }
+            _ => out.push_str("no Write64 recorded at it (a CPU, shader or copy producer)"),
+        }
+        if let Some((q, value, job, done)) = super::cpu_writes::queued_u64(w.va as usize) {
+            let state = if done >= job { "done" } else { "pending" };
+            let _ = write!(out, "; CPU write of {value:#x} for {} {state} (job {job}, queue at {done})", queue_label(q));
+        }
+    }
+    if !reached {
+        let bridged: Vec<(u64, u64, u64, Option<usize>)> = SYNC_GRAPH.lock().unwrap().as_ref().map_or_else(Vec::new, |gr| {
+            let mut v = Vec::new();
+            for (&va, c) in &gr.cells {
+                let done = c.fence.as_ref().map_or(0, |f| unsafe { f.GetCompletedValue() });
+                v.extend(c.armed_waits.iter().filter(|aw| aw.waiting_queue == queue && aw.val > done).map(|aw| (va, aw.val, done, c.submitted_queue)));
+            }
+            v
+        });
+        for (va, val, done, by) in bridged {
+            let _ = write!(out, "; bridged GPU wait {va:#x} >= {val:#x} ahead (at {done:#x}, signal by {})", label(by, "nobody yet"));
+        }
+        let _ = write!(out, "; {}", super::sparse::hub_state());
+    }
+    out
 }
 
 /// The queue may already wait on a gate nothing can open: stop the title rather than run on.
