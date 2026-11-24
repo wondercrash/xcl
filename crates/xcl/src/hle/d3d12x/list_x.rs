@@ -217,8 +217,10 @@ impl PendingWait {
         }
     }
 
+    /// Memory that is no longer readable counts as reached, as in `is_satisfied`: a cell the
+    /// title freed while a gate waits on it must not hold the queue until the release.
     unsafe fn progress_reached(&self) -> bool {
-        self.read_value().is_some_and(|current| current >= self.value)
+        self.read_value().is_none_or(|current| current >= self.value)
     }
 
     unsafe fn is_satisfied(&self) -> bool {
@@ -4167,6 +4169,32 @@ mod tests {
             assert!(!w64.wait_until_satisfied(Duration::from_millis(5)));
             cell64.store(0x0000_0002_0000_0001, Ordering::Release);
             assert!(w64.is_satisfied());
+        }
+    }
+
+    #[test]
+    fn progress_wait_on_memory_no_longer_readable_counts_as_reached() {
+        let w = PendingWait {
+            // the first 64 KiB of the address space are never mapped
+            va: 0x1000,
+            width: 8,
+            comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+            value: 5,
+            mask: u64::MAX,
+            after_write64: false,
+            gate: true,
+        };
+        unsafe {
+            assert_eq!(w.read_value(), None);
+            assert_eq!(w.progress_reached(), w.is_satisfied(), "a gate and the bounded wait must agree on unreadable memory");
+            assert!(w.progress_reached());
+        }
+        let cell = AtomicU64::new(4);
+        let w = PendingWait { va: &cell as *const AtomicU64 as u64, ..w };
+        unsafe {
+            assert!(!w.progress_reached());
+            cell.store(5, Ordering::Release);
+            assert!(w.progress_reached());
         }
     }
 
