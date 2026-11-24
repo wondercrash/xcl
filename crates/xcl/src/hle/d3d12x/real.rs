@@ -3390,21 +3390,141 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// DXIL size from which a compute pipeline's driver compile goes to the background
 const BIG_DRIVER_COMPILE: usize = 256 << 10;
 /// DXIL size from which a compute program's driver compile has a lane of its own
-/// (`pso_async::big_compile`): a retail game's 13.5 – 28 MB ones took the driver 15+ min each
+/// (`big_compile_lane`): a retail game's 13.5 – 28 MB ones took the driver 15+ min each
 /// (the next biggest of its pack is 1.9 MB)
 const HUGE_DRIVER_COMPILE: usize = 4 << 20;
 
-/// Before a big driver compile in the background: until 3 GB of commit are free (each takes
-/// ~1.5 GB; the title loading next to it must not run out – no minute's grace as for DXC).
-fn wait_for_commit() {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    loop {
-        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= 3 << 30 {
-            return;
+/// A counting semaphore: background driver compiles of big programs at once.
+pub(super) struct Slots {
+    n: Mutex<usize>,
+    cv: std::sync::Condvar,
+    most: usize,
+}
+
+pub(super) struct SlotGuard(&'static Slots);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        *self.0.n.lock().unwrap() -= 1;
+        self.0.cv.notify_one();
+    }
+}
+
+pub(super) static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+
+/// The same for the huge programs (`HUGE_DRIVER_COMPILE`): one built ahead of its first use takes
+/// the driver many minutes, and the other big ones are not held up meanwhile.
+static HUGE_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+
+/// The lane of a driver compile of `dxil` bytes in the background, and its name for the logs.
+fn big_compile_lane(dxil: usize) -> (&'static Slots, &'static str) {
+    if dxil >= HUGE_DRIVER_COMPILE {
+        (&HUGE_COMPILES, "huge-compile slot")
+    } else {
+        (&BIG_COMPILES, "big-compile slot")
+    }
+}
+
+/// Before a big driver compile in the background: its turn – one at a time, and 3 GB of commit
+/// free (each takes ~1.5 GB; the title loading next to it must not run out). Unless one of the
+/// title's threads waits for the pipeline (`wanted`): then at once and without a slot (None), as
+/// when that thread builds it itself. Holding such a build back holds the title back: on a
+/// machine with less than 3 GB of commit free throughout a retail title's world loading, the
+/// first one would not go on and keeps the slot, until the title's watchdog ends it.
+pub(super) fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
+    const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+    let slot = {
+        let mut n = slots.n.lock().unwrap();
+        loop {
+            if wanted() {
+                return None;
+            }
+            if *n < slots.most {
+                break;
+            }
+            n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        *n += 1;
+        SlotGuard(slots)
+    };
+    while !commit_free() {
+        if wanted() {
+            return None;
+        }
+        std::thread::sleep(LOOK);
+    }
+    Some(slot)
+}
+
+/// 3 GB of commit are free (true when that is not known).
+fn big_compile_commit_free() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= 3 << 30 }
+}
+
+#[cfg(test)]
+mod big_compile_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_wanted_build_waits_for_neither_the_slot_nor_the_commit() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        let held = big_compile_turn(&S, || true, || false).expect("a free slot");
+        assert_eq!(*S.n.lock().unwrap(), 1);
+        // the slot is taken: a wanted build goes on without one, at once
+        assert!(big_compile_turn(&S, || true, || true).is_none());
+        // … and one that becomes wanted while it waits for the slot goes on then
+        static WANTED: AtomicBool = AtomicBool::new(false);
+        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || WANTED.load(Ordering::Acquire)).is_none());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "not wanted yet: it waits for its turn");
+        WANTED.store(true, Ordering::Release);
+        assert!(t.join().unwrap());
+        drop(held);
+        assert_eq!(*S.n.lock().unwrap(), 0);
+        // without the commit: not wanted, it waits; wanted, it goes on and gives the slot back
+        static WANTED2: AtomicBool = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let t = std::thread::spawn(|| big_compile_turn(&S, || false, || WANTED2.load(Ordering::Acquire)).is_none());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "no commit free: it waits");
+        WANTED2.store(true, Ordering::Release);
+        assert!(t.join().unwrap() && t0.elapsed() < Duration::from_secs(5));
+        assert_eq!(*S.n.lock().unwrap(), 0, "the slot went back");
+    }
+
+    #[test]
+    fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        let first = big_compile_turn(&S, || true, || false).expect("its turn");
+        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || false).is_some());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "one at a time");
+        drop(first);
+        assert!(t.join().unwrap(), "the next one's turn");
+        assert_eq!(*S.n.lock().unwrap(), 0);
+    }
+
+    /// A huge program built ahead of its first use (a retail game's 28 MB DXIL ones took the
+    /// driver 15+ min) does not hold up the big ones built ahead: a lane of its own.
+    #[test]
+    fn a_huge_compile_built_ahead_does_not_hold_up_the_big_ones() {
+        let (huge, _) = big_compile_lane(HUGE_DRIVER_COMPILE);
+        let (big, _) = big_compile_lane(HUGE_DRIVER_COMPILE - 1);
+        assert!(!std::ptr::eq(huge, big), "a lane of its own");
+        let held = big_compile_turn(huge, || true, || false).expect("its turn");
+        // (it may wait for a big one of another test, which is given back)
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(big_compile_turn(big, || true, || false));
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(10)).is_ok(), "the big one waits for the huge one");
+        drop(held);
     }
 }
 
@@ -3456,19 +3576,25 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
-    // known before the driver's compile (and its slot): a bind may go on without a huge one now
+    // known before the driver's compile (and its turn): a bind may go on without a huge one now
     super::pso_async::dxil_known(dxil.len(), cs, cached.is_none());
+    // in the background, one at a time (huge ones in a lane of their own) and within the commit
+    // left (each ~1.5 GB in the driver); one a bind waits for goes on at once
+    let (lane, lane_name) = big_compile_lane(dxil.len());
+    let slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")))
+        .then(|| {
+            // (for the logs of a bind that waits for it)
+            super::pso_async::turn_wait(lane_name);
+            let commit_free = || {
+                super::pso_async::commit_wait();
+                big_compile_commit_free()
+            };
+            big_compile_turn(lane, commit_free, super::pso_async::build_is_wanted)
+        })
+        .flatten();
     let started = std::time::Instant::now();
-    // in the background, within the commit left (each ~1.5 GB in the driver): one at a time for
-    // the ones built ahead of their first use (huge ones in a lane of their own), and one a bind
-    // waits for does not wait for those
-    let slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = super::pso_async::big_compile(dxil.len() >= HUGE_DRIVER_COMPILE);
-        wait_for_commit();
-        slot
-    });
     // (for the logs of a bind that waits for it; a big compile is logged as it starts)
-    super::pso_async::driver_start(dxil.len(), cs, slot.as_ref(), big && cached.is_none());
+    super::pso_async::driver_start(dxil.len(), cs, slot.is_some().then_some(lane_name), big && cached.is_none());
     let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 && cached.is_some() {
         // a blob the driver does not take (another root signature at the same address…): compiled

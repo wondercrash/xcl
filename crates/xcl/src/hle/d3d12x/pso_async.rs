@@ -30,8 +30,6 @@ struct Pending {
     orphan: std::sync::atomic::AtomicBool,
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
     late: std::sync::atomic::AtomicBool,
-    /// a bind waits (or waited) for it: its build goes ahead of others for a big-compile slot
-    wanted: std::sync::atomic::AtomicBool,
     /// the stand-in the title has (what the logs name it by)
     standin: usize,
     /// where its build is, for the logs of a bind that waits for it
@@ -50,9 +48,85 @@ struct Pending {
     wait_logged: AtomicBool,
     /// a bind went on without it for `XCL_PSO_SKIP_HUGE` (logged once a pipeline)
     skip_logged: AtomicBool,
+    demand: Mutex<Demand>,
+}
+
+/// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
+#[derive(Default)]
+struct Demand {
+    wanted: bool,
+    /// thread id of the preload worker (lowest priority) building it, 0 = none
+    preload_thread: u32,
+}
+
+thread_local! {
+    /// what this worker is building
+    static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// This thread is a worker and one of the title's threads waits for what it is building: the
+/// build must not stand back for the title's sake (`real::big_compile_turn`).
+pub(super) fn build_is_wanted() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
+}
+
+/// Whether one of the title's threads waits for what this thread is doing, to be asked later and
+/// from another thread: a worker's build as `build_is_wanted`; a thread that is not XCL's is the
+/// title's own.
+pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
+    if let Some(p) = BUILDING.with(|b| b.borrow().clone()) {
+        return Box::new(move || p.demand.lock().unwrap().wanted);
+    }
+    let own = crate::state::boot().is_some() && !std::thread::current().name().is_some_and(|n| n.starts_with("xcl-"));
+    Box::new(move || own)
+}
+
+/// A build of `p` on this thread – a worker's (`preload`: by one of the lowest-priority
+/// workers), or a bind's – known to `build_is_wanted`, `dxil_known` and the logs meanwhile: its
+/// pipeline (0 = failed).
+fn build(p: &Arc<Pending>, job: Job, preload: bool) -> usize {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+    p.set_stage(Stage::Building(Instant::now(), Who::me()));
+    BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
+    if preload {
+        let mut d = p.demand.lock().unwrap();
+        d.preload_thread = unsafe { GetCurrentThreadId() };
+        if d.wanted {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+        }
+    }
+    let real = job();
+    complete(p, real);
+    if preload {
+        // (under the lock: `want` does not raise this thread after it)
+        let mut d = p.demand.lock().unwrap();
+        d.preload_thread = 0;
+        if d.wanted {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
+        }
+    }
+    BUILDING.with(|b| *b.borrow_mut() = None);
+    real
 }
 
 impl Pending {
+    /// One of the title's threads is about to wait for it: the worker building it goes on now,
+    /// at a normal priority.
+    fn want(&self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
+        let mut d = self.demand.lock().unwrap();
+        if !std::mem::replace(&mut d.wanted, true) && d.preload_thread != 0 {
+            unsafe {
+                let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, d.preload_thread);
+                if !h.is_null() {
+                    SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
+                    CloseHandle(h);
+                }
+            }
+        }
+    }
+
     fn note_use(&self) {
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
@@ -111,7 +185,7 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
                 // (None: a bind took it and builds it itself)
                 let job = p.job.lock().unwrap().take();
                 if let Some(job) = job {
-                    complete(&p, build(&p, job));
+                    build(&p, job, false);
                 }
             });
         }
@@ -160,7 +234,6 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         used: Default::default(),
         orphan: Default::default(),
         late: Default::default(),
-        wanted: Default::default(),
         standin,
         stage: Mutex::new(Stage::Queued),
         dxil: AtomicUsize::new(0),
@@ -170,6 +243,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         listed: AtomicBool::new(false),
         wait_logged: AtomicBool::new(false),
         skip_logged: AtomicBool::new(false),
+        demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -270,8 +344,8 @@ mod used {
 /// The workers that build the pipelines of an earlier run ahead of their first use
 /// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
 /// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
-/// `job` first builds it, and the build of one a bind waits for does not wait for a big-compile
-/// slot the ones built ahead hold: `big_compile`), and the title's own threads are not either.
+/// `job` first builds it, and the build of one a bind waits for does not wait for its turn at a
+/// big-compile slot: `real::big_compile_turn`), and the title's own threads are not either.
 /// After those, every compute pipeline is built ahead too, as it is made: its first bind waits
 /// for it on the title's thread (a skipped dispatch would corrupt what it computes), and the
 /// driver takes seconds for a big one – on an NVIDIA GPU a retail title's binds waited 3 – 23 s
@@ -321,8 +395,7 @@ fn preload() -> Option<&'static Preload> {
                     // (None: a bind took it and builds it itself)
                     let job = p.job.lock().unwrap().take();
                     if let Some(job) = job {
-                        let real = build(&p, job);
-                        complete(&p, real);
+                        build(&p, job, true);
                         let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_power_of_two() {
                             crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
@@ -333,169 +406,6 @@ fn preload() -> Option<&'static Preload> {
         }
     });
     Some(q)
-}
-
-thread_local! {
-    /// the pipeline this thread builds now (`build`)
-    static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Runs the build of `p` on this thread, known to `big_compile` meanwhile.
-fn build(p: &Arc<Pending>, job: Job) -> usize {
-    p.set_stage(Stage::Building(Instant::now(), Who::me()));
-    let outer = BUILDING.with(|b| b.replace(Some(p.clone())));
-    let real = job();
-    BUILDING.with(|b| *b.borrow_mut() = outer);
-    real
-}
-
-/// A bind waits for `p`: if its build waits for a big-compile slot, it takes one of those kept
-/// for binds instead.
-fn want(p: &Pending) {
-    if !p.wanted.load(Ordering::Acquire) && !p.wanted.swap(true, Ordering::AcqRel) {
-        // under the lock: a waiter checks `wanted` under it before it sleeps
-        for slots in [&BIG_COMPILES, &HUGE_COMPILES] {
-            let _g = slots.state.lock().unwrap();
-            slots.cv.notify_all();
-        }
-    }
-}
-
-/// A counting semaphore: driver compiles of big programs at once. The builds a bind waits for
-/// (`wanted`) have slots of their own and never wait for a compile of a pipeline built ahead of
-/// its first use (a preload thread takes a job, then waits here): the driver took 15+ min for
-/// each of a retail game's biggest programs, and one of those held the only slot from the
-/// title's loading to the end of the run while its binds waited (or, with `XCL_PSO_WAIT_MS`,
-/// every worker waited and no pipeline was built any more).
-struct Slots {
-    state: Mutex<SlotState>,
-    cv: Condvar,
-    /// builds no bind waits for, at once
-    most: usize,
-    /// builds a bind waits for, at once
-    most_wanted: usize,
-}
-
-struct SlotState {
-    /// slots taken by builds no bind waits for
-    held: usize,
-    /// slots taken by builds a bind waits for
-    held_wanted: usize,
-    /// the pipelines whose builds wait for one (the thread's `BUILDING`); a bind marks one
-    /// `wanted` without waking its thread first
-    waiting: Vec<Arc<Pending>>,
-}
-
-/// A slot, given back when dropped (and this thread's priority with it).
-pub struct SlotGuard {
-    slots: &'static Slots,
-    /// it is one of the slots for builds a bind waits for
-    wanted: bool,
-    /// priority the thread had before it was raised for a build a bind waits for
-    priority: Option<i32>,
-}
-
-impl Slots {
-    const fn new(most: usize, most_wanted: usize) -> Self {
-        Slots { state: Mutex::new(SlotState { held: 0, held_wanted: 0, waiting: Vec::new() }), cv: Condvar::new(), most, most_wanted }
-    }
-
-    /// Waits for a slot for the build of `mine` (None: no pipeline's). A build a bind waits for
-    /// (`wanted`, read again at each wake-up) takes one of the slots for those.
-    fn acquire(&'static self, mine: Option<Arc<Pending>>) -> SlotGuard {
-        let wanted = |p: &Pending| p.wanted.load(Ordering::Acquire);
-        // (for the logs of a bind that waits for it)
-        let who = mine.as_ref().map(|p| {
-            let who = Who::me();
-            p.set_stage(Stage::Slot(Instant::now(), who.clone(), self));
-            who
-        });
-        let mut g = self.state.lock().unwrap();
-        if let Some(p) = &mine {
-            g.waiting.push(p.clone());
-        }
-        let ahead = loop {
-            let ahead = mine.as_deref().is_some_and(wanted);
-            if if ahead { g.held_wanted < self.most_wanted } else { g.held < self.most } {
-                break ahead;
-            }
-            g = self.cv.wait(g).unwrap();
-        };
-        if let Some(p) = &mine {
-            let i = g.waiting.iter().position(|q| Arc::ptr_eq(q, p)).unwrap();
-            g.waiting.swap_remove(i);
-        }
-        if ahead {
-            g.held_wanted += 1;
-        } else {
-            g.held += 1;
-        }
-        let passed = g.waiting.iter().filter(|q| !wanted(q)).count();
-        drop(g);
-        if let (Some(p), Some(who)) = (&mine, who) {
-            // (the one caller waits for free commit next, then starts the driver's compile)
-            p.set_stage(Stage::Commit(Instant::now(), who));
-        }
-        if !ahead {
-            return SlotGuard { slots: self, wanted: false, priority: None };
-        }
-        if passed > 0 {
-            static N: AtomicUsize = AtomicUsize::new(0);
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            if n < 16 || n.is_power_of_two() {
-                crate::xlog_info!("D3D12.X: a big pipeline a bind waits for is compiled without waiting for {passed} built ahead of their first use ({} so far)", n + 1);
-            }
-        }
-        // a preload thread runs at the lowest priority: not while the title waits for its build
-        let priority = unsafe {
-            use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_NORMAL};
-            // (a failed call returns THREAD_PRIORITY_ERROR_RETURN, i32::MAX: not below normal)
-            let p = GetThreadPriority(GetCurrentThread());
-            (p < THREAD_PRIORITY_NORMAL && SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) != 0).then_some(p)
-        };
-        SlotGuard { slots: self, wanted: true, priority }
-    }
-}
-
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        if let Some(p) = self.priority {
-            unsafe {
-                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
-                SetThreadPriority(GetCurrentThread(), p);
-            }
-        }
-        let mut g = self.slots.state.lock().unwrap();
-        if self.wanted {
-            g.held_wanted -= 1;
-        } else {
-            g.held -= 1;
-        }
-        drop(g);
-        self.slots.cv.notify_all();
-    }
-}
-
-/// Driver compiles of big programs in the background (each ~1.5 GB of commit in the driver;
-/// `real::wait_for_commit` under the slot only checks for 3 GB free before one starts, so the
-/// counts stay small): one at a time for the pipelines built ahead of their first use, two for
-/// those a bind waits for.
-static BIG_COMPILES: Slots = Slots::new(1, 2);
-
-/// The same for the huge programs (`real::HUGE_DRIVER_COMPILE`), in a lane of their own: one
-/// built ahead of its first use takes the driver many minutes, and the other big ones are not
-/// held up meanwhile.
-static HUGE_COMPILES: Slots = Slots::new(1, 1);
-
-/// A slot for a big driver compile on a worker (`huge`: of a huge program); the build of a
-/// pipeline a bind waits for does not wait for the pipelines built ahead of their first use.
-pub fn big_compile(huge: bool) -> SlotGuard {
-    let mine = BUILDING.with(|b| b.borrow().clone());
-    if huge {
-        HUGE_COMPILES.acquire(mine)
-    } else {
-        BIG_COMPILES.acquire(mine)
-    }
 }
 
 #[cfg(test)]
@@ -575,6 +485,49 @@ mod used_tests {
         released(blob);
     }
 
+    /// A compile a worker's build starts is wanted once a bind waits for the build – asked from
+    /// another thread, as the DXC workers do; a thread that builds nothing (no title runs here)
+    /// wants nothing.
+    #[test]
+    fn a_waiting_bind_makes_the_builds_compiles_wanted() {
+        let standin = 0x7E57_B005usize;
+        let (tx, rx) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            tx.send(wanted_here()).unwrap();
+            let t = std::time::Instant::now();
+            while !build_is_wanted() && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            0x5454
+        }));
+        let wanted = rx.recv().unwrap();
+        assert!(!wanted(), "nobody waits yet");
+        assert_eq!(resolve_wait_for(standin, None, None), 0x5454);
+        assert!(wanted());
+        assert!(!wanted_here()());
+        let _ = released(standin);
+    }
+
+    /// A worker's build hears that a bind waits for it (and only its own build does).
+    #[test]
+    fn a_waiting_bind_makes_the_build_wanted() {
+        let standin = 0x7E57_B004usize;
+        let (started_tx, started) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            let unwanted_first = !build_is_wanted();
+            started_tx.send(()).unwrap();
+            let t = std::time::Instant::now();
+            while !build_is_wanted() && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if unwanted_first && build_is_wanted() { 0x5353 } else { 0 }
+        }));
+        started.recv().unwrap();
+        assert!(!build_is_wanted(), "this thread builds nothing");
+        assert_eq!(resolve_wait_for(standin, None, None), 0x5353, "the bind's wait reached the build");
+        let _ = released(standin);
+    }
+
     #[test]
     fn the_keys_of_a_file_are_read_and_other_lines_passed_over() {
         let keys = used::parse("00000000000000ff\n\nnot a key\n  1a2b \n0\n");
@@ -624,18 +577,19 @@ mod used_tests {
         released(graphics);
     }
 
-    /// A bind of a pipeline whose build a preload thread took and that waits for the big-compile
-    /// slot a pipeline built ahead holds (a retail game's biggest programs held it for many
-    /// minutes) is built at once, without waiting for that one or the other ones built ahead.
+    /// A bind of a pipeline whose build a preload thread took and that waits for its turn at the
+    /// big-compile slot a pipeline built ahead holds (a retail game's biggest programs held it for
+    /// many minutes) is built at once, without waiting for that one or the other ones built ahead.
     #[test]
     fn a_bound_pipeline_does_not_wait_for_the_big_compiles_of_the_ones_built_ahead() {
+        use super::super::real::{big_compile_turn, BIG_COMPILES};
         let order = Arc::new(Mutex::new(Vec::new()));
         let arrived = Arc::new(Mutex::new(Vec::new()));
         let job = |id: usize| -> Job {
             let (order, arrived) = (order.clone(), arrived.clone());
             Box::new(move || {
                 arrived.lock().unwrap().push(id);
-                let _slot = big_compile(false);
+                let _slot = big_compile_turn(&BIG_COMPILES, || true, build_is_wanted);
                 order.lock().unwrap().push(id);
                 std::thread::sleep(std::time::Duration::from_millis(5));
                 id ^ 0xF000
@@ -643,7 +597,7 @@ mod used_tests {
         };
         // held here for the whole test, as by a build ahead the driver never finishes: the
         // preload threads queue for it
-        let held = big_compile(false);
+        let held = big_compile_turn(&BIG_COMPILES, || true, || false).expect("a free slot");
         let bound = 0x7E57_8000usize;
         submit_lazy(bound, true, job(bound), 0);
         let others: Vec<usize> = (1..=8).map(|k| bound + k).collect();
@@ -652,15 +606,8 @@ mod used_tests {
         }
         let p = entry(bound).unwrap();
         let start = std::time::Instant::now();
-        // every build that arrived at the slot (the bound one too) waits for it
-        loop {
-            let (bound_arrived, n) = {
-                let a = arrived.lock().unwrap();
-                (a.contains(&bound), a.len())
-            };
-            if bound_arrived && BIG_COMPILES.state.lock().unwrap().waiting.len() == n {
-                break;
-            }
+        // the bound one's build waits for its turn
+        while !arrived.lock().unwrap().contains(&bound) {
             assert!(start.elapsed() < std::time::Duration::from_secs(10), "a preload thread takes the bound pipeline");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -682,21 +629,6 @@ mod used_tests {
             released(o);
         }
         released(bound);
-    }
-
-    /// A huge program built ahead of its first use (a retail game's 28 MB DXIL ones took the
-    /// driver 15+ min) does not hold up the big ones built ahead.
-    #[test]
-    fn a_huge_compile_built_ahead_does_not_hold_up_the_big_ones() {
-        let huge = big_compile(true);
-        // (it may wait for a big one of another test, which is given back)
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            drop(big_compile(false));
-            let _ = tx.send(());
-        });
-        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "the big one waits for the huge one");
-        drop(huge);
     }
 }
 
@@ -731,7 +663,7 @@ pub fn resolve_wait(pso: usize) -> usize {
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>, huge: Option<usize>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
-    want(&p);
+    p.want();
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget, huge);
     }
@@ -742,9 +674,8 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>, huge: Optio
         // built on this thread: as long a wait
         let start = Instant::now();
         WAITING.fetch_add(1, Ordering::Relaxed);
-        let real = build(&p, job);
+        let real = build(&p, job, false);
         WAITING.fetch_sub(1, Ordering::Relaxed);
-        complete(&p, real);
         if start.elapsed() >= LONG_WAIT {
             crate::xlog_info!(
                 "D3D12.X: a bind waited {:.1} s in all for {}: {} on the binding thread ({})",
@@ -773,7 +704,7 @@ fn build_aside(p: &Arc<Pending>) -> bool {
             // (None: a worker took it meanwhile)
             let job = p.job.lock().unwrap().take();
             if let Some(job) = job {
-                complete(&p, build(&p, job));
+                build(&p, job, false);
             }
         })
         .is_ok()
@@ -912,28 +843,17 @@ enum Stage {
     Queued,
     /// a thread translates it, compiles its HLSL (DXC) or creates it
     Building(Instant, Who),
-    /// its build waits for a slot of these (`big_compile`)
-    Slot(Instant, Who, &'static Slots),
-    /// its build holds a slot and waits for free commit (`real::wait_for_commit`)
+    /// its build waits for its turn at this lane of big driver compiles (`real::big_compile_turn`)
+    Slot(Instant, Who, &'static str),
+    /// its build holds a slot and waits for free commit (`real::big_compile_commit_free`)
     Commit(Instant, Who),
-    /// in the driver's compiler (`driver_start`), with a slot of these (true: one kept for binds)
-    Driver(Instant, Who, Option<(&'static Slots, bool)>),
+    /// in the driver's compiler (`driver_start`), holding a slot of this lane (None: without one)
+    Driver(Instant, Who, Option<&'static str>),
 }
 
-impl Slots {
-    fn name(&'static self) -> &'static str {
-        if std::ptr::eq(self, &HUGE_COMPILES) {
-            "huge-compile slot"
-        } else {
-            "big-compile slot"
-        }
-    }
-}
-
-fn slot_text(slot: Option<(&'static Slots, bool)>) -> String {
+fn slot_text(slot: Option<&'static str>) -> String {
     match slot {
-        Some((s, true)) => format!("holding a {} kept for binds", s.name()),
-        Some((s, false)) => format!("holding the {} of the builds ahead of their first use", s.name()),
+        Some(lane) => format!("holding the {lane} of the builds no bind waited for"),
         None => "without a compile slot".into(),
     }
 }
@@ -974,19 +894,7 @@ impl Pending {
             Stage::Queued => self.queue_place(),
             Stage::Building(t, who) if self.compute => format!("translated / compiled by DXC on {who} for {:.1} s, not in the driver's compiler yet", secs(t)),
             Stage::Building(t, who) => format!("being built on {who} for {:.1} s (translation, DXC or the driver)", secs(t)),
-            Stage::Slot(t, who, slots) => {
-                let g = slots.state.lock().unwrap();
-                format!(
-                    "waiting {:.1} s on {who} for a {} ({}/{} kept for binds and {}/{} for builds ahead held, {} builds waiting)",
-                    secs(t),
-                    slots.name(),
-                    g.held_wanted,
-                    slots.most_wanted,
-                    g.held,
-                    slots.most,
-                    g.waiting.len()
-                )
-            }
+            Stage::Slot(t, who, lane) => format!("waiting {:.1} s on {who} for its turn at the {lane} (one at a time; at once when a bind waits for it)", secs(t)),
             Stage::Commit(t, who) => format!("holding a compile slot on {who}, waiting {:.1} s for 3 GB of free commit before the driver's compiler", secs(t)),
             Stage::Driver(t, who, slot) => format!("in the driver's compiler for {:.1} s on {who}, {}", secs(t), slot_text(slot)),
         }
@@ -1098,16 +1006,33 @@ pub fn dxil_known(dxil: usize, console: &[u8], compiles: bool) {
     p.cv.notify_all();
 }
 
+/// The build on this thread waits for its turn at `lane` of big driver compiles (for the logs).
+pub(super) fn turn_wait(lane: &'static str) {
+    if let Some(p) = BUILDING.with(|b| b.borrow().clone()) {
+        p.set_stage(Stage::Slot(Instant::now(), Who::me(), lane));
+    }
+}
+
+/// The build on this thread holds its slot and waits for free commit (for the logs; asked at
+/// each look).
+pub(super) fn commit_wait() {
+    if let Some(p) = BUILDING.with(|b| b.borrow().clone()) {
+        let mut stage = p.stage.lock().unwrap();
+        if !matches!(*stage, Stage::Commit(..)) {
+            *stage = Stage::Commit(Instant::now(), Who::me());
+        }
+    }
+}
+
 /// A driver compile of a compute program of `dxil` bytes (console shader `console`) starts on
 /// this thread now, with `slot` (None: without one); a `big` one is logged. (A pipeline's build
 /// told `dxil_known` its DXIL first.)
-pub fn driver_start(dxil: usize, console: &[u8], slot: Option<&SlotGuard>, big: bool) {
+pub fn driver_start(dxil: usize, console: &[u8], slot: Option<&'static str>, big: bool) {
     let mine = BUILDING.with(|b| b.borrow().clone());
     if mine.is_none() && !big {
         return;
     }
     let who = Who::me();
-    let slot = slot.map(|s| (s.slots, s.wanted));
     if let Some(p) = &mine {
         p.set_stage(Stage::Driver(Instant::now(), who.clone(), slot));
     }
@@ -1115,7 +1040,7 @@ pub fn driver_start(dxil: usize, console: &[u8], slot: Option<&SlotGuard>, big: 
         return;
     }
     let (what, waits) = match &mine {
-        Some(p) => (p.describe(), if p.wanted.load(Ordering::Acquire) { "yes" } else { "no" }),
+        Some(p) => (p.describe(), if p.demand.lock().unwrap().wanted { "yes" } else { "no" }),
         None => (format!("a compute program in the title's call (console shader {:016x}, {dxil} B DXIL)", crate::gpu::shader::fnv64(console)), "the title's call does"),
     };
     crate::xlog_info!("D3D12.X: driver compile of {what} starts on {who}, {}; a bind waits for it: {waits}", slot_text(slot));
