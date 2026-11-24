@@ -30,6 +30,7 @@ pub mod shaders;
 pub mod state;
 pub mod stubs;
 pub mod tls;
+pub mod title_watchdog;
 pub mod util;
 pub mod vfs;
 pub mod vfs_hooks;

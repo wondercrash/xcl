@@ -203,6 +203,12 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         }
     }
 
+    // 5b. the title's own hang watchdog defused on request (XCL_TITLE_WATCHDOG=0), while the
+    // image is still writable
+    if is_main {
+        unsafe { crate::title_watchdog::apply(pe.timestamp, base, size, &name) };
+    }
+
     // 6. page protections
     unsafe {
         let mut old = 0u32;
