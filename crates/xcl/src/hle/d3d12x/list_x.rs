@@ -1983,9 +1983,12 @@ unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &
         wait_all_on(std::ptr::null_mut(), &gated, list_writes);
         return;
     }
-    let (q, described) = (queue as usize, gated.clone());
+    let q = queue as usize;
+    // the gate's place among this queue's tracked waits and signals, for its warnings
+    let seq = SYNC_GRAPH.lock().unwrap().get_or_insert_with(SyncGraph::default).next_seq(q);
+    let described = gated.clone();
     let ready = move || gated.iter().all(|w| w.progress_reached());
-    if let Err(reason) = super::wait_gate::arm(queue, ready, move |reached| describe_gate(q, &described, reached)) {
+    if let Err(reason) = super::wait_gate::arm(queue, ready, move |reached| describe_gate(q, seq, &described, reached)) {
         fail_submission(reason);
     }
 }
@@ -1998,8 +2001,9 @@ fn queue_label(queue: usize) -> String {
 
 /// For a gate's warnings: what the gate on `queue` waits for and what XCL knows of each
 /// producer (its recorded Write64, the GPU signal after it, the deferred CPU write). Before the
-/// queue reaches the gate (`reached` false), also what XCL queued ahead of it there.
-fn describe_gate(queue: usize, waits: &[PendingWait], reached: bool) -> String {
+/// queue reaches the gate (`reached` false), also what XCL queued ahead of it there (`seq`: the
+/// gate's place in `SyncGraph::queue_seq`).
+fn describe_gate(queue: usize, seq: u64, waits: &[PendingWait], reached: bool) -> String {
     use std::fmt::Write as _;
     let label = |q: Option<usize>, none: &str| q.map_or_else(|| none.to_owned(), queue_label);
     let mut out = queue_label(queue);
@@ -2030,16 +2034,29 @@ fn describe_gate(queue: usize, waits: &[PendingWait], reached: bool) -> String {
         }
     }
     if !reached {
-        let bridged: Vec<(u64, u64, u64, Option<usize>)> = SYNC_GRAPH.lock().unwrap().as_ref().map_or_else(Vec::new, |gr| {
-            let mut v = Vec::new();
+        // XCL's own waits and Write64 signals on this queue not yet done on the GPU: waits ahead
+        // of the gate hold it; signals ahead of it say where in its work the queue stands.
+        let (bridged, signals) = SYNC_GRAPH.lock().unwrap().as_ref().map_or_else(Default::default, |gr| {
+            let (mut waits, mut signals): (Vec<(u64, u64, u64, Option<usize>)>, Vec<(u64, u64, u64)>) = Default::default();
             for (&va, c) in &gr.cells {
                 let done = c.fence.as_ref().map_or(0, |f| unsafe { f.GetCompletedValue() });
-                v.extend(c.armed_waits.iter().filter(|aw| aw.waiting_queue == queue && aw.val > done).map(|aw| (va, aw.val, done, c.submitted_queue)));
+                waits.extend(c.armed_waits.iter().filter(|aw| aw.waiting_queue == queue && aw.val > done).map(|aw| (va, aw.val, done, c.submitted_queue)));
+                signals.extend(c.submitted_signals.iter().filter(|s| s.queue == queue && s.seq < seq && s.val > done).map(|s| (s.seq, va, s.val)));
             }
-            v
+            signals.sort_unstable();
+            (waits, signals)
         });
         for (va, val, done, by) in bridged {
             let _ = write!(out, "; bridged GPU wait {va:#x} >= {val:#x} ahead (at {done:#x}, signal by {})", label(by, "nobody yet"));
+        }
+        if signals.is_empty() {
+            out.push_str("; no Write64 signal of this queue ahead of the gate is pending");
+        } else {
+            let list: Vec<String> = signals.iter().take(8).map(|&(_, va, val)| format!("{va:#x}={val:#x}")).collect();
+            let _ = write!(out, "; {} Write64 signal(s) of this queue ahead of the gate pending, first {}", signals.len(), list.join(" "));
+        }
+        if let Some((done, value)) = super::cpu_writes::queue_progress(queue) {
+            let _ = write!(out, "; CPU-write fence of this queue at {done}/{value}");
         }
         let _ = write!(out, "; {}", super::sparse::hub_state());
     }

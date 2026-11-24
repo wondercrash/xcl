@@ -125,6 +125,13 @@ pub(super) fn queued_u64(va: usize) -> Option<(usize, u64, u64, u64)> {
         .max_by_key(|&(_, value, ..)| value)
 }
 
+/// `queue`'s CPU-write fence: (completed, last signalled). It is signalled after each submission
+/// with such writes, so it says how far the queue's work has come.
+pub(super) fn queue_progress(queue: usize) -> Option<(u64, u64)> {
+    let g = FENCES.lock().unwrap();
+    g.as_ref()?.get(&queue).map(|f| (unsafe { f.fence.GetCompletedValue() }, f.value))
+}
+
 /// The dwords at `va`, if the memory is still there and writable.
 unsafe fn write_now(va: usize, words: &[u32]) {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
