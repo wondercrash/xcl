@@ -3413,11 +3413,13 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     // in the background, within the commit left (each ~1.5 GB in the driver): one at a time for
     // the ones built ahead of their first use (huge ones in a lane of their own), and one a bind
     // waits for does not wait for those
-    let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
+    let slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
         let slot = super::pso_async::big_compile(dxil.len() >= HUGE_DRIVER_COMPILE);
         wait_for_commit();
         slot
     });
+    // (for the logs of a bind that waits for it; a big compile is logged as it starts)
+    super::pso_async::driver_start(dxil.len(), cs, slot.as_ref(), big && cached.is_none());
     let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 && cached.is_some() {
         // a blob the driver does not take (another root signature at the same address…): compiled
