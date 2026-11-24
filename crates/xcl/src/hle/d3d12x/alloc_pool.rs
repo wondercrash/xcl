@@ -13,6 +13,10 @@
 //! put aside earlier whose lists have all been reset since and whose submits are done, or a new
 //! one. A list reset on the title's allocator records on the PC allocator in use. A list holds
 //! one recording, so no more allocators are put aside than there are lists.
+//!
+//! What a recording put in unified memory (user SGPRs, argument tables, upload memory: `bind`,
+//! `console_list`) is the GPU's for as long: it is held for the PC allocator the recording is
+//! on (`recording_backing`) and goes when that one is reset, not when the title's is.
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -49,6 +53,8 @@ struct State {
     fences: HashMap<usize, (ID3D12Fence, u64)>,
     made: u64,
     swaps: u64,
+    /// swaps with submitted work of the allocator's lists not finished by the GPU
+    unfinished: u64,
 }
 
 unsafe impl Send for State {}
@@ -101,9 +107,20 @@ pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) 
     hr
 }
 
-#[cfg(test)]
-pub(super) fn recording_backing_for_test(list: usize) -> Option<usize> {
+/// The PC allocator the recording `list` holds is on (None: a list this does not know).
+pub(super) fn recording_backing(list: usize) -> Option<usize> {
     STATE.lock().unwrap().as_ref()?.of_list.get(&list).copied()
+}
+
+/// The title's allocator `alloc` stands for the PC allocator `backing` (None: for itself).
+#[cfg(test)]
+pub(super) fn stand_for_test(alloc: usize, backing: Option<usize>) {
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(State::default);
+    match backing {
+        Some(b) => s.cur.insert(alloc, b),
+        None => s.cur.remove(&alloc),
+    };
 }
 
 /// The PC allocator the title's allocator `alloc` stands for now.
@@ -185,20 +202,35 @@ pub unsafe fn forget(alloc: usize) {
     };
     // (outside the lock: their Release comes back here)
     for b in made {
+        super::console_list::allocator_reset(b as *mut c_void);
         drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
     }
 }
 
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
-/// aside with its recordings and another one took its place.
+/// aside with its recordings and another one took its place. A PC allocator reset here takes
+/// what its recordings put in unified memory with it; one put aside keeps that.
 pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     if !enabled() {
         return None;
     }
-    let mut g = STATE.lock().unwrap();
-    let s = g.get_or_insert_with(State::default);
-    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+    let mut reset = None;
+    let hr = {
+        let mut g = STATE.lock().unwrap();
+        let s = g.get_or_insert_with(State::default);
+        title_reset_in(s, alloc, |raw| {
+            let hr = super::real::reset_pc_allocator(raw);
+            if hr >= 0 {
+                reset = Some(raw);
+            }
+            hr
+        })
+    };
+    if let Some(raw) = reset {
+        super::console_list::allocator_reset(raw);
+    }
+    hr
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
@@ -215,6 +247,19 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
         return Some(reset(c as *mut c_void));
     }
     let ty = *s.types.get(&a)?;
+    // Submitted work of its lists the GPU has not finished: with lists reset since, their
+    // recordings' unified memory is held for this PC allocator alone (it was freed here, under
+    // the dispatches still queued, until that memory went with the PC allocator).
+    if s.backings.get(&c).is_some_and(|b| b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v)) {
+        s.unfinished += 1;
+        let blocks = super::console_list::held_for(c);
+        if s.unfinished.is_power_of_two() {
+            crate::xlog_warn!(
+                "D3D12.X: {} allocator resets so far with submitted lists the GPU has not finished – {blocks} block(s) of unified memory their recordings use (user SGPRs, argument tables, upload memory) stay until they have run",
+                s.unfinished
+            );
+        }
+    }
     // one put aside earlier that nothing uses any more, or a new one
     let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| s.backings.get(f).is_none_or(|b| b.free())));
     let next = match reuse {
@@ -402,10 +447,17 @@ mod tests {
             executed(queue.as_raw(), &[l]);
             done(1);
 
+            // what recordings on the PC allocator put in unified memory (a block of the pool
+            // where there is one: it is freed below)
+            let block = || crate::gpu::uma::get().and_then(|u| u.alloc(4096, 4096)).map_or(0xB10C_0000, |p| p as usize);
+            let held = block();
+            super::super::console_list::hold_until_reset(a as usize, vec![held]);
+
             // the title resets its allocator (through the hook: `real::alloc_reset`) …
             alloc.Reset().unwrap();
             let second = current(a as usize);
             assert_ne!(second, a as usize, "the list still holds its recording: another PC allocator takes the place");
+            assert_eq!(super::super::console_list::held_for(a as usize), 1, "the PC allocator put aside keeps its recordings' unified memory");
             // … and submits the recording again
             queue.ExecuteCommandLists(&lists);
             executed(queue.as_raw(), &[l]);
@@ -424,9 +476,13 @@ mod tests {
             done(3);
 
             // the next reset: the first PC allocator holds nothing now and is used again
+            super::super::console_list::hold_until_reset(second, vec![block()]);
             alloc.Reset().unwrap();
             assert_eq!(current(a as usize), a as usize, "the allocator put aside is free again");
             assert!(dev.GetDeviceRemovedReason().is_ok());
+            assert_eq!(super::super::console_list::held_for(a as usize), 0, "reset at last, it took its recordings' unified memory with it");
+            assert_eq!(super::super::console_list::held_for(second), 1, "the one put aside now keeps its own");
+            assert_eq!(super::super::console_list::take_pending_for_test(second).len(), 1);
 
             // the title's allocator goes while another PC allocator stands for it: nothing of
             // it stays (the next allocator at its address is its own)

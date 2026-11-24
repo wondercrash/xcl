@@ -4482,7 +4482,7 @@ mod tests {
 
         RESET_TEST_HR.store(0x8000_4005, Ordering::SeqCst);
         assert!(unsafe { reset_x(list, 0x333, 0x555) } < 0);
-        let failed_backing = super::super::alloc_pool::recording_backing_for_test(key);
+        let failed_backing = super::super::alloc_pool::recording_backing(key);
         assert_eq!(object[0], ext);
         {
             let g = LISTS.lock().unwrap();
@@ -4503,7 +4503,7 @@ mod tests {
 
         RESET_TEST_HR.store(0, Ordering::SeqCst);
         assert_eq!(unsafe { reset_x(list, 0x333, 0x555) }, 0);
-        let successful_backing = super::super::alloc_pool::recording_backing_for_test(key);
+        let successful_backing = super::super::alloc_pool::recording_backing(key);
         assert_eq!(object[0], ext);
         {
             let g = LISTS.lock().unwrap();
@@ -4526,6 +4526,48 @@ mod tests {
         }
         assert_eq!(failed_backing, Some(0x111), "failed Reset must keep holding the old recording's allocator");
         assert_eq!(successful_backing, Some(0x333), "only successful Reset moves the recording to its new allocator");
+    }
+
+    /// What a recording put in unified memory (user SGPRs, argument tables) is held for the PC
+    /// allocator it is on, not for the title's allocator standing for it: the title resets its
+    /// own while the GPU still has the recording to run, and that must not free the memory.
+    #[test]
+    fn a_recordings_unified_memory_is_held_for_its_pc_allocator() {
+        use super::super::{alloc_pool, bind, console_list};
+        unsafe extern "system" fn native_reset(_this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+            0
+        }
+        let mut native = vec![0usize; PC_RESET + 1];
+        native[PC_RESET] = native_reset as usize;
+        let extended = [native.as_ptr() as usize, 0usize];
+        let ext = unsafe { extended.as_ptr().add(1) as usize };
+        let mut object = [ext];
+        let list = object.as_mut_ptr() as *mut c_void;
+        let key = list as usize;
+        // (addresses of this test's own: the allocator maps are shared between tests)
+        let ids = Box::new([0u8; 3]);
+        let title = ids.as_ptr() as usize;
+        let (pc_alloc, next) = (title + 1, title + 2);
+
+        unsafe { on_create(list, next, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        // the title's allocator stands for another PC allocator (reset earlier with recordings
+        // still held): a list reset on it records there
+        alloc_pool::stand_for_test(title, Some(pc_alloc));
+        assert_eq!(unsafe { reset_x(list, title, 0) }, 0);
+        let recorded_on = (alloc_pool::recording_backing(key), bind::reset_state_for_test(list).0);
+        bind::seed_reset_state_for_test(list, recorded_on.1, 0, vec![0x4444]);
+        // the list goes on to its next recording: the finished one's memory waits for its allocator
+        assert_eq!(unsafe { reset_x(list, next, 0) }, 0);
+        let held = (console_list::take_pending_for_test(pc_alloc), console_list::take_pending_for_test(title));
+
+        on_release(key);
+        bind::remove_state_for_test(list);
+        alloc_pool::stand_for_test(title, None);
+        for a in [title, pc_alloc, next] {
+            unsafe { alloc_pool::forget(a) };
+        }
+        assert_eq!(recorded_on, (Some(pc_alloc), pc_alloc), "the recording is on the PC allocator the title's stands for");
+        assert_eq!(held, (vec![0x4444], Vec::new()), "held for the PC allocator: a reset of the title's allocator onto another leaves it alone");
     }
 
     #[test]

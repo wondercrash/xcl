@@ -6,7 +6,8 @@
 //! compute root signature and root arguments are kept here – packed by the root signature's
 //! layout – instead of going to the PC list, and each Dispatch with a translated pipeline
 //! binds the ABI root signature, writes the user SGPRs (`io`) and the argument table to
-//! unified memory and dispatches. That memory stays until the list's allocator is reset.
+//! unified memory and dispatches. That memory stays until the PC allocator the recording is
+//! on is reset (`alloc_pool`: later than the title's Reset when the GPU still has it to run).
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -29,6 +30,7 @@ struct State {
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
     rs_gfx: usize,
     pso: usize,
+    /// the PC allocator this recording is on
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
     uma: Vec<usize>,
@@ -69,10 +71,20 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
+/// The PC allocator the recording `list` starts on the title's `allocator` is on (the title's
+/// own where `alloc_pool` does not know the list; 0: no recording).
+fn recording_allocator(list: *mut c_void, allocator: usize) -> usize {
+    if allocator == 0 {
+        return 0;
+    }
+    super::alloc_pool::recording_backing(list as usize).unwrap_or(allocator)
+}
+
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
+    let allocator = recording_allocator(list, allocator);
     let (old, blocks) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
@@ -107,6 +119,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
     });
+    let allocator = recording_allocator(to, allocator);
     let (old, blocks) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();

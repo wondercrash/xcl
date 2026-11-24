@@ -285,7 +285,7 @@ const OBJECT_BYTES: usize = 0x1000;
 
 struct ListState {
     pc: usize,
-    /// allocator the current recording uses (its Reset frees `uma`)
+    /// PC allocator the current recording is on (its Reset frees `uma`)
     allocator: usize,
     refs: u32,
     /// record chunks: (start, bytes used – filled in when the next chunk starts / at close)
@@ -297,15 +297,22 @@ struct ListState {
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
-/// unified-memory blocks of finished recordings, freed when their allocator is reset
+/// unified-memory blocks of finished recordings, freed when their PC allocator is reset
 static PENDING: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
 
-/// Unified-memory blocks a recording on `allocator` uses: freed when it is reset (no
-/// allocator known: kept until the next reset of any – never freed early).
+/// Unified-memory blocks a recording on the PC allocator `allocator` uses
+/// (`alloc_pool::recording_backing`: the title's allocator may be reset while the GPU still
+/// has the recording to run): freed when that one is reset (no allocator known: kept until
+/// the next reset of any – never freed early).
 pub(super) fn hold_until_reset(allocator: usize, blocks: Vec<usize>) {
     if !blocks.is_empty() {
         PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().extend(blocks);
     }
+}
+
+/// Unified-memory blocks held for the PC allocator `allocator`.
+pub(super) fn held_for(allocator: usize) -> usize {
+    PENDING.lock().unwrap().as_ref().and_then(|m| m.get(&allocator)).map_or(0, Vec::len)
 }
 
 /// Unified-memory blocks recordings hold until their allocators reset: (allocators, blocks).
@@ -318,7 +325,8 @@ pub(crate) fn take_pending_for_test(allocator: usize) -> Vec<usize> {
     PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
 }
 
-/// An allocator was reset: the GPU no longer uses what its recordings put in unified memory.
+/// A PC allocator was reset (or is gone): the GPU no longer uses what its recordings put in
+/// unified memory.
 pub fn allocator_reset(allocator: *mut c_void) {
     let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
     if let Some(b) = blocks {
@@ -423,12 +431,15 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
         return crate::util::E_FAIL;
     };
     // what the previous recording left in unified memory lives until its allocator resets
-    if !blocks.is_empty() {
-        PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(old_alloc).or_default().extend(blocks);
-    }
+    hold_until_reset(old_alloc, blocks);
     with_list(obj, |st| new_chunk(obj, st));
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
-    f(pc, allocator, pc_pso(pso))
+    let hr = f(pc, allocator, pc_pso(pso));
+    // (the PC allocator the new recording is on, where the title's stands for another)
+    if let Some(backing) = (hr >= 0).then(|| super::alloc_pool::recording_backing(pc)).flatten() {
+        with_list(obj, |st| st.allocator = backing);
+    }
+    hr
 }
 
 unsafe extern "system" fn cl_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {

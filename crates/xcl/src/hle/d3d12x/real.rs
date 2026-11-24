@@ -5164,11 +5164,12 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
-    // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
-    let hr = match super::alloc_pool::title_reset(this) {
-        Some(hr) => hr,
-        None => reset_pc_allocator(this),
-    };
+    // (lists may still hold recordings on it that the title submits again, or the GPU has
+    // them to run yet: `alloc_pool` then resets another PC allocator, with what is its own)
+    if let Some(hr) = super::alloc_pool::title_reset(this) {
+        return hr;
+    }
+    let hr = reset_pc_allocator(this);
     if hr >= 0 {
         // the GPU is done with what lists recorded from this allocator used
         super::console_list::allocator_reset(this);
