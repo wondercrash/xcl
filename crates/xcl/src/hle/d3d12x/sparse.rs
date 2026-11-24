@@ -2320,9 +2320,8 @@ mod tests {
         Gpu::new(book, dev, queue, fence, rb_fence, event, windows, Vec::new(), rb_alloc, rb_list)
     }
 
-    /// `queue()` does not take the state either (`QUEUE`): a resource's last `Release` asks for
-    /// it (`late_release::drain_known`) from inside a D3D12 call of its own (a list's `Reset`,
-    /// with `XCL_DRED=1`), and nothing here may wait on the state from there (#968).
+    /// `queue()` needs neither `WORK` nor `STATE` (`QUEUE`); `late_release` calls it from a
+    /// release (`drain_known`), which must not wait for `WORK` (#968).
     #[test]
     fn the_queue_is_answered_while_the_state_is_locked() {
         let held = STATE.lock().unwrap();
