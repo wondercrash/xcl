@@ -505,6 +505,13 @@ pub fn forget(res: usize) {
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         (removed, unsafe { clone_resources(&remap_ptrs) })
     };
+    // a remapped texture has new tiles, not what it held: its next upload is not left out
+    {
+        let mut last = LAST_CONTENT.lock().unwrap();
+        for r in &to_remap {
+            last.remove(&(r.as_raw() as usize));
+        }
+    }
     for r in &to_remap {
         unsafe {
             super::vram::remap_if_unmapped(r);
