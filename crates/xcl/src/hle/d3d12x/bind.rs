@@ -276,7 +276,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             list.SetGraphicsRootSignature(r);
         }
         pc(this, sig, max, args, args_off, count_buf, count_off);
-        super::breadcrumbs::after_indirect(this, with(this, |s| s.pso), args_at, || format!("ExecuteIndirect max {max} with a PC pipeline (args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
+        super::breadcrumbs::after_indirect(this, with(this, |s| s.pso), args_at, (args, args_off), || format!("ExecuteIndirect max {max} with a PC pipeline (args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
         return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -293,7 +293,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             count(if gfx { DRAWS } else { DISPATCHES });
             pc(this, sig, max, args, args_off, count_buf, count_off);
             let kind = if gfx { "draws" } else { "dispatches" };
-            super::breadcrumbs::after_indirect(this, with(this, |s| s.pso), args_at, || format!("ExecuteIndirect max {max} ({kind}; args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
+            super::breadcrumbs::after_indirect(this, with(this, |s| s.pso), args_at, (args, args_off), || format!("ExecuteIndirect max {max} ({kind}; args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });

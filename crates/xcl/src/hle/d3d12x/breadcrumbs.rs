@@ -2,9 +2,14 @@
 //!
 //! Three kinds of marks, all read back by a reporter thread every second:
 //! * ops: after each draw, dispatch and ExecuteIndirect of console code the PC list writes the
-//!   op's id twice into a readback buffer (`WriteBufferImmediate`): MARKER_IN (the GPU has
-//!   started it) and MARKER_OUT (it has finished). Ops console code skipped are noted too,
-//!   without a GPU write.
+//!   op's id twice into a readback buffer (`WriteBufferImmediate`): MARKER_IN (the commands
+//!   before it have begun: the op is with the GPU, "running") and MARKER_OUT (it has
+//!   finished). Ops console code skipped are noted too, without a GPU write.
+//!   "Running" is not "being worked on": while one queue's op holds the GPU, the other queues
+//!   of the device still hand their next op over, and it stands "running" behind it. (Runs 9,
+//!   12 and 14 of a retail title: one queue at an ExecuteIndirect "not started" with all
+//!   before it done, three at the first dispatch of their list, a shader of 88 bytes with no
+//!   loop, "running" for 30 s.)
 //! * calls: before each title call that records GPU work (draws, dispatches, copies, clears,
 //!   resolves, barriers, queries, the console's fills / writes / waits, KickoffX, Close) the
 //!   same two writes go to the list (`title_list` calls `reached`). MARKER_OUT there means all
@@ -21,7 +26,9 @@
 //! A queue whose fence has not moved for 2 s with events still queued is logged once: the
 //! event it is in, the one it passed before, what is queued after it and, for executed lists,
 //! the first mark not passed and the call or op the GPU is in (shaders by their
-//! `XCL_DUMP_SHADERS` dump names). A logged queue that moves on again is logged too (a long op,
+//! `XCL_DUMP_SHADERS` dump names; an ExecuteIndirect there with its arguments, group or draw
+//! counts the GPU made: as the CPU sees them and as the GPU reads them now, in their buffer
+//! and in the memory window). A logged queue that moves on again is logged too (a long op,
 //! not a hang). `XCL_STALL_REMOVE_S=N`: once a queue has stood still N s (at least the 3 s of
 //! its report), every queue's lists in flight are logged with what each got to by its marks,
 //! then the device is removed and the run ends. (DRED, `XCL_DRED=1`, reports no command list
@@ -80,6 +87,9 @@ struct Entry {
     list: usize,
     /// where an indirect op's arguments are in unified memory (0: not there, or no such op)
     args: usize,
+    /// the PC buffer an indirect op takes its arguments from and their offset in it (0: no
+    /// such op)
+    args_buf: (usize, u64),
 }
 
 struct Event {
@@ -207,8 +217,8 @@ impl Crumbs {
     /// Mark `id` as a report shows it.
     fn view(&self, id: u32) -> OpView {
         match self.entry(id) {
-            Some(e) => OpView { id, what: e.what.clone(), pso: e.pso, state: self.state(e), call: e.call, list: e.list, args: e.args },
-            None => OpView { id, what: "(overwritten)".to_owned(), pso: 0, state: "unknown", call: false, list: 0, args: 0 },
+            Some(e) => OpView { id, what: e.what.clone(), pso: e.pso, state: self.state(e), call: e.call, list: e.list, args: e.args, args_buf: e.args_buf },
+            None => OpView { id, what: "(overwritten)".to_owned(), pso: 0, state: "unknown", call: false, list: 0, args: 0, args_buf: (0, 0) },
         }
     }
 }
@@ -218,18 +228,17 @@ pub(super) unsafe fn after(list: *mut c_void, pso: usize, what: impl FnOnce() ->
     record(list, pso, what, true);
 }
 
-/// `after` for an ExecuteIndirect whose arguments are at `args` in unified memory (0: not
-/// there): a report of the op not finished says what they hold then – counts the GPU made,
-/// which no line of the recording has.
-pub(super) unsafe fn after_indirect(list: *mut c_void, pso: usize, args: usize, what: impl FnOnce() -> String) {
+/// `after` for an ExecuteIndirect that takes its arguments from `buf` (a PC buffer and the
+/// offset in it), at `args` in unified memory (0: not there): a report of the op not finished
+/// says what they hold then – counts the GPU made, which no line of the recording has.
+pub(super) unsafe fn after_indirect(list: *mut c_void, pso: usize, args: usize, buf: (usize, u64), what: impl FnOnce() -> String) {
     let Some(id) = record(list, pso, what, true) else { return };
-    if args != 0 {
-        let _ = with_state(|| None, |s| {
-            if let Some(e) = s.entries[id as usize % SLOTS].as_mut().filter(|e| e.id == id) {
-                e.args = args;
-            }
-        });
-    }
+    let _ = with_state(|| None, |s| {
+        if let Some(e) = s.entries[id as usize % SLOTS].as_mut().filter(|e| e.id == id) {
+            e.args = args;
+            e.args_buf = buf;
+        }
+    });
 }
 
 /// An op console code skipped (nothing went to the PC list).
@@ -330,7 +339,7 @@ unsafe fn push(list: *mut c_void, pso: usize, what: String, gpu: bool, call: boo
         for k in 0..2 {
             (*(s.words as *const AtomicU32).add(2 * slot + k)).store(0, Ordering::Release);
         }
-        s.entries[slot] = Some(Entry { id, pso, what, gpu, call, list: list as usize, args: 0 });
+        s.entries[slot] = Some(Entry { id, pso, what, gpu, call, list: list as usize, args: 0, args_buf: (0, 0) });
         let r = s.recordings.entry(list as usize).or_default();
         if r.submitted > 0 || r.ops.len() >= SLOTS {
             // a new recording after a reset `list_reset` was not told of (KickoffX, a spare
@@ -542,6 +551,7 @@ struct OpView {
     call: bool,
     list: usize,
     args: usize,
+    args_buf: (usize, u64),
 }
 
 impl OpView {
@@ -562,6 +572,50 @@ impl OpView {
         } else {
             format!("#{} {} ({}, {})", self.id, self.what, shaders(self.pso), self.state)
         }
+    }
+
+    /// `text` of the mark a list stands at: an indirect op's also says what the GPU reads as
+    /// its arguments now (`arguments_on_gpu`: a GPU copy, so only for this one mark). The op
+    /// is on a queue, so its buffer is alive.
+    fn text_at(&self) -> String {
+        let mut text = self.text();
+        if !self.call && self.args_buf.0 != 0 && !finished(self.state) && text.ends_with(')') {
+            text.pop();
+            text.push_str("; ");
+            text.push_str(&arguments_on_gpu(self.args_buf, self.args));
+            text.push(')');
+        }
+        text
+    }
+}
+
+/// The first words of an indirect op's arguments as the GPU reads them now (`real::gpu_read`):
+/// from `buf`, as ExecuteIndirect takes them, and, where they are in unified memory (`at`),
+/// from the memory window at the same address, as shaders wrote them. The two are one piece
+/// of video memory; in a sparse window that takes the buffer's tiles being the window's
+/// (`sparse::place_buffer`), and a count that differs says they are not.
+fn arguments_on_gpu(buf: (usize, u64), at: usize) -> String {
+    let room = unsafe { ID3D12Resource::from_raw_borrowed(&(buf.0 as *mut c_void)).map_or(0, |r| r.GetDesc().Width) }.saturating_sub(buf.1);
+    let n = (room.min(20) & !3) as usize;
+    if n == 0 {
+        return "no GPU read of them (past the end of their buffer)".to_owned();
+    }
+    let window = if at != 0 { real::uma_window_buffer(at, n) } else { None };
+    let parts: Vec<(usize, u64, usize)> = std::iter::once((buf.0, buf.1, n)).chain(window.map(|(b, off)| (b, off, n))).collect();
+    let words = |b: &[u8]| -> Vec<u32> { b.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect() };
+    match unsafe { real::gpu_read(&parts) } {
+        Ok(b) => gpu_words(&words(&b[..n]), window.map(|_| words(&b[n..])).as_deref()),
+        Err(e) => format!("no GPU read of them ({e})"),
+    }
+}
+
+/// `arguments_on_gpu`'s text for the words read from the op's buffer and from the window.
+fn gpu_words(buffer: &[u32], window: Option<&[u32]>) -> String {
+    let hex = |w: &[u32]| format!("[{}]", w.iter().map(|x| format!("{x:#x}")).collect::<Vec<_>>().join(", "));
+    match window {
+        None => format!("the GPU reads {} in their buffer", hex(buffer)),
+        Some(w) if w == buffer => format!("the GPU reads {} there, in their buffer and in the memory window alike", hex(buffer)),
+        Some(w) => format!("the GPU reads {} in their buffer and {} at their address in the memory window: the two are not the same video memory", hex(buffer), hex(w)),
     }
 }
 
@@ -598,13 +652,13 @@ fn culprit(ops: &[OpView]) -> Option<String> {
             p.list,
             p.text(),
             first.list,
-            first.text(),
+            first.text_at(),
             p.list,
             first.list
         ),
-        Some(p) if p.call => format!("the GPU is in the call {} on list {:#x}: its commands; the next mark is {}", p.text(), p.list, first.text()),
-        Some(p) => format!("the GPU is in the commands list {:#x} recorded after {} and before {} on list {:#x}", p.list, p.text(), first.text(), first.list),
-        None => format!("the GPU is in the commands before the first mark of its lists, {} on list {:#x}", first.text(), first.list),
+        Some(p) if p.call => format!("the GPU is in the call {} on list {:#x}: its commands; the next mark is {}", p.text(), p.list, first.text_at()),
+        Some(p) => format!("the GPU is in the commands list {:#x} recorded after {} and before {} on list {:#x}", p.list, p.text(), first.text_at(), first.list),
+        None => format!("the GPU is in the commands before the first mark of its lists, {} on list {:#x}", first.text_at(), first.list),
     })
 }
 
@@ -626,7 +680,7 @@ fn list_progress(lists: &[usize], ops: &[OpView], again: &[(usize, u32)]) -> Str
             }
             let passed = marks.iter().filter(|o| finished(o.state)).count();
             match marks.iter().find(|o| !finished(o.state)) {
-                Some(o) => format!("{list}: {passed}/{} passed, at {}", marks.len(), o.text()),
+                Some(o) => format!("{list}: {passed}/{} passed, at {}", marks.len(), o.text_at()),
                 None => format!("{list}: {passed}/{} passed", marks.len()),
             }
         })
@@ -937,7 +991,7 @@ mod tests {
     }
 
     fn mark(id: u32, state: &'static str, call: bool) -> OpView {
-        OpView { id, what: if call { "CopyBufferRegion (console #15)".into() } else { "Dispatch 1x1x1".into() }, pso: 0, state, call, list: 0x10, args: 0 }
+        OpView { id, what: if call { "CopyBufferRegion (console #15)".into() } else { "Dispatch 1x1x1".into() }, pso: 0, state, call, list: 0x10, args: 0, args_buf: (0, 0) }
     }
 
     /// The GPU is put in the call whose mark it passed last, not at the next op: a dispatch
@@ -971,6 +1025,48 @@ mod tests {
         }
         assert!(!op("done").text().contains("arguments"));
         assert!(!mark(7, "running", false).text().contains("arguments"), "an op with no arguments in unified memory");
+        // the mark a list stands at also asks the GPU, when it is an indirect op with a buffer
+        assert_eq!(op("done").text_at(), op("done").text());
+        assert_eq!(mark(7, "running", false).text_at(), mark(7, "running", false).text());
+    }
+
+    /// What the GPU reads as a stalled ExecuteIndirect's arguments is given for their buffer
+    /// (what the call takes) and for the memory window at their address (what shaders wrote):
+    /// two counts that differ are two pieces of video memory.
+    #[test]
+    fn the_gpus_reads_of_an_indirect_ops_arguments_are_compared() {
+        assert_eq!(gpu_words(&[3, 1, 1], None), "the GPU reads [0x3, 0x1, 0x1] in their buffer");
+        assert_eq!(gpu_words(&[0, 1, 1], Some(&[0, 1, 1])), "the GPU reads [0x0, 0x1, 0x1] there, in their buffer and in the memory window alike");
+        let two = gpu_words(&[0x3F80_0000, 7, 7], Some(&[0, 1, 1]));
+        assert!(two.starts_with("the GPU reads [0x3f800000, 0x7, 0x7] in their buffer and [0x0, 0x1, 0x1] at their address in the memory window: "), "{two}");
+        assert!(two.ends_with("not the same video memory"), "{two}");
+    }
+
+    /// The mark a list stands at, an ExecuteIndirect not finished: its line ends with what the
+    /// GPU reads in the buffer of its arguments and in the memory window (here one buffer: the
+    /// same words), 12 bytes when the buffer ends there.
+    #[test]
+    fn the_mark_a_list_stands_at_reads_an_indirect_ops_arguments_on_the_gpu() {
+        if let Err(e) = real::init() {
+            return skip_test(&format!("no real D3D12.X backend: {e}"));
+        }
+        let u = crate::gpu::uma::get().expect("UMA");
+        let Some(k) = (0..4).find(|&k| u.is_committed_window(k)) else { return skip_test("no coherent window") };
+        let p = u.alloc_in(k, 20, 0).expect("20 bytes in the coherent window") as usize;
+        unsafe {
+            (p as *mut [u32; 5]).write_unaligned([0xFFFF_FFF0, 1, 1, 7, 9]);
+            let (buf, off) = real::uma_window_buffer(p, 20).expect("the window's buffer");
+            let op = OpView { args: p, args_buf: (buf, off), what: "ExecuteIndirect max 1".into(), ..mark(7, "not started", false) };
+            let text = op.text_at();
+            assert!(text.starts_with(&op.text()[..op.text().len() - 1]), "{text}");
+            assert!(text.ends_with("; the GPU reads [0xfffffff0, 0x1, 0x1, 0x7, 0x9] there, in their buffer and in the memory window alike)"), "{text}");
+            // (no window: the buffer alone; at the end of the buffer: the words that are there)
+            assert_eq!(arguments_on_gpu((buf, off), 0), "the GPU reads [0xfffffff0, 0x1, 0x1, 0x7, 0x9] in their buffer");
+            let width = ID3D12Resource::from_raw_borrowed(&(buf as *mut c_void)).unwrap().GetDesc().Width;
+            assert!(arguments_on_gpu((buf, width - 12), 0).matches("0x").count() == 3);
+            assert_eq!(arguments_on_gpu((buf, width), 0), "no GPU read of them (past the end of their buffer)");
+        }
+        u.free(p as _);
     }
 
     fn on(list: usize, mut m: OpView) -> OpView {
