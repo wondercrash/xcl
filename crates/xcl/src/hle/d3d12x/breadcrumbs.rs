@@ -11,6 +11,8 @@
 //!   the work recorded before the call has finished. Without them the work between two ops
 //!   (copies, clears, barriers, what XCL records inside a call) had no mark, and a queue
 //!   stuck in it was reported at the next op as "not started".
+//!   A list keeps its marks until it is reset: one submitted again (`before_execute`) has
+//!   them cleared first where its run before has finished, so they show this run.
 //! * queue events: each title queue gets a fence of XCL's own, signalled after every chunk of
 //!   lists it executes and after every wait it is given (the title's queue Wait / Signal, the
 //!   Wait64 gates and bridged GPU waits, the sparse and VRAM page fences). Its completed value
@@ -87,6 +89,18 @@ struct Event {
     lists: Vec<usize>,
     /// ops of the lists this event executed, in recording order
     ops: Vec<u32>,
+    /// (list, times) of those whose recording had run before
+    again: Vec<(usize, u32)>,
+}
+
+/// The marks of the recording a PC list holds.
+#[derive(Default)]
+struct Recording {
+    ops: Vec<u32>,
+    /// times it went to a queue
+    submitted: u32,
+    /// (queue, its event) of the last time
+    last: Option<(usize, u64)>,
 }
 
 type QueueOp = unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT;
@@ -106,8 +120,8 @@ struct Crumbs {
     words: usize,
     next: u32,
     entries: Vec<Option<Entry>>,
-    /// PC list → ops recorded on it since it last went to a queue
-    pending: HashMap<usize, Vec<u32>>,
+    /// PC list → the marks of its recording (until it is reset: it may go to a queue again)
+    recordings: HashMap<usize, Recording>,
     queues: HashMap<usize, QueueLine>,
 }
 
@@ -149,7 +163,7 @@ unsafe fn init(dev: &ID3D12Device) -> Option<Crumbs> {
         words: p as usize,
         next: 0,
         entries: (0..SLOTS).map(|_| None).collect(),
-        pending: HashMap::new(),
+        recordings: HashMap::new(),
         queues: HashMap::new(),
     })
 }
@@ -317,12 +331,13 @@ unsafe fn push(list: *mut c_void, pso: usize, what: String, gpu: bool, call: boo
             (*(s.words as *const AtomicU32).add(2 * slot + k)).store(0, Ordering::Release);
         }
         s.entries[slot] = Some(Entry { id, pso, what, gpu, call, list: list as usize, args: 0 });
-        let ops = s.pending.entry(list as usize).or_default();
-        if ops.len() >= SLOTS {
-            // a list recorded and reset without ever being executed
-            ops.clear();
+        let r = s.recordings.entry(list as usize).or_default();
+        if r.submitted > 0 || r.ops.len() >= SLOTS {
+            // a new recording after a reset `list_reset` was not told of (KickoffX, a spare
+            // segment taken again)
+            *r = Recording::default();
         }
-        ops.push(id);
+        r.ops.push(id);
         (id, s.gpu_va + 8 * slot as u64)
     })?;
     if !gpu {
@@ -370,24 +385,103 @@ unsafe fn mark(queue: *mut c_void, what: impl FnOnce() -> String, lists: &[*mut 
             None => return,
         },
     };
-    let _ = with_state(|| None, |s| {
-        let mut ops = Vec::new();
-        for l in lists {
-            if let Some(v) = s.pending.remove(&(*l as usize)) {
-                ops.extend(v);
-            }
-        }
+    let again = with_state(|| None, |s| {
         let line = s.queues.entry(queue as usize).or_insert_with(|| new_line.expect("queue line made above"));
         line.next += 1;
         if (line.signal)(queue, line.fence.as_raw(), line.next).is_err() {
             line.next -= 1;
-            return;
+            return Vec::new();
         }
+        let n = line.next;
+        let (mut ops, mut again) = (Vec::new(), Vec::new());
+        for l in lists {
+            if let Some(r) = s.recordings.get_mut(&(*l as usize)) {
+                ops.extend_from_slice(&r.ops);
+                r.submitted += 1;
+                r.last = Some((queue as usize, n));
+                if r.submitted > 1 {
+                    again.push((*l as usize, r.submitted));
+                }
+            }
+        }
+        // (what a recording that runs again holds, for its line below)
+        let held: Vec<(usize, u32, usize, Vec<OpView>)> = again
+            .iter()
+            .map(|&(l, times)| {
+                let ops = &s.recordings[&l].ops;
+                (l, times, ops.len(), ops.iter().map(|&id| s.view(id)).filter(|o| !o.call).take(SHOWN).collect())
+            })
+            .collect();
+        let line = s.queues.get_mut(&(queue as usize)).expect("queue line");
         if line.events.len() >= EVENTS {
             line.events.pop_front();
         }
-        line.events.push_back(Event { n: line.next, what, lists: lists.iter().map(|&l| l as usize).collect(), ops });
+        line.events.push_back(Event { n, what, lists: lists.iter().map(|&l| l as usize).collect(), ops, again });
+        held
     });
+    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+    for (list, times, marks, ops) in again.unwrap_or_default() {
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
+            let ops: Vec<String> = ops.iter().map(OpView::name).collect();
+            crate::xlog_warn!(
+                "D3D12.X: breadcrumbs: list {list:#x} runs again on {} without a Reset (time {times}): the {marks} mark(s) of its recording stand for this run now; its first ops: [{}]",
+                super::list_x::queue_label(queue as usize),
+                ops.join("; ")
+            );
+        }
+    }
+}
+
+/// `list` starts a new recording (Reset), or is gone: the marks of the one before are no
+/// longer its own. (Without it the Close of a list closed when it was made, and never run,
+/// stood first among the marks of its first recording, never passed.)
+pub(super) fn list_reset(list: usize) {
+    if !on() {
+        return;
+    }
+    if let Some(s) = STATE.lock().unwrap().as_mut() {
+        s.recordings.remove(&list);
+    }
+}
+
+/// `lists` are about to go to a queue (call before its ExecuteCommandLists): the marks of a
+/// recording that ran before are cleared, so that what they show is this run. Not while its
+/// run before is still on a queue: they stay that run's then.
+pub(super) unsafe fn before_execute(lists: &[*mut c_void]) {
+    if !on() {
+        return;
+    }
+    if let Some(s) = STATE.lock().unwrap().as_mut() {
+        for l in lists {
+            let Some(r) = s.recordings.get(&(*l as usize)).filter(|r| r.submitted > 0) else { continue };
+            if r.last.is_some_and(|(q, n)| s.queues.get(&q).is_some_and(|line| line.fence.GetCompletedValue() < n)) {
+                continue;
+            }
+            for &id in &r.ops {
+                if s.entry(id).is_some() {
+                    for k in 0..2 {
+                        (*(s.words as *const AtomicU32).add(2 * (id as usize % SLOTS) + k)).store(0, Ordering::Release);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What the title call just marked on `list` (`reached`) does that its name does not say (a
+/// copy's size), for the mark.
+pub(super) fn detail(list: *mut c_void, what: impl FnOnce() -> String) {
+    if !on() {
+        return;
+    }
+    if let Some(s) = STATE.lock().unwrap().as_mut() {
+        let Some(&id) = s.recordings.get(&(list as usize)).and_then(|r| r.ops.last()) else { return };
+        // (a call mark's text ends with its console slot until it has its detail)
+        if let Some(e) = s.entries[id as usize % SLOTS].as_mut().filter(|e| e.id == id && e.call && e.what.ends_with(')')) {
+            e.what.push_str(": ");
+            e.what.push_str(&what());
+        }
+    }
 }
 
 /// `lists` (PC lists) went to `queue` (call after the queue's ExecuteCommandLists).
@@ -451,6 +545,15 @@ struct OpView {
 }
 
 impl OpView {
+    /// The mark without its state.
+    fn name(&self) -> String {
+        if self.call {
+            format!("#{} {}", self.id, self.what)
+        } else {
+            format!("#{} {} ({})", self.id, self.what, shaders(self.pso))
+        }
+    }
+
     fn text(&self) -> String {
         if self.call {
             format!("#{} {} ({})", self.id, self.what, self.state)
@@ -506,19 +609,25 @@ fn culprit(ops: &[OpView]) -> Option<String> {
 }
 
 /// What each of `lists` (an event's, in order) got to by its marks in `ops`: `list 0x…: P/M
-/// passed[, at #N …]` (at: its first mark not passed), or `no marks`.
-fn list_progress(lists: &[usize], ops: &[OpView]) -> String {
+/// passed[, at #N …]` (at: its first mark not passed), or `no marks` (no title call that
+/// records GPU work, and no Close, since its Reset). `again`: (list, times) of those whose
+/// recording had run before.
+fn list_progress(lists: &[usize], ops: &[OpView], again: &[(usize, u32)]) -> String {
     lists
         .iter()
         .map(|&l| {
+            let list = match again.iter().find(|a| a.0 == l) {
+                Some(&(_, times)) => format!("list {l:#x} (run again without a Reset, time {times})"),
+                None => format!("list {l:#x}"),
+            };
             let marks: Vec<&OpView> = ops.iter().filter(|o| o.list == l).collect();
             if marks.is_empty() {
-                return format!("list {l:#x}: no marks");
+                return format!("{list}: no marks");
             }
             let passed = marks.iter().filter(|o| finished(o.state)).count();
             match marks.iter().find(|o| !finished(o.state)) {
-                Some(o) => format!("list {l:#x}: {passed}/{} passed, at {}", marks.len(), o.text()),
-                None => format!("list {l:#x}: {passed}/{} passed", marks.len()),
+                Some(o) => format!("{list}: {passed}/{} passed, at {}", marks.len(), o.text()),
+                None => format!("{list}: {passed}/{} passed", marks.len()),
             }
         })
         .collect::<Vec<_>>()
@@ -557,9 +666,9 @@ fn remove_device(queue: usize, secs: u32) {
             return;
         };
         crate::xlog_warn!("D3D12.X: breadcrumbs: {label} has stood still for {secs} s: the device is removed (XCL_STALL_REMOVE_S); what each list in flight got to:");
-        for (q, event, lists, ops) in in_flight() {
+        for (q, event, lists, ops, again) in in_flight() {
             // (a wait or signal event runs no list: the queue stands at it)
-            let at = if lists.is_empty() { "no list".to_owned() } else { list_progress(&lists, &ops) };
+            let at = if lists.is_empty() { "no list".to_owned() } else { list_progress(&lists, &ops, &again) };
             crate::xlog_warn!("D3D12.X: breadcrumbs at the removal: {} is in {event}: {at}", super::list_x::queue_label(q));
         }
         dev5.RemoveDevice();
@@ -568,8 +677,8 @@ fn remove_device(queue: usize, secs: u32) {
 }
 
 /// Each queue's event that has not passed (the one it is in), with the lists it executed and
-/// their marks: (queue, event, lists, marks).
-fn in_flight() -> Vec<(usize, String, Vec<usize>, Vec<OpView>)> {
+/// their marks: (queue, event, lists, marks, lists run again).
+fn in_flight() -> Vec<(usize, String, Vec<usize>, Vec<OpView>, Vec<(usize, u32)>)> {
     let g = STATE.lock().unwrap();
     let Some(s) = g.as_ref() else { return Vec::new() };
     let mut out = Vec::new();
@@ -580,7 +689,7 @@ fn in_flight() -> Vec<(usize, String, Vec<usize>, Vec<OpView>)> {
         }
         let Some(cur) = line.events.iter().find(|e| e.n == done + 1) else { continue };
         let ops = cur.ops.iter().map(|&id| s.view(id)).collect();
-        out.push((q, format!("#{} {}", cur.n, cur.what), cur.lists.clone(), ops));
+        out.push((q, format!("#{} {}", cur.n, cur.what), cur.lists.clone(), ops, cur.again.clone()));
     }
     out
 }
@@ -641,7 +750,15 @@ fn report() {
                 queue: q,
                 done,
                 passed,
-                current: format!("#{} {}", cur.n, cur.what),
+                current: match cur.again.as_slice() {
+                    [] => format!("#{} {}", cur.n, cur.what),
+                    again => format!(
+                        "#{} {} (run again without a Reset: {})",
+                        cur.n,
+                        cur.what,
+                        again.iter().map(|&(l, times)| format!("{l:#x} time {times}")).collect::<Vec<_>>().join(", ")
+                    ),
+                },
                 later: later.iter().take(SHOWN).map(|e| format!("#{} {}", e.n, e.what)).collect(),
                 later_n: later.len(),
                 ops,
@@ -781,6 +898,41 @@ mod tests {
             assert!(until(|| fence.GetCompletedValue() >= 2), "the queue did not pass its marks");
             assert_eq!(state_of(ran), "done");
             assert_eq!(state_of(call), "passed");
+
+            // The same recording goes to the queue again: its marks are cleared first and
+            // stand for this run, and the event says the list ran before.
+            queue.Wait(&gate, 2).unwrap();
+            waited(queue.as_raw(), || "second test wait".into());
+            before_execute(&[list.as_raw()]);
+            assert_eq!((state_of(ran), state_of(call)), ("not started", "not reached"), "a recording that runs again starts with no mark passed");
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            if !real::is_adopted(queue.as_raw()) {
+                executed(queue.as_raw(), &[list.as_raw()]);
+            }
+            let (ops, again) = {
+                let g = STATE.lock().unwrap();
+                let e = g.as_ref().unwrap().queues[&(queue.as_raw() as usize)].events.back().unwrap();
+                (e.ops.clone(), e.again.clone())
+            };
+            assert_eq!((ops, again), (vec![ran, skip, call], vec![(list.as_raw() as usize, 2)]));
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(state_of(ran), "not started", "behind its wait the second run has not started");
+            gate.Signal(2).unwrap();
+            assert!(until(|| fence.GetCompletedValue() >= 4), "the queue did not pass the second run");
+            assert_eq!((state_of(ran), state_of(call)), ("done", "passed"));
+
+            // a Reset: the marks of the recording before are not the new one's
+            list_reset(list.as_raw() as usize);
+            list.Reset(&alloc, None).unwrap();
+            let new = push(list.as_raw(), 0, "a new recording".into(), true, false).unwrap();
+            assert_eq!(STATE.lock().unwrap().as_ref().unwrap().recordings[&(list.as_raw() as usize)].ops, vec![new]);
+            // a size for a call's mark, once
+            let copy = push(list.as_raw(), 0, "CopyBufferRegion (console #15)".into(), true, true).unwrap();
+            detail(list.as_raw(), || "0x40 bytes".into());
+            detail(list.as_raw(), || "again".into());
+            assert_eq!(STATE.lock().unwrap().as_ref().unwrap().view(copy).what, "CopyBufferRegion (console #15): 0x40 bytes");
+            list.Close().unwrap();
+            list_reset(list.as_raw() as usize);
         }
     }
 
@@ -845,8 +997,8 @@ mod tests {
     fn each_list_of_an_event_is_named_with_the_marks_it_passed() {
         let ops = [on(0x10, mark(1, "done", false)), on(0x10, mark(2, "passed", true)), on(0x20, mark(3, "not reached", true))];
         assert_eq!(
-            list_progress(&[0x10, 0x20, 0x30], &ops),
-            "list 0x10: 2/2 passed; list 0x20: 0/1 passed, at #3 CopyBufferRegion (console #15) (not reached); list 0x30: no marks"
+            list_progress(&[0x10, 0x20, 0x30], &ops, &[(0x20, 3)]),
+            "list 0x10: 2/2 passed; list 0x20 (run again without a Reset, time 3): 0/1 passed, at #3 CopyBufferRegion (console #15) (not reached); list 0x30: no marks"
         );
     }
 }
