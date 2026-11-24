@@ -17,6 +17,7 @@ use super::lower::{ComputeInit, Init, Lw, Partner, VAR_BUDGET, VAR_SCC, VAR_VGPR
 use super::module::{Block, Pred, Value};
 use super::shader::{RawUav, Shader};
 use super::ssa::Ssa;
+use crate::gpu::rdna2::Decoded;
 use crate::gpu::recomp::{CsInterface, MsInterface, PsInterface, VsInterface, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 
 #[derive(Debug, Clone, Copy)]
@@ -87,7 +88,7 @@ pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Resul
 
 /// The entry ABI.
 #[derive(Clone)]
-enum Entry {
+pub enum Entry {
     Kernel,
     Compute(CsInterface),
     Mesh(MsInterface),
@@ -132,123 +133,14 @@ fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>
 
 fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel, String> {
     let cfg = Cfg::build(code)?;
-    let split = o.wave64 && o.split;
     let kernel = matches!(entry, Entry::Kernel);
-    let cs = match &entry {
-        Entry::Compute(cs) => Some(cs.clone()),
-        _ => None,
-    };
-    let ms = match &entry {
-        Entry::Mesh(ms) => Some(ms.clone()),
-        _ => None,
-    };
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
-    let split = split && !gfx;
-    let stage = match &entry {
-        Entry::Vertex(_) => Stage::Vertex,
-        Entry::Pixel(_) => Stage::Pixel,
-        _ => Stage::Compute,
-    };
-    let mut s = Shader::new(stage, (6, 6));
-    let io = s.raw_uav(0, 0);
-    let res = if kernel || ms.is_some() { Some(s.raw_uav(1, 0)) } else { None };
-    let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, cs.is_some());
-    let i32 = s.m.i32();
-    let z = s.m.i32c(0);
-    let mut lw = Lw {
-        s,
-        ssa: Ssa::new(i32),
-        init: Init { io: Some(io), compute: None, vgpr_base: None, entry: Block(0), touched: BTreeSet::new() },
-        wave64: o.wave64,
-        split,
-        lane: z,
-        lane31: z,
-        upper: z,
-        half: z,
-        mems,
-        heap_mem,
-        res,
-        fmt_table: None,
-        fmt_desc_cache: HashMap::new(),
-        fmt_comp1_cache: HashMap::new(),
-        uma_base_val: None,
-        ntmp: 0,
-        scratch: None,
-        static_samplers: Default::default(),
-        static_used: Vec::new(),
-        sampler_base: o.sampler_base,
-        dyn_rm: false,
-        has_f64_round_op: false,
-        exec_cache: HashMap::new(),
-        xs: None,
-        xw: None,
-        xc: None,
-        waves: 1,
-        cw: z,
-        xn: z,
-        xslot: 1,
-        lds: None,
-        lds_top: 8191,
-        dpp_enable: None,
-        partner: Partner::Present,
-        mesh: None,
-        gfx: None,
-        gfx_half: None,
-        whole_live: Default::default(),
-        guard_override: None,
-        mask_override: None,
-        exchange_error: None,
-        pc: 0,
-    };
-    {
-        let Lw { s, ssa, init, .. } = &mut lw;
-        ssa.expect_preds(s, Block(0), 0, &mut |s, v| init.load(s, v));
-    }
-    // LDS and the split form's exchange slot size (16 words for a coherent s_load_dwordx16,
-    // 32 for ds_bpermute), as the HLSL kernel sizes them
-    let mut uses_lds = false;
-    let mut slot = 1u32;
-    for d in &cfg.insts {
-        let n = d.inst.name;
-        if d.enc.name == "ENC_DS" && !matches!(n, "DS_SWIZZLE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" | "DS_NOP") {
-            uses_lds = true;
-        }
-        if n == "DS_BPERMUTE_B32" {
-            slot = slot.max(32);
-        }
-        if d.enc.name == "ENC_SMEM" && ["GLC", "DLC"].iter().any(|f| crate::gpu::rdna2::field_value(d.enc, &d.words, f) == Some(1)) {
-            let w = match n.rsplit('_').next().unwrap_or("") {
-                "DWORDX2" => 2,
-                "DWORDX4" => 4,
-                "DWORDX8" => 8,
-                "DWORDX16" => 16,
-                _ => 1,
-            };
-            slot = slot.max(w);
-        }
-    }
+    let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
-    lw.static_samplers = crate::gpu::recomp::constant_samplers(&cfg.insts, &leaders);
-    let group_threads: Option<u32> = match &entry {
-        Entry::Vertex(_) | Entry::Pixel(_) => None,
-        Entry::Kernel => None,
-        Entry::Compute(cs) => Some(cs.threads.iter().product()),
-        Entry::Mesh(ms) => Some(ms.threads),
-    };
-    if let (Some(t), true) = (group_threads, split) {
-        lw.waves = t.div_ceil(64).max(1);
-    }
-    if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(&cfg.insts, kernel);
-    }
-    lw.setup_storage(uses_lds, if split { slot } else { 1 });
-    if let (Some(t), true) = (group_threads, split) {
-        lw.partner = match t {
-            0..=32 => Partner::Missing,
-            33..=64 => Partner::Present,
-            _ => Partner::Spin,
-        };
-    }
+    let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    let uses_lds = lw.lds.is_some();
+    let res = lw.res;
+    let io = lw.init.io.expect("the I/O buffer");
     let numthreads = match &entry {
         Entry::Kernel => {
             lw.setup_lanes();
@@ -364,25 +256,162 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     lw.s.m.ret();
     lw.s.m.set_block(Block(0));
     lw.s.m.br(h0);
-    if let Some(e) = lw.exchange_error.take() {
-        return Err(e);
-    }
     let hw = if split || !o.wave64 { 32 } else { 64 };
-    let c = if gfx {
-        let g = lw.gfx.take().ok_or("graphics entry without graphics I/O")?;
-        let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
-        lw.s.try_finish_graphics(g.io, info)
-    } else {
-        lw.s.try_finish(numthreads, Some(hw))
-    }
-    .map_err(|e| format!("direct DXIL builder error: {e}"))?;
-    if cfg!(any(test, debug_assertions)) {
-        if let Err(e) = super::validate::validate(&c) {
-            let dis = super::validate::disassemble(&c).unwrap_or_else(|d| d);
-            return Err(format!("direct DXIL failed validation: {e}\n--- disassembly ---\n{dis}"));
+    lw.finish(numthreads, hw)
+}
+
+impl Lw {
+    /// The translator's state for a program (`insts`, its blocks starting at `leaders`) at
+    /// `entry`: the shader with its buffers,
+    /// the SSA's entry block, the program's LDS and the split form's exchange storage and
+    /// partner. The caller then sets up the lanes for its entry (`setup_lanes*`), lowers the
+    /// program's blocks, branches from `Block(0)` to the first of them and ends with
+    /// [`Lw::finish`]. #1426's block walk (`translate_on_this_thread`) and the recompiler's
+    /// per-lane lowering (`recomp::lower_dxil`) both build their `Lw` here.
+    pub fn new(insts: &[Decoded], leaders: &BTreeSet<u64>, o: KernelOptions, entry: &Entry) -> Lw {
+        let split = o.wave64 && o.split;
+        let kernel = matches!(entry, Entry::Kernel);
+        let cs = match entry {
+            Entry::Compute(cs) => Some(cs.clone()),
+            _ => None,
+        };
+        let ms = match entry {
+            Entry::Mesh(ms) => Some(ms.clone()),
+            _ => None,
+        };
+        let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
+        let split = split && !gfx;
+        let stage = match entry {
+            Entry::Vertex(_) => Stage::Vertex,
+            Entry::Pixel(_) => Stage::Pixel,
+            _ => Stage::Compute,
+        };
+        let mut s = Shader::new(stage, (6, 6));
+        let io = s.raw_uav(0, 0);
+        let res = if kernel || ms.is_some() { Some(s.raw_uav(1, 0)) } else { None };
+        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, cs.is_some());
+        let i32 = s.m.i32();
+        let z = s.m.i32c(0);
+        let mut lw = Lw {
+            s,
+            ssa: Ssa::new(i32),
+            init: Init { io: Some(io), compute: None, vgpr_base: None, entry: Block(0), touched: BTreeSet::new() },
+            wave64: o.wave64,
+            split,
+            lane: z,
+            lane31: z,
+            upper: z,
+            half: z,
+            mems,
+            heap_mem,
+            res,
+            fmt_table: None,
+            fmt_desc_cache: HashMap::new(),
+            fmt_comp1_cache: HashMap::new(),
+            uma_base_val: None,
+            ntmp: 0,
+            scratch: None,
+            static_samplers: Default::default(),
+            static_used: Vec::new(),
+            sampler_base: o.sampler_base,
+            dyn_rm: false,
+            has_f64_round_op: false,
+            exec_cache: HashMap::new(),
+            xs: None,
+            xw: None,
+            xc: None,
+            waves: 1,
+            cw: z,
+            xn: z,
+            xslot: 1,
+            lds: None,
+            lds_top: 8191,
+            dpp_enable: None,
+            partner: Partner::Present,
+            mesh: None,
+            gfx: None,
+            gfx_half: None,
+            whole_live: Default::default(),
+            guard_override: None,
+            mask_override: None,
+            exchange_error: None,
+            pc: 0,
+        };
+        {
+            let Lw { s, ssa, init, .. } = &mut lw;
+            ssa.expect_preds(s, Block(0), 0, &mut |s, v| init.load(s, v));
         }
+        // LDS and the split form's exchange slot size (16 words for a coherent s_load_dwordx16,
+        // 32 for ds_bpermute), as the HLSL kernel sizes them
+        let mut uses_lds = false;
+        let mut slot = 1u32;
+        for d in insts {
+            let n = d.inst.name;
+            if d.enc.name == "ENC_DS" && !matches!(n, "DS_SWIZZLE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" | "DS_NOP") {
+                uses_lds = true;
+            }
+            if n == "DS_BPERMUTE_B32" {
+                slot = slot.max(32);
+            }
+            if d.enc.name == "ENC_SMEM" && ["GLC", "DLC"].iter().any(|f| crate::gpu::rdna2::field_value(d.enc, &d.words, f) == Some(1)) {
+                let w = match n.rsplit('_').next().unwrap_or("") {
+                    "DWORDX2" => 2,
+                    "DWORDX4" => 4,
+                    "DWORDX8" => 8,
+                    "DWORDX16" => 16,
+                    _ => 1,
+                };
+                slot = slot.max(w);
+            }
+        }
+        lw.static_samplers = crate::gpu::recomp::constant_samplers(insts, leaders);
+        let group_threads: Option<u32> = match entry {
+            Entry::Vertex(_) | Entry::Pixel(_) => None,
+            Entry::Kernel => None,
+            Entry::Compute(cs) => Some(cs.threads.iter().product()),
+            Entry::Mesh(ms) => Some(ms.threads),
+        };
+        if let (Some(t), true) = (group_threads, split) {
+            lw.waves = t.div_ceil(64).max(1);
+        }
+        if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
+            lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
+        }
+        lw.setup_storage(uses_lds, if split { slot } else { 1 });
+        if let (Some(t), true) = (group_threads, split) {
+            lw.partner = match t {
+                0..=32 => Partner::Missing,
+                33..=64 => Partner::Present,
+                _ => Partner::Spin,
+            };
+        }
+        lw
     }
-    Ok(Kernel { dxil: c, static_samplers: lw.static_used.iter().map(|&(w, c, _)| (w, c)).collect() })
+
+    /// The finished container and the static samplers the program bound, once every block
+    /// is closed: `numthreads` and the hardware wave size `hw` for a compute-like entry, the
+    /// stage's I/O for a VS / PS.
+    pub fn finish(mut self, numthreads: [u32; 3], hw: u32) -> Result<Kernel, String> {
+        if let Some(e) = self.exchange_error.take() {
+            return Err(e);
+        }
+        let stage = self.s.stage;
+        let c = if matches!(stage, Stage::Vertex | Stage::Pixel) {
+            let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
+            let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
+            self.s.try_finish_graphics(g.io, info)
+        } else {
+            self.s.try_finish(numthreads, Some(hw))
+        }
+        .map_err(|e| format!("direct DXIL builder error: {e}"))?;
+        if cfg!(any(test, debug_assertions)) {
+            if let Err(e) = super::validate::validate(&c) {
+                let dis = super::validate::disassemble(&c).unwrap_or_else(|d| d);
+                return Err(format!("direct DXIL failed validation: {e}\n--- disassembly ---\n{dis}"));
+            }
+        }
+        Ok(Kernel { dxil: c, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect() })
+    }
 }
 
 /// The kernel's epilogue: SGPRs and SCC from lane 0, every touched VGPR per lane.
@@ -415,7 +444,7 @@ fn store_registers(lw: &mut Lw, res: super::shader::RawUav) {
 
 /// The compute entry's fixed registers (the HLSL compute mode's prologue): group ids
 /// after the user SGPRs, TG_SIZE, SCC = 0, EXEC = the wave's threads, v0..v2 = thread id.
-fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3]) {
+pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3]) {
     let mut sgpr = HashMap::new();
     let mut next = cs.user_sgprs;
     for k in 0..3 {
@@ -453,7 +482,7 @@ fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3]) {
 /// The mesh entry's registers (the HLSL mesh mode's prologue): SGPRs from `io` with the
 /// wave index in s3[27:24], SCC 0, EXEC = the wave's threads, v5 = group · threads + slot,
 /// other VGPRs 0; and the record slots.
-fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::RawUav) {
+pub fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::RawUav) {
     let lanes: u32 = if lw.wave64 { 64 } else { 32 };
     let l = lw.c(lanes);
     let wave = lw.bin(super::module::BinOp::UDiv, tid, l);

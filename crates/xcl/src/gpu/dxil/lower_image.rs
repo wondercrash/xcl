@@ -12,6 +12,28 @@ use super::ops_core::op;
 use crate::gpu::rdna2::{self, Decoded};
 
 impl Lw {
+    /// The sampler of the MIMG at `pc`: a static sampler (bound at `s<i>, space1` in order of
+    /// first use) when the console bound one there, else the heap sampler the S# indexes.
+    fn mimg_sampler(&mut self, pc: u64, has_c: bool, s3: Value) -> Sampler {
+        match self.static_samplers.get(&pc).copied() {
+            Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
+                Some(u) => u.2,
+                None => {
+                    let k = self.static_used.len() as u32;
+                    let cur = self.cur();
+                    self.s.m.set_block(self.init.entry);
+                    let h = self.s.sampler(self.sampler_base + k, 1, has_c);
+                    self.s.m.set_block(cur);
+                    self.static_used.push((w, has_c, h));
+                    h
+                }
+            },
+            None => {
+                let si = self.andc(s3, 0xFFF);
+                self.s.heap_sampler(si, has_c, true)
+            }
+        }
+    }
     fn f3(&mut self, a: [Value; 3], b: [Value; 3], op: fn(&mut Lw, Value, Value) -> Value) -> [Value; 3] {
         [op(self, a[0], b[0]), op(self, a[1], b[1]), op(self, a[2], b[2])]
     }
@@ -466,25 +488,7 @@ impl Lw {
             let ps = self.gfx.as_ref().is_some_and(|g| g.ps.is_some());
             let spatial: Vec<Value> = coords[..kind.grads().min(coords.len())].to_vec();
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let smp: Sampler = match self.static_samplers.get(&d.pc).copied() {
-                // the console's static samplers: bound at s<i>, space1 in order of first use
-                Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
-                    Some(u) => u.2,
-                    None => {
-                        let k = self.static_used.len() as u32;
-                        let cur = self.cur();
-                        self.s.m.set_block(self.init.entry);
-                        let h = self.s.sampler(self.sampler_base + k, 1, has_c);
-                        self.s.m.set_block(cur);
-                        self.static_used.push((w, has_c, h));
-                        h
-                    }
-                },
-                None => {
-                    let si = self.andc(s3, 0xFFF);
-                    self.s.heap_sampler(si, has_c, true)
-                }
-            };
+            let smp: Sampler = self.mimg_sampler(d.pc, has_c, s3);
             if let Some(o) = ovgpr {
                 // texel offset / size of the sampled mip (0 for lz / gather; else the LOD given, else 0)
                 let level = match (&lod, has_lz || gather) {
@@ -620,9 +624,6 @@ impl Lw {
             if !self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
                 return err(d, "image_get_lod outside PS");
             }
-            if self.static_samplers.contains_key(&d.pc) {
-                return err(d, "image_get_lod with a static sampler");
-            }
             let coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
             let spatial: Vec<Value> = match dim {
                 3 => self.cube_dir(coords[0], coords[1], coords[2]).to_vec(),
@@ -630,8 +631,7 @@ impl Lw {
             };
             let s3 = self.sreg(ssamp + 3);
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let si = self.andc(s3, 0xFFF);
-            let smp = self.s.heap_sampler(si, false, true);
+            let smp = self.mimg_sampler(d.pc, false, s3);
             let a = self.s.calculate_lod(tex, smp, &spatial, true);
             let b = self.s.calculate_lod(tex, smp, &spatial, false);
             let z = self.c(0);

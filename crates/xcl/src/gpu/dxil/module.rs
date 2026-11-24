@@ -1110,9 +1110,19 @@ impl Module {
     /// Replaces every use of `old` by `new` in the entry's instructions and in
     /// metadata (e.g. to drop a trivial phi). `old` itself stays in its block.
     pub fn replace_all_uses(&mut self, old: Value, new: Value) {
+        self.replace_uses(&HashMap::from([(old, new)]));
+    }
+
+    /// `replace_all_uses` for every `old → new` of `map` in one pass over the module: a use
+    /// becomes the end of its chain (`a → b`, `b → c`: a use of `a` becomes `c`), as the same
+    /// calls one at a time in order would leave it.
+    pub fn replace_uses(&mut self, map: &HashMap<Value, Value>) {
+        if map.is_empty() {
+            return;
+        }
         let r = |v: &mut Value| {
-            if *v == old {
-                *v = new;
+            while let Some(&n) = map.get(v) {
+                *v = n;
             }
         };
         for inst in &mut self.insts {

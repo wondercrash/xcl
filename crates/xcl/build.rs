@@ -20,6 +20,16 @@ const TRANSLATOR_SOURCES: &[&str] = &[
     "src/gpu/xbox.rs",
 ];
 
+/// The per-lane form's sources (`XCL_PER_LANE`): part of only its own cache entries' identity,
+/// so editing them does not invalidate the HLSL path's.
+const PER_LANE_SOURCES: &[&str] = &[
+    "src/gpu/recomp/lane_masks.rs",
+    "src/gpu/recomp/lower.rs",
+    "src/gpu/recomp/lower/wave.rs",
+    "src/gpu/recomp/lower_dxil.rs",
+    "src/gpu/recomp/ssa.rs",
+];
+
 fn add(h: &mut u64, bytes: &[u8]) {
     for &byte in bytes {
         *h ^= byte as u64;
@@ -55,11 +65,13 @@ fn main() {
         add(&mut h, &[0]);
     }
     println!("cargo:rustc-env=XCL_TRANSLATOR_SOURCE_ID={h:016x}");
-    // xcl.exe is linked without high-entropy ASLR (#585): with it, `VirtualAlloc(NULL)` lands
-    // above 2^40 and a retail game's XboxBvhBuilder refuses acceleration structures there.
-    match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
-        Ok("msvc") => println!("cargo:rustc-link-arg-bin=xcl=/HIGHENTROPYVA:NO"),
-        Ok("gnu") => println!("cargo:rustc-link-arg-bin=xcl=-Wl,--disable-high-entropy-va"),
-        _ => {}
+    let mut p = 0xcbf2_9ce4_8422_2325u64;
+    for relative in PER_LANE_SOURCES {
+        println!("cargo:rerun-if-changed={relative}");
+        add(&mut p, relative.as_bytes());
+        add(&mut p, &[0]);
+        add(&mut p, &std::fs::read(root.join(relative)).expect("read per-lane source"));
+        add(&mut p, &[0]);
     }
+    println!("cargo:rustc-env=XCL_PER_LANE_SOURCE_ID={p:016x}");
 }
