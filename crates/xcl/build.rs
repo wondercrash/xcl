@@ -36,6 +36,13 @@ fn main() {
         _ => {}
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // xcl.exe asks for the segment heap (xcl.exe.manifest). Under the NT heap's one lock, 15 DXC
+    // threads made the NVIDIA driver's in-process pipeline compiles 2.4 times as slow.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rerun-if-changed=xcl.exe.manifest");
+        println!("cargo:rustc-link-arg-bin=xcl=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg-bin=xcl=/MANIFESTINPUT:{}", root.join("xcl.exe.manifest").display());
+    }
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     add(&mut h, b"xcl-translator-source-v1\0");
     add(&mut h, TRANSLATION_GLUE_REVISION.as_bytes());

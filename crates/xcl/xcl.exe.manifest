@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Embedded into xcl.exe by build.rs. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- The segment heap for the process heap: DXC, the NVIDIA driver's compiler and the title
+           allocate from it on many threads at once, and the NT heap's one lock serialized them. -->
+      <heapType xmlns="http://schemas.microsoft.com/SMI/2020/WindowsSettings">SegmentHeap</heapType>
+    </windowsSettings>
+  </application>
+</assembly>
