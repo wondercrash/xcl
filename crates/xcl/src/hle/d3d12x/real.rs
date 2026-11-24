@@ -5290,19 +5290,33 @@ pub fn drain_gpu() {
 }
 
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
-/// it) and the operations each command list got to – into the log, once.
+/// it) and the operations each command list got to – into the log, once. A second caller (the
+/// stall monitor and a gate monitor see the removal at the same time) waits for the first, so
+/// that its `stop_if_device_removed` does not end the process while the lines are written.
 pub fn log_device_removed() {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static ONCE: std::sync::Once = std::sync::Once::new();
     let raw = device_raw();
     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
     let Err(e) = (unsafe { dev.GetDeviceRemovedReason() }) else { return };
-    if DONE.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
-    unsafe {
-        let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
-        if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
+    ONCE.call_once(|| {
+        crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+        for line in unsafe { dred_lines(dev) } {
+            crate::xlog_error!("{line}");
+        }
+    });
+}
+
+/// DRED's view of a removed `dev`: the page fault, then each command list in flight that did
+/// not finish (the operation it stopped at marked `>`), and how many lists DRED had in flight.
+/// What DRED could not give is said too (it is silent only without `XCL_DRED`).
+unsafe fn dred_lines(dev: &ID3D12Device) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else {
+        out.push("DRED: not enabled (set XCL_DRED=1 before the run)".to_owned());
+        return out;
+    };
+    match dred.GetPageFaultAllocationOutput() {
+        Ok(pf) => {
             let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
                 let mut v = Vec::new();
                 while !n.is_null() && v.len() < 8 {
@@ -5315,23 +5329,78 @@ pub fn log_device_removed() {
             };
             let va = pf.PageFaultVA;
             let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
-            crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            out.push(format!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode)));
         }
-        if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
-            let mut n = bc.pHeadAutoBreadcrumbNode;
-            let mut k = 0;
-            while !n.is_null() && k < 64 {
+        Err(e) => out.push(format!("DRED page fault: none given ({e})")),
+    }
+    // (DRED 1.1 names the lists and queues; the 1.0 output has the same nodes without names)
+    macro_rules! walk {
+        ($head:expr) => {{
+            let mut v = Vec::new();
+            let mut n = $head;
+            while !n.is_null() {
                 let node = &*n;
-                let count = node.BreadcrumbCount as usize;
-                let done = if node.pLastBreadcrumbValue.is_null() { 0 } else { *node.pLastBreadcrumbValue as usize };
-                if done < count {
-                    let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, breadcrumb_op_name((*node.pCommandHistory.add(i)).0))).collect();
-                    crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
-                }
+                v.push(BreadcrumbNode::read(node.pCommandList.as_ref().map(|l| l.as_raw()), node.pCommandQueue.as_ref().map(|q| q.as_raw()), node.BreadcrumbCount, node.pLastBreadcrumbValue, node.pCommandHistory, node.pCommandListDebugNameA, node.pCommandQueueDebugNameA));
                 n = node.pNext;
-                k += 1;
             }
+            v
+        }};
+    }
+    let nodes: Vec<BreadcrumbNode> = match dred.cast::<ID3D12DeviceRemovedExtendedData1>().map(|d| d.GetAutoBreadcrumbsOutput1()) {
+        Ok(Ok(bc)) => walk!(bc.pHeadAutoBreadcrumbNode),
+        _ => match dred.GetAutoBreadcrumbsOutput() {
+            Ok(bc) => walk!(bc.pHeadAutoBreadcrumbNode),
+            Err(e) => {
+                out.push(format!("DRED: no auto-breadcrumbs ({e})"));
+                return out;
+            }
+        },
+    };
+    if nodes.is_empty() {
+        out.push("DRED: no command list in flight (none is kept after a removal by RemoveDevice, as XCL_STALL_REMOVE_S does: the breadcrumb lines before say what each list got to)".to_owned());
+        return out;
+    }
+    let unfinished: Vec<&BreadcrumbNode> = nodes.iter().filter(|n| n.done < n.ops.len()).collect();
+    for n in unfinished.iter().take(64) {
+        out.push(n.line());
+    }
+    out.push(format!("DRED: {} command list(s) in flight at the removal, {} of them not finished", nodes.len(), unfinished.len()));
+    out
+}
+
+/// One command list DRED had in flight: its operations and how many of them the GPU finished.
+struct BreadcrumbNode {
+    list: *mut c_void,
+    queue: *mut c_void,
+    names: String,
+    done: usize,
+    ops: Vec<i32>,
+}
+
+impl BreadcrumbNode {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn read(list: Option<*mut c_void>, queue: Option<*mut c_void>, count: u32, last: *const u32, history: *const D3D12_AUTO_BREADCRUMB_OP, list_name: *const u8, queue_name: *const u8) -> Self {
+        let name = |p: *const u8| (!p.is_null()).then(|| std::ffi::CStr::from_ptr(p as *const std::ffi::c_char).to_string_lossy().into_owned()).filter(|s| !s.is_empty());
+        let names = match (name(list_name), name(queue_name)) {
+            (None, None) => String::new(),
+            (l, q) => format!(" ({} on {})", l.unwrap_or_else(|| "unnamed".to_owned()), q.unwrap_or_else(|| "unnamed".to_owned())),
+        };
+        let ops = if history.is_null() { Vec::new() } else { (0..count as usize).map(|i| (*history.add(i)).0).collect() };
+        BreadcrumbNode {
+            list: list.unwrap_or(std::ptr::null_mut()),
+            queue: queue.unwrap_or(std::ptr::null_mut()),
+            names,
+            done: if last.is_null() { 0 } else { *last as usize },
+            ops,
         }
+    }
+
+    /// `DRED: list … on queue …: D of C operations done, around: … >Op …` (`>`: the first one
+    /// not done).
+    fn line(&self) -> String {
+        let (done, count) = (self.done, self.ops.len());
+        let around: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, breadcrumb_op_name(self.ops[i]))).collect();
+        format!("DRED: list {:p} on queue {:p}{}: {done} of {count} operations done, around: {}", self.list, self.queue, self.names, around.join(" "))
     }
 }
 
@@ -5366,6 +5435,84 @@ pub fn stop_if_device_removed() {
         unsafe {
             windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), e.code().0 as u32);
         }
+    }
+}
+
+#[cfg(test)]
+mod dred_tests {
+    use super::*;
+
+    const CHILD: &str = "XCL_TEST_DRED_CHILD";
+
+    /// The child's part: a list held behind a queue wait nothing signals, then `RemoveDevice`
+    /// (what `XCL_STALL_REMOVE_S` does). Its device is its own process's, so the removal does
+    /// not end other tests' devices.
+    unsafe fn removed_device_lines() -> Result<Vec<String>, String> {
+        let settings = crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(&CLSID_D3D12DeviceRemovedExtendedData).map_err(|e| format!("no DRED settings: {e}"))?;
+        settings.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        settings.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        let dev = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_12_0).map_err(|e| format!("no D3D12 device: {e}"))?;
+        let e = |e: windows::core::Error| e.to_string();
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        let buffer = || -> Result<ID3D12Resource, String> {
+            let hp = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 1 << 16,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, None, &mut r).map_err(e)?;
+            r.ok_or_else(|| "no buffer".to_owned())
+        };
+        let (a, b) = (buffer()?, buffer()?);
+        list.CopyBufferRegion(&b, 0, &a, 0, 256);
+        list.CopyBufferRegion(&a, 256, &b, 0, 256);
+        list.Close().map_err(e)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        queue.Wait(&fence, 1).map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        dev.cast::<ID3D12Device5>().map_err(e)?.RemoveDevice();
+        if dev.GetDeviceRemovedReason().is_ok() {
+            return Err("RemoveDevice left the device as it was".to_owned());
+        }
+        Ok(dred_lines(&dev))
+    }
+
+    /// A device removed while a list waits behind a queue wait (as `XCL_STALL_REMOVE_S` removes
+    /// it on a stall) is never left without DRED lines: DRED names the list and the operation it
+    /// did not get to, or says it has no list (what this driver and runtime do after
+    /// `RemoveDevice`), where the removal used to log the page fault alone.
+    #[test]
+    fn dred_names_the_list_a_removed_device_had_not_finished_or_says_it_has_none() {
+        if std::env::var_os(CHILD).is_some() {
+            match unsafe { removed_device_lines() } {
+                Ok(lines) => lines.iter().for_each(|l| println!("DREDLINE {l}")),
+                Err(e) => println!("DREDSKIP {e}"),
+            }
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "hle::d3d12x::real::dred_tests::dred_names_the_list_a_removed_device_had_not_finished_or_says_it_has_none", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(skip) = text.lines().find_map(|l| l.strip_prefix("DREDSKIP ")) {
+            return crate::gpu::recomp::runner::skip_test(skip);
+        }
+        let lines: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("DREDLINE ")).collect();
+        let named = lines.iter().any(|l| l.starts_with("DRED: list ") && l.contains(": 0 of 2 operations done, around: >CopyBufferRegion CopyBufferRegion"))
+            && lines.iter().any(|l| l.ends_with("1 of them not finished"));
+        let none = lines.iter().any(|l| l.starts_with("DRED: no command list in flight"));
+        assert!(named || none, "{lines:#?}\nchild stdout:\n{text}\nchild stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     }
 }
 
