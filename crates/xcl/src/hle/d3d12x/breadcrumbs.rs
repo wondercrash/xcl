@@ -217,8 +217,8 @@ impl Crumbs {
     /// Mark `id` as a report shows it.
     fn view(&self, id: u32) -> OpView {
         match self.entry(id) {
-            Some(e) => OpView { id, what: e.what.clone(), pso: e.pso, state: self.state(e), call: e.call, list: e.list, args: e.args, args_buf: e.args_buf },
-            None => OpView { id, what: "(overwritten)".to_owned(), pso: 0, state: "unknown", call: false, list: 0, args: 0, args_buf: (0, 0) },
+            Some(e) => OpView { id, what: e.what.clone(), pso: e.pso, state: self.state(e), call: e.call, list: e.list, args: e.args, args_buf: e.args_buf, args_ref: None },
+            None => OpView { id, what: "(overwritten)".to_owned(), pso: 0, state: "unknown", call: false, list: 0, args: 0, args_buf: (0, 0), args_ref: None },
         }
     }
 }
@@ -552,6 +552,27 @@ struct OpView {
     list: usize,
     args: usize,
     args_buf: (usize, u64),
+    /// a reference on `args_buf`'s buffer, for the mark whose line reads it on the GPU
+    /// (`hold_arguments`)
+    args_ref: Option<ID3D12Resource>,
+}
+
+/// For the marks whose line reads an indirect op's arguments on the GPU (`OpView::text_at`:
+/// the first mark not passed of each list), a reference on the buffer of the arguments. Taken
+/// with the marks, under the lock: the title can release the buffer once the queue has moved
+/// on, and the read comes after the lock, on a queue no late release waits for. Not kept from
+/// the recording on: a reference there would be the last one at the title's Release.
+unsafe fn hold_arguments(ops: &mut [OpView]) {
+    let mut lists: Vec<usize> = Vec::new();
+    for o in ops.iter_mut().filter(|o| !finished(o.state)) {
+        if lists.contains(&o.list) {
+            continue;
+        }
+        lists.push(o.list);
+        if !o.call && o.args_buf.0 != 0 {
+            o.args_ref = ID3D12Resource::from_raw_borrowed(&(o.args_buf.0 as *mut c_void)).cloned();
+        }
+    }
 }
 
 impl OpView {
@@ -575,14 +596,14 @@ impl OpView {
     }
 
     /// `text` of the mark a list stands at: an indirect op's also says what the GPU reads as
-    /// its arguments now (`arguments_on_gpu`: a GPU copy, so only for this one mark). The op
-    /// is on a queue, so its buffer is alive.
+    /// its arguments now (`arguments_on_gpu`: a GPU copy, so only for this one mark, whose
+    /// buffer `hold_arguments` keeps alive).
     fn text_at(&self) -> String {
         let mut text = self.text();
-        if !self.call && self.args_buf.0 != 0 && !finished(self.state) && text.ends_with(')') {
+        if let Some(buf) = self.args_ref.as_ref().filter(|_| text.ends_with(')')) {
             text.pop();
             text.push_str("; ");
-            text.push_str(&arguments_on_gpu(self.args_buf, self.args));
+            text.push_str(&arguments_on_gpu((buf.as_raw() as usize, self.args_buf.1), self.args));
             text.push(')');
         }
         text
@@ -742,7 +763,8 @@ fn in_flight() -> Vec<(usize, String, Vec<usize>, Vec<OpView>, Vec<(usize, u32)>
             continue;
         }
         let Some(cur) = line.events.iter().find(|e| e.n == done + 1) else { continue };
-        let ops = cur.ops.iter().map(|&id| s.view(id)).collect();
+        let mut ops: Vec<OpView> = cur.ops.iter().map(|&id| s.view(id)).collect();
+        unsafe { hold_arguments(&mut ops) };
         out.push((q, format!("#{} {}", cur.n, cur.what), cur.lists.clone(), ops, cur.again.clone()));
     }
     out
@@ -793,7 +815,8 @@ fn report() {
             let passed = line.events.iter().find(|e| e.n == done).map(|e| format!("#{} {}", e.n, e.what));
             let Some(cur) = line.events.iter().find(|e| e.n == done + 1) else { continue };
             let later: Vec<&Event> = line.events.iter().filter(|e| e.n > done + 1).collect();
-            let ops: Vec<OpView> = cur.ops.iter().map(|&id| s.view(id)).collect();
+            let mut ops: Vec<OpView> = cur.ops.iter().map(|&id| s.view(id)).collect();
+            unsafe { hold_arguments(&mut ops) };
             // ops console code skipped on any list just before the stuck one: a stand-in that
             // never wrote what the stuck op reads would be among them
             let anchor = ops.iter().find(|o| !finished(o.state)).map_or(s.next, |o| o.id);
@@ -991,7 +1014,7 @@ mod tests {
     }
 
     fn mark(id: u32, state: &'static str, call: bool) -> OpView {
-        OpView { id, what: if call { "CopyBufferRegion (console #15)".into() } else { "Dispatch 1x1x1".into() }, pso: 0, state, call, list: 0x10, args: 0, args_buf: (0, 0) }
+        OpView { id, what: if call { "CopyBufferRegion (console #15)".into() } else { "Dispatch 1x1x1".into() }, pso: 0, state, call, list: 0x10, args: 0, args_buf: (0, 0), args_ref: None }
     }
 
     /// The GPU is put in the call whose mark it passed last, not at the next op: a dispatch
@@ -1056,7 +1079,13 @@ mod tests {
         unsafe {
             (p as *mut [u32; 5]).write_unaligned([0xFFFF_FFF0, 1, 1, 7, 9]);
             let (buf, off) = real::uma_window_buffer(p, 20).expect("the window's buffer");
-            let op = OpView { args: p, args_buf: (buf, off), what: "ExecuteIndirect max 1".into(), ..mark(7, "not started", false) };
+            // (the buffer is held for the first mark not passed of a list, an indirect op's)
+            let indirect = |id, state| OpView { args: p, args_buf: (buf, off), what: "ExecuteIndirect max 1".into(), ..mark(id, state, false) };
+            let mut ops = [indirect(5, "done"), mark(6, "passed", true), indirect(7, "not started"), indirect(8, "not started"), on(0x20, mark(9, "not reached", true)), on(0x20, indirect(10, "not started"))];
+            hold_arguments(&mut ops);
+            assert_eq!(ops.iter().map(|o| o.args_ref.is_some()).collect::<Vec<_>>(), [false, false, true, false, false, false]);
+            assert_eq!(ops[3].text_at(), ops[3].text(), "no read without the buffer held");
+            let op = &ops[2];
             let text = op.text_at();
             assert!(text.starts_with(&op.text()[..op.text().len() - 1]), "{text}");
             assert!(text.ends_with("; the GPU reads [0xfffffff0, 0x1, 0x1, 0x7, 0x9] there, in their buffer and in the memory window alike)"), "{text}");
