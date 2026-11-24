@@ -20,12 +20,14 @@
 //! event it is in, the one it passed before, what is queued after it and, for executed lists,
 //! the first mark not passed and the call or op the GPU is in (shaders by their
 //! `XCL_DUMP_SHADERS` dump names). A logged queue that moves on again is logged too (a long op,
-//! not a hang).
+//! not a hang). `XCL_STALL_REMOVE_S=N`: once a queue has stood still N s (at least the 3 s of
+//! its report), the device is removed and the run ends, so that DRED (`XCL_DRED=1`) logs the
+//! operation each command list in flight got to, the commands no mark covers included.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of, transmute};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -460,12 +462,35 @@ struct Stuck {
     skips: Vec<(u32, String, usize)>,
 }
 
+/// `XCL_STALL_REMOVE_S`: seconds a queue stands still before the device is removed.
+fn remove_after() -> Option<u32> {
+    static S: LazyLock<Option<u32>> = LazyLock::new(|| std::env::var("XCL_STALL_REMOVE_S").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0));
+    *S
+}
+
+/// Remove the device (`queue` has stood still `secs` s), so that DRED logs the operation each
+/// command list in flight got to (`real::log_device_removed`), and end the run.
+fn remove_device(queue: usize, secs: u32) {
+    let label = super::list_x::queue_label(queue);
+    unsafe {
+        let Some(dev) = device_of_queue(queue as *mut c_void) else { return };
+        let Ok(dev5) = dev.cast::<ID3D12Device5>() else {
+            crate::xlog_warn!("D3D12.X: breadcrumbs: XCL_STALL_REMOVE_S: no ID3D12Device5, the device stays");
+            return;
+        };
+        crate::xlog_warn!("D3D12.X: breadcrumbs: {label} has stood still for {secs} s: the device is removed (XCL_STALL_REMOVE_S) so that DRED logs what each list in flight got to (with XCL_DRED=1)");
+        dev5.RemoveDevice();
+    }
+    real::stop_if_device_removed();
+}
+
 /// Log each queue whose fence has stood still for 2 s with events still queued, and each
 /// logged one that moves on again.
 fn report() {
     static LOGGED: AtomicUsize = AtomicUsize::new(0);
     // (queue, mark it stood at, mark it is at now, reports it stood)
     let mut moved: Vec<(usize, u64, u64, u32)> = Vec::new();
+    let mut remove: Option<(usize, u32)> = None;
     let stuck: Vec<Stuck> = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
@@ -491,6 +516,10 @@ fn report() {
                 line.watch.1 += 1;
             } else {
                 line.watch = (done, 1, false);
+            }
+            // (not before its report: the report is logged first)
+            if remove.is_none() && remove_after().is_some_and(|n| line.watch.1 >= n.max(STUCK_REPORTS)) {
+                remove = Some((q, line.watch.1));
             }
             if line.watch.1 < STUCK_REPORTS || line.watch.2 {
                 continue;
@@ -564,6 +593,12 @@ fn report() {
         );
         if LOGGED.fetch_add(1, Ordering::Relaxed) < 256 {
             crate::xlog_warn!("{line}");
+        }
+    }
+    if let Some((q, secs)) = remove {
+        static REMOVED: AtomicBool = AtomicBool::new(false);
+        if !REMOVED.swap(true, Ordering::AcqRel) {
+            remove_device(q, secs);
         }
     }
 }
