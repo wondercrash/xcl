@@ -59,7 +59,8 @@ const MAX_FILL: u64 = 256 << 20;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Watchdog timeout for GPU `queue.Wait` so a genuinely hung GPU cycle never triggers a 30 s
 /// hang, while giving heavy initial 3D frames (>1 s of dispatches) plenty of room to finish
-/// cleanly without prematurely breaking synchronization.
+/// cleanly without prematurely breaking synchronization. `XCL_GPU_WAIT_WATCHDOG_MS` overrides
+/// it (`gpu_wait_watchdog`).
 const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
@@ -74,6 +75,22 @@ fn wait_timeout() -> Duration {
             .map(Duration::from_millis)
             .unwrap_or(WAIT_TIMEOUT)
     })
+}
+
+/// How long a GPU `queue.Wait` stays armed before the watchdog releases it on the CPU:
+/// `XCL_GPU_WAIT_WATCHDOG_MS` (default 5000, like `XCL_WAIT_GATE_RELEASE_MS` for Wait64BitValueX
+/// gates; `0`: never released). The work after a released wait runs before its producer.
+fn gpu_wait_watchdog() -> Duration {
+    static T: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| gpu_wait_watchdog_from(std::env::var("XCL_GPU_WAIT_WATCHDOG_MS").ok().as_deref()));
+    *T
+}
+
+fn gpu_wait_watchdog_from(v: Option<&str>) -> Duration {
+    match v.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => Duration::MAX,
+        Some(ms) => Duration::from_millis(ms),
+        None => GPU_WAIT_WATCHDOG_TIMEOUT,
+    }
 }
 
 fn once(counter: &AtomicU64, n: u64) -> bool {
@@ -1462,12 +1479,12 @@ static WAIT_CHAIN_LOGGED: Mutex<Option<Instant>> = Mutex::new(None);
 static WAIT_CHAIN_LINES: AtomicU64 = AtomicU64::new(0);
 const MAX_WAIT_CHAIN_LINES: u64 = 64;
 
-/// True when the last chain line (`logged`) is at least one timeout old and a wait has expired at
-/// `now`: a burst of expired waits gets one line. For one timeout after a line the waits are not
-/// looked at; otherwise this scan is the whole cost while no wait expires.
-fn wait_chain_due(graph: &SyncGraph, now: Instant, logged: &Mutex<Option<Instant>>) -> bool {
-    logged.lock().unwrap().is_none_or(|t| now.duration_since(t) >= GPU_WAIT_WATCHDOG_TIMEOUT)
-        && graph.cells.values().any(|c| c.armed_waits.iter().any(|aw| now.duration_since(aw.armed_at) >= GPU_WAIT_WATCHDOG_TIMEOUT))
+/// True when the last chain line (`logged`) is at least one `timeout` old and a wait has expired
+/// at `now`: a burst of expired waits gets one line. For one timeout after a line the waits are
+/// not looked at; otherwise this scan is the whole cost while no wait expires.
+fn wait_chain_due(graph: &SyncGraph, now: Instant, logged: &Mutex<Option<Instant>>, timeout: Duration) -> bool {
+    logged.lock().unwrap().is_none_or(|t| now.duration_since(t) >= timeout)
+        && graph.cells.values().any(|c| c.armed_waits.iter().any(|aw| now.duration_since(aw.armed_at) >= timeout))
 }
 
 /// The tracked `queue.Wait` calls and the `(queue, seq)` of the tracked `Signal` calls that have not
@@ -1568,9 +1585,10 @@ fn wake_sync_watchdog() {
                 let mut rew: Vec<(ID3D12Fence, u64)> = Vec::new();
                 let mut in_flight = None;
                 let now = Instant::now();
+                let timeout = gpu_wait_watchdog();
                 if let Some(graph) = g.as_mut() {
                     // the calls in flight before a wait is released, for the line on where its chain ends
-                    if WAIT_CHAIN_LINES.load(Ordering::Relaxed) < MAX_WAIT_CHAIN_LINES && wait_chain_due(graph, now, &WAIT_CHAIN_LOGGED) {
+                    if WAIT_CHAIN_LINES.load(Ordering::Relaxed) < MAX_WAIT_CHAIN_LINES && wait_chain_due(graph, now, &WAIT_CHAIN_LOGGED, timeout) {
                         in_flight = Some(unsafe { calls_in_flight(graph) });
                     }
                     for (&va, cell) in graph.cells.iter_mut() {
@@ -1596,7 +1614,7 @@ fn wake_sync_watchdog() {
                         let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
                         cell.armed_waits.retain(|aw| {
-                            if now.duration_since(aw.armed_at) >= GPU_WAIT_WATCHDOG_TIMEOUT {
+                            if now.duration_since(aw.armed_at) >= timeout {
                                 if aw.val >= max_exp {
                                     max_exp = aw.val;
                                     waiter_q = aw.waiting_queue;
@@ -1651,7 +1669,7 @@ fn wake_sync_watchdog() {
                 let rq = recorded_last_q.map(queue_id);
                 crate::xlog_warn!(
                     "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, graph_signal_queue=q{sq:?}, recorded_list_last_queue=q{rq:?}/ty{recorded_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
-                    GPU_WAIT_WATCHDOG_TIMEOUT.as_millis()
+                    gpu_wait_watchdog().as_millis()
                 );
             }
             if had_expired {
@@ -6913,14 +6931,25 @@ mod tests {
 
         // one line per burst: only once a wait has expired, and not again within the timeout
         let logged = Mutex::new(None);
-        assert!(!wait_chain_due(&g, now, &logged), "no wait has expired");
-        let old = now.checked_sub(GPU_WAIT_WATCHDOG_TIMEOUT).expect("up for longer than the timeout");
+        let t = GPU_WAIT_WATCHDOG_TIMEOUT;
+        assert!(!wait_chain_due(&g, now, &logged, t), "no wait has expired");
+        let old = now.checked_sub(t).expect("up for longer than the timeout");
         g.cells.get_mut(&0x1000).unwrap().armed_waits[0].armed_at = old;
-        assert!(wait_chain_due(&g, now, &logged), "a wait that is one timeout old starts a burst");
+        assert!(wait_chain_due(&g, now, &logged, t), "a wait that is one timeout old starts a burst");
         *logged.lock().unwrap() = Some(now);
-        assert!(!wait_chain_due(&g, now, &logged), "a burst gets one line");
+        assert!(!wait_chain_due(&g, now, &logged, t), "a burst gets one line");
         *logged.lock().unwrap() = Some(old);
-        assert!(wait_chain_due(&g, now, &logged), "the next burst gets its own");
+        assert!(wait_chain_due(&g, now, &logged, t), "the next burst gets its own");
+        // XCL_GPU_WAIT_WATCHDOG_MS=0: a wait never expires
+        assert!(!wait_chain_due(&g, now, &logged, gpu_wait_watchdog_from(Some("0"))));
+    }
+
+    #[test]
+    fn the_gpu_wait_watchdog_timeout_is_read_from_its_variable() {
+        assert_eq!(gpu_wait_watchdog_from(None), Duration::from_millis(5000));
+        assert_eq!(gpu_wait_watchdog_from(Some(" 60000 ")), Duration::from_secs(60));
+        assert_eq!(gpu_wait_watchdog_from(Some("0")), Duration::MAX);
+        assert_eq!(gpu_wait_watchdog_from(Some("soon")), Duration::from_millis(5000));
     }
 
     /// Calls the GPU has completed are not on a chain: a Signal that has run does not make its queue

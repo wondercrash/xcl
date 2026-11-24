@@ -3,7 +3,8 @@
 //! A gate the CPU never sees satisfied (its producer was skipped, never submitted, or is itself
 //! held behind this queue) is opened on the CPU once the queue has stood at it for
 //! `XCL_WAIT_GATE_RELEASE_MS` (default 5000; `0` keeps the queue blocked for good). The work
-//! after it then runs before its producer, as with the GPU wait watchdog of bridged waits.
+//! after it then runs before its producer, as with the GPU wait watchdog of bridged waits
+//! (`XCL_GPU_WAIT_WATCHDOG_MS`, default 5000; `0` never releases them; `list_x`).
 //! Gates armed on that queue before such a release are opened `GRACE` after the queue reaches
 //! them: they wait behind the same stalled producers, and k of them must not cost k release
 //! times.
