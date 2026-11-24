@@ -291,6 +291,14 @@ struct State {
     /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
     /// took ~0.15 ms.)
     parked: FxHashMap<usize, (u32, u32)>,
+    /// tile address → pool tile of tiles decommitted under a placed buffer (`pinned`), still
+    /// mapped in their window past `flush_parked`: a commit there takes the same pool tile back,
+    /// so the window and the buffer go on naming the same video memory. (Unmapped with the
+    /// other parked tiles, the window got another pool tile at the next commit and the buffer
+    /// kept the old one: shaders wrote through the window, and the PC calls that take the
+    /// buffer – ExecuteIndirect's arguments, copies – read what nobody wrote to any more.)
+    /// Parked again once no buffer has the pool tile (`forget_buffer`).
+    kept: FxHashMap<usize, (u32, u32)>,
     /// placed buffers → the pool tiles they use
     buffers: FxHashMap<usize, Vec<(u32, u32)>>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
@@ -542,6 +550,8 @@ fn early_remove(early: &mut BTreeMap<usize, usize>, a: usize, b: usize) {
 }
 /// generation counter incremented whenever the set of mapped tiles changes (for watch_ranges cache)
 static MAPPED_GEN: AtomicU64 = AtomicU64::new(0);
+/// commits that took back a tile kept mapped for a placed buffer (`State::kept`)
+static KEPT_TAKEN: AtomicU64 = AtomicU64::new(0);
 
 /// Generation counter of `mapped_ranges()` (changes only when tiles are mapped or unmapped).
 pub fn mapped_gen() -> u64 {
@@ -892,7 +902,7 @@ impl Gpu {
                 while let Some(x) = t.filter(|&x| x < end) {
                     if wanted(s, x) {
                         // still mapped there: no new mapping, what it held is cleared
-                        if let Some(tile) = s.parked.remove(&x) {
+                        if let Some(tile) = s.take_back(x) {
                             let holes = s.pending.remove(&x).unwrap_or_else(|| initial_holes(x));
                             s.mapped.insert(x, TileEntry::with_holes(tile, holes));
                             s.runs = None;
@@ -1373,6 +1383,7 @@ impl State {
             pending: FxHashMap::default(),
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
+            kept: FxHashMap::default(),
             buffers: FxHashMap::default(),
             to_zero: Vec::new(),
             queue_rb: FxHashMap::default(),
@@ -1384,6 +1395,16 @@ impl State {
     #[inline]
     fn window_index(&self, a: usize) -> Option<usize> {
         self.bases.iter().position(|&b| a >= b && a < b + crate::gpu::uma::WINDOW)
+    }
+
+    /// The pool tile the decommitted tile at `x` is still mapped on in its window (`parked`, or
+    /// `kept` for a placed buffer), taken for a commit there.
+    fn take_back(&mut self, x: usize) -> Option<(u32, u32)> {
+        self.parked.remove(&x).or_else(|| {
+            let tile = self.kept.remove(&x)?;
+            KEPT_TAKEN.fetch_add(1, Ordering::Relaxed);
+            Some(tile)
+        })
     }
 
     /// Clear `sent` hashes for every page overlapping `[a, a + n)`.
@@ -1873,7 +1894,8 @@ pub unsafe fn committed(a: usize, n: usize) {
 
 /// The title decommitted `[a, a + n)`: tiles whose pages are all uncommitted (whether in one
 /// full-tile decommit or incrementally via sub-tile decommits) give their video memory back
-/// (unless a placed buffer still pins the pool tile) once the GPU side flushes them.
+/// once the GPU side flushes them. One whose pool tile a placed buffer still pins stays mapped
+/// (`State::kept`): a commit there finds the buffer's video memory again.
 pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
@@ -1906,6 +1928,12 @@ impl State {
                 *c -= 1;
                 if *c == 0 {
                     self.pinned.remove(&tile);
+                    // (kept mapped for the buffer alone: parked, the next flush unmaps and
+                    // frees it)
+                    if let Some(x) = self.kept.iter().find_map(|(&x, &t)| (t == tile).then_some(x)) {
+                        self.kept.remove(&x);
+                        self.parked.insert(x, tile);
+                    }
                     self.release_if_unused(tile);
                 }
             }
@@ -1920,7 +1948,7 @@ impl State {
         let mut t = Some(a & !(TILE - 1));
         while let Some(x) = t.filter(|&x| x < end) {
             if !self.mapped.contains_key(&x) && !self.pending.contains_key(&x) && self.window_index(x).is_some() {
-                match self.parked.remove(&x) {
+                match self.take_back(x) {
                     Some(tile) => {
                         self.mapped.insert(x, TileEntry::with_holes(tile, 0xFFFF));
                         self.to_zero.push((x, TILE));
@@ -2003,6 +2031,7 @@ impl State {
     }
 
     /// a pool tile no window maps, none is parked on and no buffer uses goes back to the free list
+    /// (a `kept` tile is a buffer's)
     fn release_if_unused(&mut self, tile: (u32, u32)) {
         if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) && !self.parked.values().any(|&p| p == tile) {
             self.free.push(tile);
@@ -2012,8 +2041,9 @@ impl State {
 
 impl Gpu {
     /// The parked tiles unmapped from their windows (one call per window) and their pool tiles
-    /// free (but those of placed buffers). Pools left all free are not retired here: callers do
-    /// that (`retire_free_pools`) unless they take a tile right away.
+    /// free. Those of placed buffers stay mapped (`State::kept`). Pools left all free are not
+    /// retired here: callers do that (`retire_free_pools`) unless they take a tile right away.
+    /// False: nothing was unmapped.
     unsafe fn flush_parked(&mut self) -> bool {
         let by_window = {
             let mut b = self.st();
@@ -2023,15 +2053,20 @@ impl Gpu {
             }
             let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
             for (t, tile) in std::mem::take(&mut s.parked) {
+                if s.pinned.contains_key(&tile) {
+                    s.kept.insert(t, tile);
+                    continue;
+                }
                 if let Some(wi) = s.window_index(t) {
                     by_window.entry(wi).or_default().push(t);
                 }
-                if !s.pinned.contains_key(&tile) {
-                    s.free.push(tile);
-                }
+                s.free.push(tile);
             }
             by_window
         };
+        if by_window.is_empty() {
+            return false;
+        }
         for (wi, ts) in by_window {
             let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
             self.unmap_tiles(&r, b, &ts);
@@ -2158,6 +2193,15 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             );
         }
     }
+    {
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        let n = KEPT_TAKEN.load(Ordering::Relaxed);
+        if n >= (2 * LOGGED.load(Ordering::Relaxed)).max(1) {
+            LOGGED.store(n, Ordering::Relaxed);
+            let kept = gpu.st().kept.len();
+            crate::xlog_info!("sparse windows: {n} tiles committed again under a placed buffer took the buffer's video memory back ({kept} more are kept mapped for theirs)");
+        }
+    }
     dirty_runs.clear();
     gpu.scratch_runs = dirty_runs;
     let q = queue.as_raw() as usize;
@@ -2194,26 +2238,34 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         return None;
     }
-    // its tiles: the window's video memory at the same addresses; probe actual OS commitment
-    // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
-    gpu.ensure_mapped(start, delta + bytes, |t| query_tile_holes(t), false);
     let raw = *ppv;
-    let tiles: Vec<(usize, (u32, u32))> = {
-        let mut b = gpu.st();
-        let s = &mut *b;
-        // (one decommitted since `ensure_mapped` is parked: still mapped, and the pin keeps
-        // `flush_parked` from freeing its pool tile)
-        let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| e.pool).or_else(|| s.parked.get(&t).copied()).map(|p| (t, p))).collect();
-        for &(_, tile) in &tiles {
-            *s.pinned.entry(tile).or_default() += 1;
-        }
-        s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
-        tiles
-    };
     let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
-    gpu.map_tiles(&res, start, &tiles);
-    gpu.signal();
+    gpu.place(&res, start, delta + bytes);
     Some((hr, delta))
+}
+
+impl Gpu {
+    /// `res`, a reserved buffer over `[start, start + len)` of a window (`place_buffer`), mapped
+    /// onto the pool tiles the window has there, which it pins.
+    unsafe fn place(&mut self, res: &ID3D12Resource, start: usize, len: usize) {
+        // its tiles: the window's video memory at the same addresses; probe actual OS commitment
+        // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
+        self.ensure_mapped(start, len, |t| query_tile_holes(t), false);
+        let tiles: Vec<(usize, (u32, u32))> = {
+            let mut b = self.st();
+            let s = &mut *b;
+            // (one decommitted since `ensure_mapped` is parked: still mapped, and the pin keeps
+            // `flush_parked` from unmapping it)
+            let tiles: Vec<(usize, (u32, u32))> = (start..start + len).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| e.pool).or_else(|| s.parked.get(&t).copied()).map(|p| (t, p))).collect();
+            for &(_, tile) in &tiles {
+                *s.pinned.entry(tile).or_default() += 1;
+            }
+            s.buffers.insert(res.as_raw() as usize, tiles.iter().map(|x| x.1).collect());
+            tiles
+        };
+        self.map_tiles(res, start, &tiles);
+        self.signal();
+    }
 }
 
 /// A placed buffer is gone: its tiles are not pinned by it any more.
@@ -2585,6 +2637,103 @@ mod tests {
             assert!(g.st().parked.is_empty());
             assert_eq!(g.st().mapped[&(base + TILE)].pool, tile);
             assert!(!g.st().mapped.contains_key(&base));
+            g.wait_for(g.value);
+            drop(g);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// A tile decommitted under a placed buffer and committed again after a submit is the
+    /// buffer's pool tile still: what a shader writes through the window is what a PC call
+    /// reads through the buffer. (Unmapped before the submit like any parked tile, the window
+    /// got another pool tile at the commit and the buffer kept the old one: an ExecuteIndirect
+    /// then took its arguments from video memory no shader wrote to any more.)
+    #[test]
+    fn a_tile_committed_again_under_a_placed_buffer_is_the_buffers_tile() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let base = VirtualAlloc(std::ptr::null(), 2 * TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert!(base != 0 && base % TILE == 0);
+            let reserved = |bytes: usize| {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateReservedResource(&buffer_desc(bytes as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut r).expect("CreateReservedResource");
+                r.expect("reserved buffer")
+            };
+            let committed = |heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| {
+                let desc = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_NONE, ..buffer_desc(256) };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r).expect("CreateCommittedResource");
+                r.expect("buffer")
+            };
+            let window = reserved(2 * TILE);
+            static BOOK: Mutex<Option<State>> = Mutex::new(None);
+            let mut g = gpu_for(&BOOK, dev.clone(), vec![(base, window.clone())]);
+            g.st().commit_range(base, 2 * TILE);
+            g.map_pending();
+            let tile = g.st().mapped[&base].pool;
+
+            // the title's buffer over the first tile
+            let placed = reserved(TILE);
+            g.place(&placed, base, TILE);
+            assert_eq!(g.st().pinned.get(&tile), Some(&1));
+
+            // its page goes away, a submit (its flush), a page comes there again
+            let v = g.value;
+            g.st().decommit_range(base, TILE);
+            assert!(!g.flush_parked(), "a tile under a placed buffer is not unmapped");
+            assert_eq!(g.value, v, "no tile mapping changed");
+            assert_eq!(g.st().kept.get(&base), Some(&tile));
+            assert!(!g.st().free.contains(&tile), "the buffer's pool tile is not free");
+            g.st().commit_range(base, TILE);
+            g.map_pending();
+            assert_eq!(g.st().mapped[&base].pool, tile, "the window has the buffer's pool tile there again");
+            assert!(g.st().kept.is_empty());
+            assert!(g.st().pending.is_empty());
+            assert_eq!(g.value, v, "no tile mapping changed");
+
+            // on the GPU: a word written through the window is read through the buffer (in a list
+            // of its own: with no barrier between them the two copies of one list are not in order)
+            let (upload, readback) = (committed(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ), committed(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST));
+            let mut p = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut p)).expect("Map");
+            (p as *mut u32).add(4).write(0xC0FF_EE11);
+            upload.Unmap(0, None);
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+            for (dst, src) in [(&window, &upload), (&readback, &placed)] {
+                list.CopyBufferRegion(dst, 16, src, 16, 4);
+                list.Close().expect("Close");
+                g.queue.ExecuteCommandLists(&[Some(list.cast().expect("ID3D12CommandList"))]);
+                g.signal();
+                g.wait_for(g.value);
+                alloc.Reset().expect("allocator Reset");
+                list.Reset(&alloc, None).expect("list Reset");
+            }
+            readback.Map(0, None, Some(&mut p)).expect("Map");
+            let read = (p as *const u32).add(4).read();
+            readback.Unmap(0, None);
+            assert_eq!(read, 0xC0FF_EE11, "the buffer reads what was written through the window");
+
+            // kept again, and the buffer goes: its tile is unmapped and freed like any other
+            g.st().decommit_range(base, TILE);
+            assert!(!g.flush_parked());
+            g.st().forget_buffer(placed.as_raw() as usize);
+            assert_eq!(g.st().parked.get(&base), Some(&tile), "no buffer has it: parked");
+            assert!(!g.st().free.contains(&tile), "a parked tile is not free");
+            assert!(g.flush_parked());
+            assert!(g.st().free.contains(&tile));
+            assert!(g.st().pinned.is_empty());
+
             g.wait_for(g.value);
             drop(g);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
