@@ -363,9 +363,11 @@ static ARGUMENT_ORDER: Mutex<Option<(usize, ID3D12Resource)>> = Mutex::new(None)
 /// whatever count the memory held before. A transition to INDIRECT_ARGUMENT makes the driver
 /// wait for the writes – of any buffer, as measured there. The title's buffer is in the title's
 /// state (its transitions reach the PC list), so a buffer of XCL's own takes it, COMMON ->
-/// INDIRECT_ARGUMENT before and back after. Not in a bundle, which cannot hold barriers.
+/// INDIRECT_ARGUMENT before and back after. Only on a list XCL made (`list_x::on_create`) and
+/// not a bundle, which cannot hold barriers; its type comes from XCL's state, not a call to it.
 unsafe fn fresh_indirect_arguments(list: *mut c_void, op: impl FnOnce()) {
-    let buffer = ID3D12GraphicsCommandList::from_raw_borrowed(&list).filter(|l| l.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE).and_then(|l| argument_order_buffer(l));
+    let tracked = super::list_x::tracked_list_type(list).is_some_and(|t| t != D3D12_COMMAND_LIST_TYPE_BUNDLE);
+    let buffer = if tracked { ID3D12GraphicsCommandList::from_raw_borrowed(&list).and_then(|l| argument_order_buffer(l)) } else { None };
     let Some(buffer) = buffer else { return op() };
     let b = buffer.as_raw() as usize;
     super::list_x::transition(list, b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
@@ -1656,6 +1658,7 @@ void main(uint t : SV_GroupIndex) {
                 // from here as XCL records a title's ExecuteIndirect: on the adopted list
                 let raw = list.as_raw();
                 real::adopt(raw, real::Kind::CommandList);
+                list_x::on_create(raw, alloc.as_raw() as usize, 0, ty);
                 type Ei = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
                 type Close = unsafe extern "system" fn(*mut c_void) -> windows::core::HRESULT;
                 let ei: Ei = std::mem::transmute(real::orig_fn(raw, 59));
