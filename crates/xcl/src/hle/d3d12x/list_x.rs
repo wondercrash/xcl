@@ -692,10 +692,11 @@ pub fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIST_TYPE)
 
 /// Remove a released command queue so `KickoffX` never submits to a dead queue.
 pub(super) fn on_queue_release(queue: usize) {
-    let mut scratch = COPY_SCRATCH.lock().unwrap();
-    scratch.fences.remove(&queue);
+    let mut scratch = copy_scratch_lock();
+    let fence = scratch.fences.remove(&queue);
     scratch.collect_released();
     drop(scratch);
+    drop(fence);
     LIVE_QUEUES.lock().unwrap().retain(|q| q.queue != queue);
     if let Some(m) = LISTS.lock().unwrap().as_mut() {
         for s in m.values_mut() {
@@ -2392,17 +2393,22 @@ struct CopyScratchCache {
     fences: HashMap<usize, (ID3D12Fence, u64)>,
     bytes: u64,
     reaping: bool,
+    /// given up under the lock, released after it (`CopyScratchLock`)
+    gone: Vec<CopyScratch>,
 }
 
 impl CopyScratchCache {
     fn collect_released(&mut self) {
-        self.released.retain_mut(|scratch| {
-            if !scratch.idle() {
-                return true;
+        let mut i = 0;
+        while i < self.released.len() {
+            if self.released[i].idle() {
+                let scratch = self.released.swap_remove(i);
+                self.bytes -= scratch.bytes;
+                self.gone.push(scratch);
+            } else {
+                i += 1;
             }
-            self.bytes -= scratch.bytes;
-            false
-        });
+        }
     }
 
     fn release(&mut self, list: usize) {
@@ -2424,8 +2430,11 @@ impl CopyScratchCache {
                 scratch.recorded = true;
                 return Some((scratch.buffer.as_raw() as usize, scratch.bytes));
             }
-            // Drop the old allocation before growing so the peak stays within the budget.
-            self.bytes -= self.active.remove(&key).unwrap().bytes;
+            // Its bytes go before growing so the budget holds (the buffer itself is released
+            // after the lock, `gone`: both are there for a moment).
+            let old = self.active.remove(&key).unwrap();
+            self.bytes -= old.bytes;
+            self.gone.push(old);
         }
         if bytes > MAX_COPY_SCRATCH - self.bytes {
             return None;
@@ -2442,8 +2451,39 @@ impl CopyScratchCache {
 
 static COPY_SCRATCH: LazyLock<Mutex<CopyScratchCache>> = LazyLock::new(|| Mutex::new(CopyScratchCache::default()));
 
+/// `COPY_SCRATCH`, locked; the buffers it gives up meanwhile (`gone`) are released once the lock
+/// is. A resource's release runs `late_release` (which signals every queue), and the lock is
+/// taken from list and queue final releases: no D3D12 release under it (the sparse state's
+/// DRED deadlock, 61e7ec2, was a release waiting for a lock held across a D3D12 call).
+struct CopyScratchLock(Option<std::sync::MutexGuard<'static, CopyScratchCache>>);
+
+impl std::ops::Deref for CopyScratchLock {
+    type Target = CopyScratchCache;
+    fn deref(&self) -> &CopyScratchCache {
+        self.0.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for CopyScratchLock {
+    fn deref_mut(&mut self) -> &mut CopyScratchCache {
+        self.0.as_mut().unwrap()
+    }
+}
+
+impl Drop for CopyScratchLock {
+    fn drop(&mut self) {
+        let gone = self.0.as_mut().map(|g| std::mem::take(&mut g.gone));
+        self.0 = None;
+        drop(gone);
+    }
+}
+
+fn copy_scratch_lock() -> CopyScratchLock {
+    CopyScratchLock(Some(COPY_SCRATCH.lock().unwrap()))
+}
+
 fn release_copy_scratch(list: usize) {
-    let mut cache = COPY_SCRATCH.lock().unwrap();
+    let mut cache = copy_scratch_lock();
     cache.release(list);
     if cache.reaping || !cache.released.iter().any(|s| !s.untracked_submission) {
         return;
@@ -2452,7 +2492,7 @@ fn release_copy_scratch(list: usize) {
     // the GPU finishes even if no call touches the cache again.
     cache.reaping = std::thread::Builder::new().name("xcl-copy-scratch".into()).spawn(|| loop {
         {
-            let mut cache = COPY_SCRATCH.lock().unwrap();
+            let mut cache = copy_scratch_lock();
             cache.collect_released();
             if !cache.released.iter().any(|s| !s.untracked_submission) {
                 cache.reaping = false;
@@ -2468,7 +2508,7 @@ unsafe fn copy_scratch(list: *mut c_void, n: u64) -> Option<(usize, u64)> {
         return None;
     }
     let bytes = n.next_power_of_two().max(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64);
-    COPY_SCRATCH.lock().unwrap().acquire(list, bytes)
+    copy_scratch_lock().acquire(list, bytes)
 }
 
 fn reset_copy_scratch(list: *mut c_void) {
@@ -2479,7 +2519,7 @@ fn reset_copy_scratch(list: *mut c_void) {
 
 /// Mark GPU ownership on the queue that actually submitted each PC list or split segment.
 pub(super) unsafe fn copy_scratch_submitted(queue: *mut c_void, lists: &[*mut c_void]) {
-    let mut cache = COPY_SCRATCH.lock().unwrap();
+    let mut cache = copy_scratch_lock();
     cache.collect_released();
     if !lists.iter().any(|l| cache.active.get(&(*l as usize)).is_some_and(|s| s.recorded)) {
         return;
@@ -4546,6 +4586,7 @@ mod tests {
             assert_eq!(cache.bytes, small);
             cache.release(second_raw as usize);
             assert_eq!(cache.bytes, 0);
+            assert!(cache.gone.len() >= 2, "buffers given up wait in `gone` to be released after the lock");
         }
     }
 
