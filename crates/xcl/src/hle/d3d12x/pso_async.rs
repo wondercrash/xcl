@@ -658,13 +658,13 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
 }
 
-/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset: until it
-/// is built). A retail game builds compute programs on its own threads: the driver takes up to
+/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
+/// it is built). A retail game builds compute programs on its own threads: the driver takes up to
 /// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
 /// has been held 30 s.
 fn wait_budget() -> Option<std::time::Duration> {
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(std::time::Duration::from_millis))
+    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
