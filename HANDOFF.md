@@ -1838,6 +1838,13 @@ SHA-NI is not emulated (also missing on those CPUs): add it if a title's code by
 - Open (from a user report): a write-watch scan of textures in the 4 GiB coherent window costs in proportion to their
   size at every submit; a page guard (read-only until the first CPU write, `kernelx::lazy`) was tried and reverted
   pending measurement past the menus.
+- **`XCL_TITLE_WATCHDOG=0`** (bring-up only, temporary): the title's own hang watchdog no longer ends the process. Its
+  thread checks every second; 30 checks without a new frame heartbeat (or a "long operation" scope open for 300 s
+  while a tunable enables that check) call a callback that writes to address 0 – the 0xC0000005 at exe+0x23cf683
+  that ended runs stalled in the driver's pipeline compiles. The loader makes those three branches no-ops
+  (`title_watchdog.rs`), only for this executable (PE timestamp 0x6af783d4, image size 0xb06d000 and the code at
+  each site; anything else logs a warning and is left alone). With it a real hang no longer ends the run: the fix is
+  removing the stalls. `XCL_SAMPLE_EXE=<the exe>` checks the file in a unit test.
 
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
