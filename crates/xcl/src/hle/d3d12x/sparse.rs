@@ -925,6 +925,13 @@ impl Gpu {
             drop(b);
             t = x.checked_add(TILE);
         }
+        // a tile decommitted while the state was let go, and freed by `take_tile`'s flush, is
+        // not mapped: its pool tile is free or another tile's now. A parked one stays in (a
+        // parked tile is still mapped). Only this thread flushes: what is left stays valid.
+        {
+            let b = self.st();
+            new.retain(|&(x, tile)| b.mapped.get(&x).is_some_and(|e| e.pool == tile) || b.parked.get(&x) == Some(&tile));
+        }
         if new.is_empty() {
             if unparked {
                 MAPPED_GEN.fetch_add(1, Ordering::Release);
