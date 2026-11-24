@@ -1558,9 +1558,12 @@ impl Em {
             }
         }
         // split wave64, a coherent load (GLC / DLC: memory other waves may be writing): both
-        // halves take the lower half's values, so they cannot see two different ones
+        // halves take the lower half's values, so they cannot see two different ones. With
+        // group barriers every scalar load does: memory written during the dispatch is the
+        // only thing that could make the halves' scalar values (and so their branches and
+        // barriers) differ
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
-        if self.x64() && coherent {
+        if self.x64() && (coherent || !self.x64_spin()) {
             self.x64_words = self.x64_words.max(vals.len());
             for (i, v) in vals.iter().enumerate() {
                 self.line(&format!("xcl_x_put({i}u, {v});"));
@@ -4197,12 +4200,16 @@ impl Em {
         }
     }
 
-    /// Split wave64: meet through bounded arrival counters (`XCL_X_SPIN 1`) by default so
-    /// divergent wave32 halves can never permanently deadlock a GPU SM at an unbounded
-    /// `GroupMemoryBarrierWithGroupSync()`. Set `XCL_WAVE64_SPIN=0` to force group barriers
-    /// for 1-wave64 groups.
+    /// Split wave64: whether the pairs meet through bounded arrival counters (`XCL_X_SPIN 1`:
+    /// several console waves per group, or `XCL_WAVE64_SPIN=1`) instead of group barriers. A
+    /// group of one console wave is its two halves, which take the same branches as long as
+    /// their scalar values agree: masks and lane reads are exchanged, and in this form every
+    /// scalar load is too (`smem`), so memory written during the dispatch cannot give the
+    /// halves different values, and both reach every barrier. The counters' wait loop at each
+    /// of a program's exchanges is what costs: the NVIDIA driver took twice as long on them
+    /// (a 1/8 part of a retail CS with 845 exchanges: 32 s against 16 s).
     fn x64_spin(&self) -> bool {
-        self.x64_threads() > 64 || std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0")
+        self.x64_threads() > 64 || std::env::var("XCL_WAVE64_SPIN").is_ok_and(|v| v.trim() == "1")
     }
 
     /// The console LDS block (`xcl_lds`) is declared before the split-wave64 prelude, which

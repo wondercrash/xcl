@@ -54,8 +54,11 @@ SGPRs of both halves and the tests fail if they ever differ.
 * **One console wave per group** (≤ 64 threads: kernel mode, most compute, ES+GS):
   `GroupMemoryBarrierWithGroupSync` between writing and reading the slot. All hardware
   waves of the group are the two halves of the same console wave, which execute the same
-  sequence of exchanges, so every barrier is reached by both. Portable (no forward-progress
-  assumption) and cheap.
+  sequence of exchanges, so every barrier is reached by both. In this form every scalar
+  load is exchanged (half 0's values), so not even memory written during the dispatch can
+  give the halves different scalar values (see hazards). Portable (no forward-progress
+  assumption) and cheap, also for the NVIDIA driver's compiler: the spin's wait loop at
+  every exchange doubled its compile time of big wave64 programs.
 * **Several console waves per group** (mesh: 128 threads, compute > 64 threads): a group
   barrier would also wait for the *other* console waves, whose control flow may differ (wave
   index, per-wave data). Each pair instead meets through groupshared arrival counters:
@@ -89,8 +92,10 @@ it. A program that really uses the whole 32 KB of LDS therefore loses its top dw
 
 1. **Divergent halves** – anything that lets the two halves compute different scalar values
    desynchronises the exchanges. Covered: masks and lane reads (exchanged), GLC scalar loads
-   (half 0's value), `s_memtime` (constant 0). Not exchanged: non-GLC scalar loads of memory
-   that changes during the dispatch (incoherent on the console as well).
+   (half 0's value), `s_memtime` (constant 0), and with group barriers every other scalar
+   load too. With arrival counters non-GLC scalar loads of memory that changes during the
+   dispatch are not exchanged (incoherent on the console as well); the bounded wait covers
+   a pair they desynchronise.
 2. **Barriers in divergent control flow** – the barrier variant is only used when the group
    is exactly one console wave, whose control flow is identical in both halves; console
    `s_barrier` stays a group barrier (all console waves reach it, as on the console). The GS
