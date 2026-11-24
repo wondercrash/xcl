@@ -4422,28 +4422,19 @@ unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: 
     m.insert(key, std::sync::Arc::new(bytes));
 }
 
-unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+/// The PC desc of a pipeline with a console VS (and PS) and no GS / HS / DS: the translated
+/// shaders, XCL's ABI root signature, PC formats and topology (`translated_graphics_pso`, apart
+/// from making the pipeline).
+struct GraphicsPrep {
+    desc: D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    rs: *mut c_void,
+    rect_gs: Option<Vec<u8>>,
+    /// the VS / PS DXIL `desc` points at
+    _dxil: (Vec<u8>, Option<Vec<u8>>),
+}
+
+unsafe fn prep_graphics(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8]) -> Option<GraphicsPrep> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
-    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
-        return None;
-    }
-    let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
-    let vs = shader_bytes(&d.VS)?;
-    if !is_console(vs) {
-        return None;
-    }
-    if shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() {
-        note_translation_error("PSO with HS/DS – not supported yet".into());
-        return None;
-    }
-    if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
-        let _ = f;
-        return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
-    }
-    // made when first used (`pso_async::lazy`): not even translated now
-    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
-        return None;
-    }
     // a GPU that can run 32-lane waves may run a wave64 VS / PS in waves of 32 (the driver
     // picks; RDNA2 does for pixel shaders): the lanes 32..63 it reads come from `upper_lanes`
     // (split_wave64)
@@ -4488,6 +4479,32 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
         copy.GS = bytecode(gs);
     }
     pc_topology_type(&mut copy);
+    Some(GraphicsPrep { desc: copy, rs, rect_gs, _dxil: (vs_dxil, ps_dxil) })
+}
+
+unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    use crate::gpu::recomp::pso::is_console;
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    let vs = shader_bytes(&d.VS)?;
+    if !is_console(vs) {
+        return None;
+    }
+    if shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() {
+        note_translation_error("PSO with HS/DS – not supported yet".into());
+        return None;
+    }
+    if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
+        let _ = f;
+        return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
+    }
+    // made when first used (`pso_async::lazy`): not even translated now
+    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
+        return None;
+    }
+    let GraphicsPrep { desc: mut copy, rs, rect_gs, _dxil: (vs_dxil, ps_dxil) } = prep_graphics(this, d, vs)?;
     let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
     if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
         copy.DepthStencilState.StencilEnable = false.into();
