@@ -558,6 +558,8 @@ struct ListState {
     allocator: usize,
     list_type: Option<D3D12_COMMAND_LIST_TYPE>,
     last_queue: Option<usize>,
+    /// Times the title's ExecuteCommandLists took this recording (since Reset / KickoffX)
+    submitted: u32,
     /// Title's currently bound PSO (before dynamic depth-bias override)
     bound_pso: usize,
     /// Active `RSSetDepthBiasX` override (None = zero / disabled)
@@ -807,6 +809,7 @@ pub(super) fn clear_segment_state(list: usize) {
     // (a spare holds no recording: only its submitted work still holds the PC allocator)
     super::alloc_pool::forget_list(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
+        s.submitted = 0;
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
         s.clear_sparse_writes();
@@ -944,13 +947,33 @@ pub(super) unsafe fn note_queue_for_lists(queue: usize, lists: &[*mut c_void]) {
             }
         }
     }
-    let mut g = LISTS.lock().unwrap();
-    let m = g.get_or_insert_with(HashMap::new);
-    for &l in lists {
-        if !l.is_null() {
-            m.entry(l as usize).or_default().last_queue = Some(queue);
+    let again = count_submissions(LISTS.lock().unwrap().get_or_insert_with(HashMap::new), queue, lists);
+    // The PC runs a closed list as often as it is submitted, and so does this: logged, since
+    // XCL keeps what a recording needs for one run in places (its CPU-side writes, its marks).
+    static AGAIN: AtomicU64 = AtomicU64::new(0);
+    for (list, times) in again {
+        let n = AGAIN.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: command list {list:#x} goes to {} again without a Reset since it ran (time {times}; {n} such submissions so far): its recording runs again as it is", queue_label(queue));
         }
     }
+}
+
+/// `lists` go to `queue`: each one's queue, and (list, times) of those whose recording the
+/// title's ExecuteCommandLists took before.
+fn count_submissions(m: &mut HashMap<usize, ListState>, queue: usize, lists: &[*mut c_void]) -> Vec<(usize, u32)> {
+    let mut again = Vec::new();
+    for &l in lists {
+        if !l.is_null() {
+            let s = m.entry(l as usize).or_default();
+            s.last_queue = Some(queue);
+            s.submitted += 1;
+            if s.submitted > 1 {
+                again.push((l as usize, s.submitted));
+            }
+        }
+    }
+    again
 }
 
 fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_TYPE) -> Option<usize> {
@@ -3275,6 +3298,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     // Reset() cleared the PC list's native RSSetDepthBias state to (0, 0, 0) and bound init_pso.
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+        s.submitted = 0;
         s.native_bias = DepthBias::ZERO;
         s.using_fallback_pso = false;
         s.pso_dirty = false;
@@ -3890,6 +3914,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
         s.allocator = alloc;
+        s.submitted = 0;
         s.bound_pso = pso;
         s.depth_bias = None;
         s.native_bias = DepthBias::ZERO;
@@ -4536,6 +4561,20 @@ mod tests {
         }
         assert_eq!(failed_backing, Some(0x111), "failed Reset must keep holding the old recording's allocator");
         assert_eq!(successful_backing, Some(0x333), "only successful Reset moves the recording to its new allocator");
+    }
+
+    /// A recording the title's ExecuteCommandLists takes a second time is found (it runs again
+    /// as it is: a list XCL failed to reset shows up here), one reset in between is not.
+    #[test]
+    fn a_recording_submitted_again_without_a_reset_is_counted() {
+        let ids = Box::new([0u8; 2]);
+        let (a, b) = (ids.as_ptr() as *mut c_void, unsafe { ids.as_ptr().add(1) } as *mut c_void);
+        let mut m = HashMap::new();
+        assert!(count_submissions(&mut m, 7, &[a, b]).is_empty());
+        assert_eq!(m[&(a as usize)].last_queue, Some(7));
+        m.get_mut(&(b as usize)).unwrap().submitted = 0; // as its Reset does
+        assert_eq!(count_submissions(&mut m, 8, &[a, b]), vec![(a as usize, 2)]);
+        assert_eq!(count_submissions(&mut m, 8, &[a]), vec![(a as usize, 3)]);
     }
 
     /// What a recording put in unified memory (user SGPRs, argument tables) is held for the PC
