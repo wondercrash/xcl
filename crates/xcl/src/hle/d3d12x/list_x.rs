@@ -1972,12 +1972,7 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
 unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)], sparse_after: bool) {
     let (gated, other): (Vec<PendingWait>, Vec<PendingWait>) = waits.iter().copied().partition(|w| w.gate);
     wait_all_on(queue, &other, list_writes);
-    // A value this very list writes later can only be reached after the list: skipped, as
-    // `try_gpu_wait` does for a same-batch self-wait, instead of gating the list on itself.
-    let gated: Vec<PendingWait> = gated
-        .into_iter()
-        .filter(|w| !w.progress_reached() && !list_writes.iter().any(|&(va, v)| va == w.va && v >= w.value))
-        .collect();
+    let gated: Vec<PendingWait> = gated.into_iter().filter(|w| !w.progress_reached() && !waits_on_itself(w, list_writes)).collect();
     if gated.is_empty() {
         return;
     }
@@ -1995,6 +1990,15 @@ unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &
         Ok(()) => super::breadcrumbs::waited(queue, || format!("Wait64BitValueX gate on {}", label.unwrap_or_default())),
         Err(reason) => fail_submission(reason),
     }
+}
+
+/// A gated wait on a value this very list writes later while no submission has signalled it
+/// yet can only be reached after the list: skipped, as `try_gpu_wait` does for a same-batch
+/// self-wait, instead of gating the list on itself. Once another queue's producer of the value
+/// is submitted (`submitted_max`), the wait is gated so the list does not run ahead of it.
+fn waits_on_itself(w: &PendingWait, list_writes: &[(u64, u64)]) -> bool {
+    list_writes.iter().any(|&(va, v)| va == w.va && v >= w.value)
+        && SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&w.va)).is_none_or(|c| c.submitted_max < w.value)
 }
 
 /// `q{id}/ty{type}` of a title queue, as the other synchronisation warnings name it.
@@ -4196,6 +4200,30 @@ mod tests {
             cell.store(5, Ordering::Release);
             assert!(w.progress_reached());
         }
+    }
+
+    #[test]
+    fn gated_wait_on_its_own_list_write_is_skipped_only_until_another_producer_is_submitted() {
+        let cell = AtomicU64::new(0);
+        let va = &cell as *const AtomicU64 as u64;
+        let w = PendingWait {
+            va,
+            width: 8,
+            comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+            value: 7,
+            mask: u64::MAX,
+            after_write64: false,
+            gate: true,
+        };
+        let list_writes = [(va, 7)];
+        assert!(waits_on_itself(&w, &list_writes), "nobody has the value yet: the list itself writes it");
+        assert!(!waits_on_itself(&w, &[(va, 6)]), "a lower value of the list does not satisfy the wait");
+        SYNC_GRAPH.lock().unwrap().get_or_insert_with(SyncGraph::default).cells.insert(va, SyncCell { recorded_max: 7, submitted_max: 6, ..Default::default() });
+        assert!(waits_on_itself(&w, &list_writes), "a lower submitted value is not the producer");
+        SYNC_GRAPH.lock().unwrap().as_mut().unwrap().cells.get_mut(&va).unwrap().submitted_max = 7;
+        let skipped = waits_on_itself(&w, &list_writes);
+        SYNC_GRAPH.lock().unwrap().as_mut().unwrap().cells.remove(&va);
+        assert!(!skipped, "another queue's producer is already submitted: the wait must be gated");
     }
 
     #[test]
