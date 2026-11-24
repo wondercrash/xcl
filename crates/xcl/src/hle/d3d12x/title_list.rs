@@ -64,8 +64,16 @@ fn vtable() -> usize {
     V.get_or_init(|| {
         let mut v = vec![0usize; LIST_SLOTS];
         let trace = std::env::var_os("XCL_LIST_TRACE").is_some();
+        let crumbs = super::breadcrumbs::on();
         for (slot, e) in v.iter_mut().enumerate() {
-            *e = if trace { forward_traced(slot) } else { forward(slot) };
+            // the waits and KickoffX record no GPU work, but they split or submit the list
+            let mark = crumbs && (records_work(slot) || matches!(slot, 71..=74 | 93 | 95));
+            *e = match (trace, mark) {
+                (false, false) => forward(slot),
+                (true, false) => forward_calling(slot, record),
+                (false, true) => forward_calling(slot, mark_call),
+                (true, true) => forward_calling(slot, record_and_mark),
+            };
         }
         v[0] = qi as usize;
         v[1] = add_ref as usize;
@@ -77,10 +85,14 @@ fn vtable() -> usize {
     .0
 }
 
+/// Draws, copies, barriers, queries, clears and known GPU console extensions. Slots 71–74 are
+/// not among them: they can be Wait32/64 in one or both layouts.
+fn records_work(slot: usize) -> bool {
+    matches!(slot, 11..=19 | 26..=30 | 51..=55 | 59..=66 | 69..=70 | 78 | 80..=81 | 83..=92 | 104..=105 | 108 | 146)
+}
+
 fn append_forward(c: &mut Vec<u8>, slot: usize) {
-    // Draws, copies, barriers, queries, clears and known GPU console extensions. Keep slots
-    // 71–74 unmarked: they can be Wait32/64 in one or both layouts.
-    if matches!(slot, 11..=19 | 26..=30 | 51..=55 | 59..=66 | 69..=70 | 78 | 80..=81 | 83..=92 | 104..=105 | 108 | 146) {
+    if records_work(slot) {
         c.extend_from_slice(&[0xC6, 0x81]); // mov byte ptr [rcx + F_RECORDED_WORK], 1
         c.extend_from_slice(&(F_RECORDED_WORK as u32).to_le_bytes());
         c.push(1);
@@ -101,8 +113,8 @@ fn forward(slot: usize) -> usize {
     p as usize
 }
 
-/// `forward` after `record(this, slot)` (argument registers, xmm0–3 kept)
-fn forward_traced(slot: usize) -> usize {
+/// `forward` after `f(this, slot)` (argument registers, xmm0–3 kept)
+fn forward_calling(slot: usize, f: unsafe extern "system" fn(*mut c_void, u32)) -> usize {
     let mut c: Vec<u8> = vec![0x51, 0x52, 0x41, 0x50, 0x41, 0x51]; // push rcx, rdx, r8, r9
     c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x68]); // sub rsp, 0x68
     for (reg, off) in [(0x44u8, 0x20u8), (0x4C, 0x30), (0x54, 0x40), (0x5C, 0x50)] {
@@ -110,8 +122,8 @@ fn forward_traced(slot: usize) -> usize {
     }
     c.push(0xBA); // mov edx, slot
     c.extend_from_slice(&(slot as u32).to_le_bytes());
-    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, record
-    c.extend_from_slice(&(record as usize as u64).to_le_bytes());
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, f
+    c.extend_from_slice(&(f as usize as u64).to_le_bytes());
     c.extend_from_slice(&[0xFF, 0xD0]); // call rax
     for (reg, off) in [(0x44u8, 0x20u8), (0x4C, 0x30), (0x54, 0x40), (0x5C, 0x50)] {
         c.extend_from_slice(&[0xF3, 0x0F, 0x6F, reg, 0x24, off]); // movdqu xmmN, [rsp+off]
@@ -133,11 +145,22 @@ unsafe extern "system" fn record(this: *mut c_void, slot: u32) {
     *at += 1;
 }
 
+/// `XCL_GPU_BREADCRUMBS`: a call mark on the PC list the call records into, before the call.
+unsafe extern "system" fn mark_call(this: *mut c_void, slot: u32) {
+    super::breadcrumbs::reached(*((this as usize + F_BACKING) as *const *mut c_void), slot as usize);
+}
+
+unsafe extern "system" fn record_and_mark(this: *mut c_void, slot: u32) {
+    record(this, slot);
+    mark_call(this, slot);
+}
+
 /// #9 Close: closes the active recording segment (`F_BACKING`); a failure is logged with
 /// the last methods called (`XCL_LIST_TRACE`). Prior split segments were closed on split.
 unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     let pc = *((this as usize + F_BACKING) as *const *mut c_void);
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
+    super::breadcrumbs::reached(pc, 9);
     let hr = f(pc);
     let n = *((this as usize + F_RING_AT) as *const usize);
     if hr < 0 && n > 0 {
@@ -433,6 +456,11 @@ mod tests {
         this as u64 + a + 10 * b + 100 * c + 1000 * d
     }
 
+    static SEEN: std::sync::Mutex<(usize, u32)> = std::sync::Mutex::new((0, 0));
+    unsafe extern "system" fn seen(this: *mut c_void, slot: u32) {
+        *SEEN.lock().unwrap() = (this as usize, slot);
+    }
+
     /// The SDK's inline writers check `write < end` (or `write + n <= end`): never room here.
     #[test]
     fn console_list_objects_have_no_room_and_forward_to_the_pc_list() {
@@ -452,6 +480,11 @@ mod tests {
             // a method: the PC list's, with the PC list as `this` and the arguments kept
             let m: unsafe extern "system" fn(*mut c_void, u64, u64, u64, u64) -> u64 = std::mem::transmute(slot(20));
             assert_eq!(m(o, 1, 2, 3, 4), fake as u64 + 4321);
+            // the breadcrumb / trace form calls its function with the console object and the
+            // slot first, then the same method with the same arguments
+            let m: unsafe extern "system" fn(*mut c_void, u64, u64, u64, u64) -> u64 = std::mem::transmute(forward_calling(20, seen));
+            assert_eq!(m(o, 1, 2, 3, 4), fake as u64 + 4321);
+            assert_eq!(*SEEN.lock().unwrap(), (o as usize, 20));
             // QueryInterface hands out the console object – also for the console-only list IIDs
             let q: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(slot(0));
             let mut out = std::ptr::null_mut();
