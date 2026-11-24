@@ -12,7 +12,9 @@
 //! staging upload queue, and the title's queues GPU-wait on the upload fence (no CPU stall).
 //! Only the bytes the CPU changed go (64-byte chunks against a hash of what was sent last,
 //! `changed_chunks`): the rest of a written page may hold what the GPU wrote there (counters,
-//! indirect arguments) and must not be overwritten with the CPU's stale view of it.
+//! indirect arguments) and must not be overwritten with the CPU's stale view of it. Inside a
+//! changed chunk the words title lists write on the GPU (`gpu_written`) stay out too unless
+//! the CPU changed them as well (`State::gpu_words`).
 //! Buffers the title places there get reserved resources over the same tiles, so PC-side
 //! copies, views and barriers see the same memory.
 
@@ -300,6 +302,15 @@ struct State {
     queue_rb: FxHashMap<usize, (ID3D12Fence, u64)>,
     /// title queue → its copies back the worker has not landed yet (later ones follow in order)
     unlanded: FxHashMap<usize, u32>,
+    /// 4-byte words title lists write on the GPU (`WriteBufferImmediate`: the console's
+    /// Write32/64BitValue*, progress values queues wait on) → the CPU view of the word when it
+    /// was last in step with video memory (noted, copied back, or sent). A chunk the CPU
+    /// changed is sent without such a word whose CPU view has not changed since: video memory
+    /// may already hold a newer value the copy back has not brought yet. Run 7: a queue's gate
+    /// waited for 0x68f at a progress cell whose 0x68f write had run on the GPU (its fence was
+    /// there) while the CPU view held 0x68e, then 0x68c; four cells other queues write shared
+    /// its 64 bytes.
+    gpu_words: BTreeMap<usize, u32>,
     /// `mapped` as sorted (start, end) runs (None: to be made again)
     runs: Option<Vec<(usize, usize)>>,
 }
@@ -1309,11 +1320,14 @@ impl Gpu {
     /// `batch` (address, window, staging offset at `p`, bytes) into staging and recorded on upload
     /// slot `slot_idx`. The CPU view is read with the state held, and only its pages still
     /// committed: a decommit or a free takes the state alone, and the title's memory under it
-    /// may be gone right after. The copies are recorded once the state is let go.
+    /// may be gone right after. The copies are recorded once the state is let go. Words the GPU
+    /// writes that the CPU did not change are left out (`State::upload_parts`).
     unsafe fn stage_batch(&mut self, batch: &mut Vec<(usize, usize, usize, usize)>, slot_idx: usize, p: *mut u8) {
         let mut copies: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(batch.len());
+        let mut parts: Vec<(usize, usize)> = Vec::new();
         {
-            let b = self.st();
+            let mut b = self.st();
+            let s = &mut *b;
             for &(cur, wi, off, len) in batch.iter() {
                 let mut at = cur;
                 let end = cur + len;
@@ -1322,12 +1336,16 @@ impl Gpu {
                     let t = pg & !(TILE - 1);
                     let idx = (pg - t) / PAGE;
                     let step = (pg + PAGE).min(end) - at;
-                    if b.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
-                        let dst = off + (at - cur);
-                        std::ptr::copy_nonoverlapping(at as *const u8, p.add(dst), step);
-                        match copies.last_mut() {
-                            Some(last) if last.1 == wi && last.0 + last.3 == at && last.2 + last.3 == dst => last.3 += step,
-                            _ => copies.push((at, wi, dst, step)),
+                    if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
+                        std::ptr::copy_nonoverlapping(at as *const u8, p.add(off + (at - cur)), step);
+                        parts.clear();
+                        s.upload_parts(at, step, &mut parts);
+                        for &(a, n) in &parts {
+                            let dst = off + (a - cur);
+                            match copies.last_mut() {
+                                Some(last) if last.1 == wi && last.0 + last.3 == a && last.2 + last.3 == dst => last.3 += n,
+                                _ => copies.push((a, wi, dst, n)),
+                            }
                         }
                     }
                     at += step;
@@ -1356,6 +1374,7 @@ impl State {
             to_zero: Vec::new(),
             queue_rb: FxHashMap::default(),
             unlanded: FxHashMap::default(),
+            gpu_words: BTreeMap::new(),
             runs: None,
         }
     }
@@ -1367,6 +1386,7 @@ impl State {
 
     /// Clear `sent` hashes for every page overlapping `[a, a + n)`.
     fn clear_sent_range(&mut self, a: usize, n: usize) {
+        self.forget_gpu_words(a, n);
         let mut pg = a & !(PAGE - 1);
         let end = a + n;
         while pg < end {
@@ -1380,6 +1400,51 @@ impl State {
                 }
             }
             pg = tile_end;
+        }
+    }
+
+    /// `gpu_words` in `[a, a + n)` no longer tracked (the memory was cleared or decommitted).
+    fn forget_gpu_words(&mut self, a: usize, n: usize) {
+        let gone: Vec<usize> = self.gpu_words.range(a..a.saturating_add(n)).map(|(&w, _)| w).collect();
+        for w in gone {
+            self.gpu_words.remove(&w);
+        }
+    }
+
+    /// The CPU view of `gpu_words` in `[a, a + n)` (committed memory) is in step with video
+    /// memory again.
+    unsafe fn sync_gpu_words(&mut self, a: usize, n: usize) {
+        for (&w, last) in self.gpu_words.range_mut(a..a.saturating_add(n)) {
+            *last = (w as *const u32).read_volatile();
+        }
+    }
+
+    /// The parts of `[a, a + n)` (committed memory, one page at most) a CPU-write upload sends
+    /// into `out`: all of it but the `gpu_words` whose CPU view has not changed since it was in
+    /// step with video memory. Those the CPU changed go, and are in step again.
+    unsafe fn upload_parts(&mut self, a: usize, n: usize, out: &mut Vec<(usize, usize)>) {
+        static KEPT: AtomicU64 = AtomicU64::new(0);
+        let end = a + n;
+        let mut from = a;
+        for (&w, last) in self.gpu_words.range_mut(a..end) {
+            let now = (w as *const u32).read_volatile();
+            if now != *last {
+                *last = now;
+                continue;
+            }
+            if w > from {
+                out.push((from, w - from));
+            }
+            from = (w + 4).min(end);
+            let k = KEPT.fetch_add(1, Ordering::Relaxed) + 1;
+            if k <= 16 || k.is_power_of_two() {
+                crate::xlog_info!(
+                    "sparse windows: a CPU-write upload left out {w:#x}, a word title lists write on the GPU (the CPU view {now:#x} has not changed since it was in step; other bytes of its 64 did) ({k} so far)"
+                );
+            }
+        }
+        if from < end {
+            out.push((from, end - from));
         }
     }
 
@@ -1429,6 +1494,7 @@ impl State {
                 let step = (pg + PAGE).min(end) - at;
                 if self.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
                     std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+                    self.sync_gpu_words(at, step);
                 }
                 at += step;
                 src_off += step;
@@ -1934,6 +2000,7 @@ impl State {
     /// unmaps them and frees their pool tiles); a pending tile left with no committed page is
     /// no longer pending.
     fn decommit_range(&mut self, a: usize, n: usize) {
+        self.forget_gpu_words(a, n);
         let end = a.saturating_add(n);
         let mut pools: Vec<(usize, (u32, u32))> = Vec::new();
         let mut dropped = false;
@@ -2179,6 +2246,22 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     Some((hr, delta))
 }
 
+/// A title list writes `[va, va + len)` on the GPU (`WriteBufferImmediate`): its words in a
+/// sparse window's committed memory are `State::gpu_words` from now on, taken as in step with
+/// video memory as the CPU sees them now.
+pub unsafe fn gpu_written(va: usize, len: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    let mut w = va & !3;
+    while w < va + len {
+        let t = w & !(TILE - 1);
+        if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << ((w - t) / PAGE)) == 0) {
+            s.gpu_words.entry(w).or_insert_with(|| (w as *const u32).read_volatile());
+        }
+        w += 4;
+    }
+}
+
 /// A placed buffer is gone: its tiles are not pinned by it any more.
 pub fn forget_buffer(res: usize) {
     if let Some(s) = STATE.lock().unwrap().as_mut() {
@@ -2295,6 +2378,43 @@ mod tests {
         }
         let occupied = used.iter().filter(|&&bucket| bucket).count();
         assert!(occupied >= used.len() / 2, "256 aligned addresses used {occupied} buckets");
+    }
+
+    /// Inside a chunk the CPU changed, a word title lists write on the GPU is not sent while
+    /// its CPU view is what it was when last in step with video memory (there the GPU may have
+    /// written a newer value the copy back has not brought yet: run 7's progress cell); it is
+    /// sent once the CPU changes it, and a copy back puts it in step again.
+    #[test]
+    fn a_changed_chunk_is_sent_without_the_gpu_words_the_cpu_did_not_change() {
+        let mut chunk = vec![0u64; CHUNK / 8];
+        let a = chunk.as_mut_ptr() as usize;
+        chunk[1] = 0x68e;
+        let mut s = State::new(Vec::new());
+        // a list writes the 64-bit cell at a + 8: its two words, as the CPU sees them now
+        unsafe {
+            for w in [a + 8, a + 12] {
+                s.gpu_words.insert(w, (w as *const u32).read());
+            }
+            let parts = |s: &mut State| {
+                let mut out = Vec::new();
+                s.upload_parts(a, CHUNK, &mut out);
+                out
+            };
+            // the CPU changes another cell of the chunk: all of it goes but the GPU's cell
+            std::ptr::write_volatile(&mut chunk[4], 7);
+            assert_eq!(parts(&mut s), vec![(a, 8), (a + 16, CHUNK - 16)]);
+            // the CPU writes the cell itself: its changed (low) word goes
+            std::ptr::write_volatile(&mut chunk[1], 0x700);
+            assert_eq!(parts(&mut s), vec![(a, 12), (a + 16, CHUNK - 16)], "the high word did not change");
+            assert_eq!(parts(&mut s), vec![(a, 8), (a + 16, CHUNK - 16)], "sent: in step again");
+            // a copy back brings the GPU's newer value: in step, left out again
+            std::ptr::write_volatile(&mut chunk[1], 0x68f);
+            s.sync_gpu_words(a, CHUNK);
+            assert_eq!(parts(&mut s), vec![(a, 8), (a + 16, CHUNK - 16)]);
+            // the memory is cleared or decommitted: no longer tracked
+            s.forget_gpu_words(a, CHUNK);
+            assert_eq!(parts(&mut s), vec![(a, CHUNK)]);
+        }
     }
 
     /// Only the 64-byte chunks the CPU changed are sent again – the rest of the page may hold
