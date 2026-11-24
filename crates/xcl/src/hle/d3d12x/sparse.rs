@@ -438,7 +438,8 @@ unsafe impl Send for State {}
 
 /// Lock order: `WORK`, then `STATE`. `WORK` is held across calls into D3D12 and waits for the
 /// GPU, so it is only taken where a title submits, maps or places (`before_execute`,
-/// `readback_*`, `place_buffer`), never by a release, a commit or a decommit.
+/// `readback_*`, `place_buffer`), by `init` and by `pool_bytes`, never by a release, a commit
+/// or a decommit.
 static WORK: Mutex<Option<Gpu>> = Mutex::new(None);
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// `Gpu::queue`, for `queue` (`late_release` asks for it from inside a release)
@@ -1492,8 +1493,8 @@ impl State {
 }
 
 /// Allocate a zeroed, write-watched block in the sparse VRAM windows (never straddling a
-/// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages and maps VRAM tiles
-/// (or queues them until the D3D12 device exists). Returns `(address, rounded_size)`.
+/// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages; their tiles get video
+/// memory before the GPU's next use (`State::pending`). Returns `(address, rounded_size)`.
 pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc(size, align)?;
@@ -1642,7 +1643,7 @@ unsafe fn execute_own(queue: &ID3D12CommandQueue, list: &ID3D12CommandList) {
     }
 }
 
-/// A copy back recorded on a title queue (`State::readback_on`): done when `fence` reaches
+/// A copy back recorded on a title queue (`Gpu::readback_on`): done when `fence` reaches
 /// `value`.
 struct Readback {
     queue: usize,
