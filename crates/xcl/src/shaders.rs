@@ -816,7 +816,7 @@ fn driver_fits(running: &[usize], avail: u64, huge_most: usize) -> Option<usize>
 }
 
 /// A byte count: a number with an optional K / M / G suffix (1024-based, any case), e.g. `8M`.
-fn parse_bytes(s: &str) -> Option<usize> {
+pub(crate) fn parse_bytes(s: &str) -> Option<usize> {
     let s = s.trim();
     let (digits, shift) = match s.as_bytes().last()?.to_ascii_uppercase() {
         b'K' => (&s[..s.len() - 1], 10),
