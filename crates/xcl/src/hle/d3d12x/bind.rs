@@ -246,6 +246,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if super::pso_async::is_pending(with(this, |s| s.pso)) {
             count(DRAWS_SKIPPED);
+            super::breadcrumbs::skipped(this, with(this, |s| s.pso), || format!("ExecuteIndirect max {max} skipped: pipeline still being built"));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
@@ -257,9 +258,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
-        return pc(this, sig, max, args, args_off, count_buf, count_off);
+        pc(this, sig, max, args, args_off, count_buf, count_off);
+        super::breadcrumbs::after(this, with(this, |s| s.pso), || format!("ExecuteIndirect max {max} with a PC pipeline (args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
+        return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+        super::breadcrumbs::skipped(this, with(this, |s| s.pso), || format!("ExecuteIndirect max {max} skipped: it changes root arguments"));
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
@@ -270,10 +274,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
-            pc(this, sig, max, args, args_off, count_buf, count_off)
+            pc(this, sig, max, args, args_off, count_buf, count_off);
+            let kind = if gfx { "draws" } else { "dispatches" };
+            super::breadcrumbs::after(this, with(this, |s| s.pso), || format!("ExecuteIndirect max {max} ({kind}; args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+            super::breadcrumbs::skipped(this, with(this, |s| s.pso), || format!("ExecuteIndirect max {max} skipped: {e}"));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
@@ -354,12 +361,15 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
+    let what = || format!("DrawInstanced {vertices} vertices x {instances}");
     if let Some(list) = graphics_bound(this) {
-        if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
-            return;
+        if !draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
+            super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
+            list.DrawInstanced(vertices, instances, first_vertex, first_instance);
         }
-        super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
-        list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        super::breadcrumbs::after(this, with(this, |s| s.pso), what);
+    } else {
+        super::breadcrumbs::skipped(this, with(this, |s| s.pso), what);
     }
 }
 
@@ -373,6 +383,8 @@ pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, i
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
+    } else {
+        super::breadcrumbs::skipped(this, with(this, |s| s.pso), || format!("DrawIndexedInstanced {indices} indices x {instances}"));
     }
 }
 
@@ -398,6 +410,8 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     first_instance: u32,
 ) {
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    let this = list.as_raw();
+    super::breadcrumbs::after(this, with(this, |s| s.pso), || format!("DrawIndexedInstanced {indices} indices x {instances}"));
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
@@ -722,12 +736,17 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
         count(DISPATCHES_SKIPPED);
+        super::breadcrumbs::skipped(this, with(this, |s| s.pso), || format!("Dispatch {x}x{y}x{z} skipped: no translated console shader"));
         return;
     }
     match translated_dispatch(this, list, pso, x, y, z) {
-        Ok(()) => count(DISPATCHES),
+        Ok(()) => {
+            count(DISPATCHES);
+            super::breadcrumbs::after(this, pso, || format!("Dispatch {x}x{y}x{z}"));
+        }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
+            super::breadcrumbs::skipped(this, pso, || format!("Dispatch {x}x{y}x{z} skipped: {e}"));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: Dispatch with a translated pipeline skipped: {e}");

@@ -11,6 +11,7 @@
 
 mod alloc_pool;
 pub mod bind;
+mod breadcrumbs;
 pub mod console_heap;
 pub mod console_list;
 pub mod device_x;

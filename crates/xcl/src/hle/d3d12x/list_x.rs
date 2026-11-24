@@ -1994,7 +1994,7 @@ unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &
 }
 
 /// `q{id}/ty{type}` of a title queue, as the other synchronisation warnings name it.
-fn queue_label(queue: usize) -> String {
+pub(super) fn queue_label(queue: usize) -> String {
     let ty = LIVE_QUEUES.lock().unwrap().iter().find(|q| q.queue == queue).map_or(-1, |q| q.ty.0);
     format!("q{}/ty{ty}", queue_id(queue))
 }
@@ -2917,6 +2917,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
+            super::breadcrumbs::executed(q_raw, prior);
             execute_with_waits_on(q_raw, prior, |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
                 super::alloc_pool::executed(q_raw, chunk);
@@ -2936,6 +2937,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
+    super::breadcrumbs::executed(q_raw, &one);
     exec(q_raw, 1, one.as_ptr());
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
