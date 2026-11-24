@@ -713,6 +713,41 @@ pub fn video_memory() -> Option<VideoMemory> {
     }
 }
 
+/// `XCL_VRAM_BALLAST_MB`: video memory the process holds from the device's creation and never
+/// uses. It moves the point at which the process's local video memory reaches a level, so a run
+/// with it tells whether a device removal follows the process's video memory (it comes that
+/// much sooner in the title) or what the title is doing (it comes at the same point).
+fn ballast_mb_from(v: Option<&str>) -> Option<u64> {
+    v?.trim().parse().ok().filter(|&mb: &u64| mb > 0)
+}
+
+/// Default heaps of `mb` MB in all, of at most 256 MiB each (resident from their creation, so
+/// counted in the process's local video memory). Fewer when one cannot be made (logged).
+unsafe fn vram_ballast(dev: &ID3D12Device, mb: u64) -> Vec<ID3D12Heap> {
+    const HEAP: u64 = 256 << 20;
+    let mut left = mb << 20;
+    let mut heaps = Vec::new();
+    while left > 0 {
+        let size = left.min(HEAP);
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: size,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        match dev.CreateHeap(&desc, &mut heap) {
+            Ok(()) => heaps.extend(heap),
+            Err(e) => {
+                crate::xlog_warn!("D3D12: XCL_VRAM_BALLAST_MB: a heap of {} MB cannot be made ({e}): {} MB held", size >> 20, (mb << 20).saturating_sub(left) >> 20);
+                break;
+            }
+        }
+        left -= size;
+    }
+    heaps
+}
+
 /// The device runs only 32-lane waves: wave64 compute, mesh and geometry programs need the
 /// split form (`Options::split_wave64`). Unknown device: assume so.
 fn wave32_only(device: *mut c_void) -> bool {
@@ -821,6 +856,12 @@ pub fn init() -> Result<String, String> {
         }
         open_uma(&device);
         super::device_x::probe_dynamic_depth_bias(&device);
+        if let Some(mb) = ballast_mb_from(std::env::var("XCL_VRAM_BALLAST_MB").ok().as_deref()) {
+            let heaps = vram_ballast(&device, mb);
+            crate::xlog_info!("D3D12: XCL_VRAM_BALLAST_MB: {} MB of video memory held and never used ({} heaps)", heaps.iter().map(|h| h.GetDesc().SizeInBytes).sum::<u64>() >> 20, heaps.len());
+            // (held for the process lifetime, as the device is)
+            std::mem::forget(heaps);
+        }
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -831,26 +872,55 @@ pub fn init() -> Result<String, String> {
 
 /// A debug layer message: errors and warnings into the log – the first 8 of each message id
 /// (3 000 in all). One cap for all of them (200) was used up in seconds by two per-frame state
-/// errors of a retail game, long before the message that came with its device removal.
+/// errors of a retail game, long before the message that came with its device removal. Every
+/// message, capped or not, also goes to `DEBUG_TAIL`, written out at a removal.
 unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
     if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
         return;
     }
-    {
+    let error = severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0;
+    let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
+    let logged = {
         let mut g = PER_ID.lock().unwrap();
         let n = g.get_or_insert_with(HashMap::new).entry(id.0).or_insert(0);
         *n += 1;
-        if *n > 8 {
-            return;
-        }
+        *n <= 8
+    } && N.fetch_add(1, Ordering::Relaxed) < 3000;
+    if logged {
+        crate::xlog_warn!("D3D12 debug layer ({}, id {}): {t}", if error { "error" } else { "warning" }, id.0);
     }
-    if N.fetch_add(1, Ordering::Relaxed) >= 3000 {
-        return;
+    remember_debug_message(&mut DEBUG_TAIL.lock().unwrap(), (std::time::Instant::now(), error, id.0, t));
+}
+
+/// A debug layer message: (when, an error, its id, its text).
+type DebugMessage = (std::time::Instant, bool, i32, String);
+
+/// How many of the last debug layer messages `DEBUG_TAIL` keeps.
+const DEBUG_TAIL_LEN: usize = 64;
+
+/// The last `DEBUG_TAIL_LEN` debug layer messages of any id, the ones past the log's cap too
+/// (a removal's own message can be an id already logged 8 times).
+static DEBUG_TAIL: Mutex<std::collections::VecDeque<DebugMessage>> = Mutex::new(std::collections::VecDeque::new());
+
+fn remember_debug_message(tail: &mut std::collections::VecDeque<DebugMessage>, m: DebugMessage) {
+    if tail.len() == DEBUG_TAIL_LEN {
+        tail.pop_front();
     }
-    let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
-    crate::xlog_warn!("D3D12 debug layer ({}, id {}): {t}", if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 { "error" } else { "warning" }, id.0);
+    tail.push_back(m);
+}
+
+/// The log lines of `tail` at `now`, oldest first (none without the debug layer).
+fn debug_tail_lines(tail: &std::collections::VecDeque<DebugMessage>, now: std::time::Instant) -> Vec<String> {
+    let mut out = Vec::with_capacity(tail.len() + 1);
+    if !tail.is_empty() {
+        out.push(format!("the last {} debug layer messages before the removal, of any id:", tail.len()));
+    }
+    for (at, error, id, text) in tail {
+        out.push(format!("D3D12 debug layer, {} ms before ({}, id {id}): {text}", now.saturating_duration_since(*at).as_millis(), if *error { "error" } else { "warning" }));
+    }
+    out
 }
 
 type QiFn = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
@@ -6454,6 +6524,10 @@ pub fn log_device_removed() {
         for line in unsafe { dred_lines(dev) } {
             crate::xlog_error!("{line}");
         }
+        let lines = debug_tail_lines(&DEBUG_TAIL.lock().unwrap(), std::time::Instant::now());
+        for line in lines {
+            crate::xlog_error!("{line}");
+        }
     });
 }
 
@@ -6629,6 +6703,63 @@ fn a_gpu_copy_reads_a_coherent_window_word() {
     }
     u.free(p as _);
     assert!(unsafe { gpu_read_u64(0x10) }.is_err(), "outside the windows");
+}
+
+/// `XCL_VRAM_BALLAST_MB`: a whole number from 1, else no ballast.
+#[cfg(test)]
+#[test]
+fn the_vram_ballast_is_a_whole_number_of_mb_from_1() {
+    assert_eq!(ballast_mb_from(None), None);
+    assert_eq!(ballast_mb_from(Some("0")), None);
+    assert_eq!(ballast_mb_from(Some("2 GB")), None);
+    assert_eq!(ballast_mb_from(Some(" 2048 ")), Some(2048));
+}
+
+/// The ballast is resident video memory of the process: its local usage grows by it.
+#[cfg(test)]
+#[test]
+fn a_vram_ballast_counts_in_the_local_video_memory() {
+    use windows::Win32::Graphics::Dxgi::*;
+    unsafe {
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        }
+        let dev = dev.unwrap();
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(dev.GetAdapterLuid()).unwrap();
+        let local = || {
+            let mut i = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut i).unwrap();
+            i.CurrentUsage >> 20
+        };
+        let before = local();
+        let heaps = vram_ballast(&dev, 600);
+        assert_eq!(heaps.iter().map(|h| h.GetDesc().SizeInBytes >> 20).collect::<Vec<_>>(), [256, 256, 88]);
+        let held = local();
+        assert!(held >= before + 590, "local video memory {before} MB → {held} MB with 600 MB of ballast");
+        drop(heaps);
+        assert!(local() + 590 <= held, "the ballast's memory went back when its heaps did");
+    }
+}
+
+/// A removal's debug layer message is logged even when its id is past the log's cap: the tail
+/// keeps the last messages of every id.
+#[cfg(test)]
+#[test]
+fn the_debug_tail_keeps_the_last_messages_of_any_id() {
+    let t0 = std::time::Instant::now();
+    let mut tail = std::collections::VecDeque::new();
+    for i in 0..100 {
+        remember_debug_message(&mut tail, (t0, true, 538, format!("state {i}")));
+    }
+    remember_debug_message(&mut tail, (t0 + std::time::Duration::from_millis(5), true, 1047, "hazard".to_owned()));
+    assert_eq!(tail.len(), DEBUG_TAIL_LEN);
+    let lines = debug_tail_lines(&tail, t0 + std::time::Duration::from_millis(30));
+    assert_eq!(lines[0], format!("the last {DEBUG_TAIL_LEN} debug layer messages before the removal, of any id:"));
+    assert_eq!(lines[1], "D3D12 debug layer, 30 ms before (error, id 538): state 37");
+    assert_eq!(lines.last().unwrap(), "D3D12 debug layer, 25 ms before (error, id 1047): hazard");
+    assert!(debug_tail_lines(&std::collections::VecDeque::new(), t0).is_empty());
 }
 
 /// The device of a GPU test of the reads (None: no GPU).
