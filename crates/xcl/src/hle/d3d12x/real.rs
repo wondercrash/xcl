@@ -4611,9 +4611,14 @@ unsafe impl Send for OwnedDesc {}
 /// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
 /// pipeline by in the next run.
 pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
+    shaders_key_of(blobs.iter().map(|b| crate::gpu::shader::fnv64(b)))
+}
+
+/// `shaders_key` from the `fnv64` of each shader (what `pso_journal` keeps of a pipeline's shaders).
+pub(crate) fn shaders_key_of(hashes: impl IntoIterator<Item = u64>) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for b in blobs {
-        h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    for s in hashes {
+        h = (h ^ s).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h | 1
 }

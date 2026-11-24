@@ -1058,6 +1058,15 @@ the FSR4 GPU probe, Unicorn Overlord and XDefiant:
   after another, and 47 binds waited 2 – 17.5 s each (median ~5.5 s, 75 – 353 s into the run); with a short graphics
   budget the title reaches all of them at once and the workers build them in parallel – a discovery run for
   `used-pipelines.txt`, which a bind adds its pipeline's shaders to however long it waited.
+- **Used list and warm-up:** `<DXIL cache>\used-pipelines.txt` holds one 16-digit hex key per line: `real::shaders_key`
+  (an FNV fold of the `fnv64` of a pipeline's shaders in slot order – VS, PS, DS, HS, GS; a compute pipeline's CS), added
+  once per key at the first `pso_async::resolve` / `resolve_wait` of a graphics **or** compute pipeline (a bind that
+  went on without it counts; no extra hashing per draw). Older readers parse it unchanged (`xcl shaders --precompile
+  --used` takes the compute keys). `xcl pipelines <game> --used [file]` (repeat for more files) makes only the
+  journal's pipelines (`<data>\cache\pipelines.bin`, key from the shader hashes of each `G` / `C` frame:
+  `pso_journal::shaders_key`) whose key is listed, biggest console shaders first, and prints how many it picked; a
+  graphics pipeline made that way fills the DXIL cache and the driver's own cache (only compute pipelines have
+  XCL's `driver_cache` blobs). The key holds no pipeline state, so every state variant of a listed shader set is made.
 - Tests: `retail_pipelines_built_in_the_background_behind_a_stand_in` (empty DXIL cache: the game's VS/PS pipeline built
   in the background renders the same triangle pixel for pixel; a mesh pipeline returns after ~0.1 s, real after ~1 s,
   two-pass parts found through the stand-in, title's description freed before the worker ran); the game's BVH builder

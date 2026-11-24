@@ -301,8 +301,9 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     }
 }
 
-/// The pipelines a title used, by a hash of their shaders, kept between runs
-/// (`used-pipelines.txt` beside the DXIL cache, a key a line).
+/// The pipelines a title used – graphics and compute ones, from the first bind or replay that
+/// resolves them (`resolve`, `resolve_wait`: also one that goes on without it, `late`) – by a hash of their
+/// shaders, kept between runs (`used-pipelines.txt` beside the DXIL cache, a key a line).
 ///
 /// A lazy pipeline is built at its first use: until then a graphics one draws nothing, and a
 /// compute one is waited for on the title's thread. A retail title's first frames of its world
@@ -385,7 +386,8 @@ pub(crate) fn used_path() -> std::path::PathBuf {
 }
 
 /// The shader sets (`real::shaders_key`) in a used-pipelines file (none when it cannot be read):
-/// what `xcl shaders --precompile --used [file]` builds between runs.
+/// what `xcl shaders --precompile --used [file]` (compute) and `xcl pipelines --used [file]`
+/// (graphics and compute, from the journal) build between runs.
 pub(crate) fn used_in(file: &std::path::Path) -> std::collections::HashSet<u64> {
     used::parse(&std::fs::read_to_string(file).unwrap_or_default())
 }

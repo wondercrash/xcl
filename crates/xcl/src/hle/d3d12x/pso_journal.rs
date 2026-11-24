@@ -273,6 +273,25 @@ pub fn used(hash: u64) {
     with(|j| put(j, b'U', 0, hash, &[]).map(|_| 0));
 }
 
+/// The shaders of the pipeline in a `G` / `C` frame's `payload` by their `fnv64`, in slot order
+/// (the empty slots left out): the hashes at the start of the payload. None: not a pipeline, or
+/// too short.
+pub fn shader_hashes(tag: u8, payload: &[u8]) -> Option<impl Iterator<Item = u64> + '_> {
+    let slots = match tag {
+        b'G' => 5,
+        b'C' => 1,
+        _ => return None,
+    };
+    let words = payload.get(..slots * 8)?.chunks_exact(8).map(|w| u64::from_le_bytes(w.try_into().unwrap()));
+    Some(words.filter(|&h| h != 0))
+}
+
+/// `real::shaders_key` of the pipeline in a `G` / `C` frame: what `used-pipelines.txt` lists a
+/// used pipeline by.
+pub fn shaders_key(tag: u8, payload: &[u8]) -> Option<u64> {
+    shader_hashes(tag, payload).map(super::real::shaders_key_of)
+}
+
 /// A journal's pipeline, read back with everything it points to owned.
 pub enum Replay {
     Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Vec<u8>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
@@ -442,5 +461,40 @@ mod tests {
         let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&p).unwrap();
         let _ = std::fs::remove_file(&p);
         f
+    }
+
+    /// The key of a journal frame is the one the runtime writes to `used-pipelines.txt` for the
+    /// same pipeline (`OwnedDesc::shaders_key`: its shaders in slot order, the empty slots left out).
+    #[test]
+    fn a_frame_has_the_key_the_runtime_notes_for_its_pipeline() {
+        let (vs, ps, gs, cs) = (vec![1u8, 2, 3, 4], vec![9u8; 40], vec![7u8; 8], vec![5u8; 12]);
+        let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        for (slot, b) in [(&mut d.VS, &vs), (&mut d.PS, &ps)] {
+            *slot = D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as *const _, BytecodeLength: b.len() };
+        }
+        let mut j = Journal { file: tempfile(), seen: HashSet::new() };
+        let payload_of = |j: &mut Journal, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC| {
+            use std::io::{Read, Seek};
+            unsafe { graphics_in(j, d).unwrap() };
+            let mut bytes = MAGIC.to_vec();
+            j.file.seek(std::io::SeekFrom::Start(0)).unwrap();
+            j.file.read_to_end(&mut bytes).unwrap();
+            let mut last = None;
+            for_each_frame(&bytes, |f| {
+                if f.tag == b'G' {
+                    last = Some(f.payload.to_vec());
+                }
+            });
+            last.unwrap()
+        };
+        let key_vs_ps = super::super::real::shaders_key(&[vs.clone(), ps.clone()]);
+        assert_eq!(shaders_key(b'G', &payload_of(&mut j, &d)), Some(key_vs_ps), "VS and PS: the empty DS / HS / GS slots are not part of it");
+        d.GS = D3D12_SHADER_BYTECODE { pShaderBytecode: gs.as_ptr() as *const _, BytecodeLength: gs.len() };
+        assert_eq!(shaders_key(b'G', &payload_of(&mut j, &d)), Some(super::super::real::shaders_key(&[vs, ps, gs])), "a GS follows the PS");
+        let mut compute = [0u8; 8];
+        compute.copy_from_slice(&crate::gpu::shader::fnv64(&cs).to_le_bytes());
+        assert_eq!(shaders_key(b'C', &compute), Some(super::super::real::shaders_key(&[cs])));
+        assert_eq!(shaders_key(b'G', &compute), None, "too short for a graphics frame");
+        assert_eq!(shaders_key(b'U', &compute), None);
     }
 }

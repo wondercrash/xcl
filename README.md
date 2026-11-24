@@ -117,7 +117,7 @@ xcl run D:\Game [-- game arguments]        # run
 xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
-xcl pipelines D:\Games\SomeTitle [--watch]  # compile the pipelines a run queued (<data>\cache\pipelines.bin)
+xcl pipelines D:\Games\SomeTitle [--watch] [--used [file]]  # compile the pipelines a run queued (<data>\cache\pipelines.bin); --used: only those an earlier run bound (used-pipelines.txt)
 ```
 
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a

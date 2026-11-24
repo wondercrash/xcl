@@ -15,12 +15,27 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 const HELP: &str = "\
-xcl pipelines <game folder | title data folder | pipelines.bin> [--watch] [--threads N] [--limit N]
+xcl pipelines <game folder | title data folder | pipelines.bin> [--watch] [--threads N] [--limit N] [--used [file]]
   Compiles the pipelines a run of the title asked for (<data>\\cache\\pipelines.bin) outside
   the title: the DXIL cache and the driver's cache. --watch: also while the title runs,
   following what it adds (stop with Ctrl+C). --threads: pipelines at once (default: half the
   cores, at below-normal priority; XCL_PIPELINE_THREADS caps the driver compiles, default 4, 2 with --watch).
+  --used [file]: only the graphics and compute pipelines whose shaders an earlier run of the
+  title used (the keys the runtime keeps in used-pipelines.txt in the DXIL cache, or in `file`;
+  repeat --used for more files), the biggest console shaders first; says how many it picked.
   XCL_PRECOMPILE_MAX_DXIL (bytes, e.g. 8M): compute programs with more DXIL are left to the title.";
+
+/// The files `--used` names: the one after each `--used` that is not another option, else
+/// `default` (the runtime's list). Empty without `--used`.
+fn used_files(args: &[String], default: impl Fn() -> PathBuf) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a == "--used" {
+            files.push(args.get(i + 1).filter(|n| !n.starts_with("--")).map_or_else(&default, PathBuf::from));
+        }
+    }
+    files
+}
 
 /// The journal of `target`: the file itself, a data folder with one, or a game folder.
 fn journal_of(target: &Path) -> Result<PathBuf, String> {
@@ -79,7 +94,8 @@ impl Trying {
 
 #[derive(Default)]
 struct Queue {
-    /// pipelines the title built, then the others (journal order)
+    /// pipelines the title built, then the others (journal order); with `filter` only the first
+    /// is used, biggest first
     used: VecDeque<u64>,
     rest: VecDeque<u64>,
     /// done, or taken by a worker
@@ -87,6 +103,13 @@ struct Queue {
     shaders: HashMap<u64, Arc<Vec<u8>>>,
     pipes: HashMap<u64, (u8, Arc<Vec<u8>>)>,
     was_used: HashSet<u64>,
+    /// `--used`: the `real::shaders_key`s of the pipelines to make, and for those of `pipes` the
+    /// bytes of their shaders (to order them)
+    filter: Option<HashSet<u64>>,
+    sizes: HashMap<u64, usize>,
+    /// pipelines of the run's memory windows taken by `filter` (graphics, compute), and left out
+    picked: [usize; 2],
+    not_listed: usize,
     /// the memory windows of the run (`run` sets them: `pso::set_mem_windows`); other runs' are left out
     windows: u8,
     other_windows: usize,
@@ -135,9 +158,19 @@ impl Queue {
                         self.other_windows += 1;
                         continue;
                     }
+                    if let Some(keys) = &self.filter {
+                        let key = pso_journal::shaders_key(tag, &payload);
+                        if !key.is_some_and(|k| keys.contains(&k)) {
+                            self.not_listed += 1;
+                            continue;
+                        }
+                        self.picked[(tag == b'C') as usize] += 1;
+                        let size = pso_journal::shader_hashes(tag, &payload).map_or(0, |hs| hs.filter_map(|h| self.shaders.get(&h)).map(|s| s.len()).sum());
+                        self.sizes.insert(hash, size);
+                    }
                     self.pipes.insert(hash, (tag, Arc::new(payload)));
                     if !self.taken.contains(&hash) {
-                        if self.was_used.contains(&hash) {
+                        if self.filter.is_some() || self.was_used.contains(&hash) {
                             self.used.push_back(hash);
                         } else {
                             self.rest.push_back(hash);
@@ -146,12 +179,17 @@ impl Queue {
                     }
                 }
                 b'U' => {
-                    if self.was_used.insert(hash) && self.pipes.contains_key(&hash) && !self.taken.contains(&hash) {
+                    if self.was_used.insert(hash) && self.filter.is_none() && self.pipes.contains_key(&hash) && !self.taken.contains(&hash) {
                         self.used.push_back(hash);
                     }
                 }
                 _ => {}
             }
+        }
+        if self.filter.is_some() && new > 0 {
+            // (stable: the journal's order among equals)
+            let sizes = &self.sizes;
+            self.used.make_contiguous().sort_by_key(|h| std::cmp::Reverse(sizes.get(h).copied().unwrap_or(0)));
         }
         new
     }
@@ -211,6 +249,14 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     let gpu_most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(if watch { 2 } else { 4usize }).max(1);
     let threads = opt("--threads").unwrap_or(half).max(1);
     let max_dxil = crate::shaders::max_dxil("xcl pipelines");
+    // `--used`: the shader sets an earlier run of the title used (`pso_async::used_in`)
+    let used = used_files(args, crate::hle::d3d12x::pso_async::used_path);
+    let used_keys: Option<HashSet<u64>> = (!used.is_empty()).then(|| used.iter().flat_map(|f| crate::hle::d3d12x::pso_async::used_in(f)).collect());
+    let used_names = used.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", ");
+    if used_keys.as_ref().is_some_and(HashSet::is_empty) {
+        eprintln!("xcl pipelines --used: no pipelines in {used_names} (a title run writes them)");
+        return 2;
+    }
 
     let mut file = match std::fs::File::open(&journal) {
         Ok(f) => f,
@@ -220,6 +266,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         }
     };
     let q = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
+    q.0.lock().unwrap().filter = used_keys;
     // what an earlier run of this binary finished
     let done_path = journal.with_extension("done");
     let key = binary_key(gpu_key);
@@ -272,6 +319,20 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             max_dxil.map_or(String::new(), |most| format!("; compute programs over {most} B of DXIL left to the title")),
             if watch { "; following the journal (Ctrl+C stops)" } else { "" }
         );
+    }
+    {
+        let g = q.0.lock().unwrap();
+        if let Some(keys) = &g.filter {
+            println!(
+                "--used {used_names}: {} shader sets listed; picked {} of the journal's {} pipelines ({} graphics, {} compute), biggest first; {} not on the list",
+                keys.len(),
+                g.picked[0] + g.picked[1],
+                g.picked[0] + g.picked[1] + g.not_listed,
+                g.picked[0],
+                g.picked[1],
+                g.not_listed
+            );
+        }
     }
 
     let t0 = std::time::Instant::now();
@@ -395,6 +456,9 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     );
     if g.other_windows > 0 {
         println!("  {} pipelines from a run with other memory windows left out", g.other_windows);
+    }
+    if g.filter.is_some() {
+        println!("  --used: picked {} pipelines ({} graphics, {} compute), {} of the journal's not on the list", g.picked[0] + g.picked[1], g.picked[0], g.picked[1], g.not_listed);
     }
     let mut r: Vec<_> = reasons.into_inner().unwrap().into_iter().collect();
     r.sort_by(|a, b| b.1.cmp(&a.1));
@@ -575,6 +639,52 @@ mod tests {
         assert_eq!(q.ingest(&mut f), 0);
         assert_eq!(q.next().map(|(h, _)| h), Some(2));
         assert!(q.next().is_none(), "each pipeline once");
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn used_names_the_file_after_it_unless_that_is_another_option() {
+        let default = || PathBuf::from("cache.txt");
+        assert!(used_files(&args(&["--watch"]), default).is_empty());
+        assert_eq!(used_files(&args(&["--used"]), default), [PathBuf::from("cache.txt")]);
+        assert_eq!(used_files(&args(&["--used", "--watch"]), default), [PathBuf::from("cache.txt")]);
+        assert_eq!(used_files(&args(&["--threads", "2", "--used", "a.txt", "--used", "b.txt"]), default), [PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
+    }
+
+    /// `--used` takes the graphics and compute pipelines whose shader set is on the list (a
+    /// graphics one by all its shaders in slot order, a compute one by its CS), counts them, and
+    /// queues them biggest first by the bytes of their shaders; the others are left out and a `U`
+    /// frame does not queue them again.
+    #[test]
+    fn used_takes_the_listed_shader_sets_biggest_first() {
+        use crate::hle::d3d12x::real::shaders_key_of;
+        // (a pipeline's payload: five shader slots, then its desc)
+        let pipe = |slots: &[u64]| {
+            let mut p = [0u64; 5];
+            p[..slots.len()].copy_from_slice(slots);
+            p.iter().flat_map(|h| h.to_le_bytes()).chain([0u8; 8]).collect::<Vec<u8>>()
+        };
+        let mut j = pso_journal::MAGIC.to_vec();
+        for (h, len) in [(1u64, 100usize), (2, 10), (3, 50), (4, 30)] {
+            j.extend(frame(b'S', h, &vec![0u8; len]));
+        }
+        j.extend(frame(b'G', 10, &pipe(&[1, 4]))); // VS + PS: 130 B
+        j.extend(frame(b'G', 11, &pipe(&[2]))); // 10 B
+        j.extend(frame(b'G', 12, &pipe(&[4, 2]))); // not listed
+        j.extend(frame(b'C', 13, &pipe(&[3]))); // 50 B
+        j.extend(frame(b'U', 12, &[]));
+        let path = std::env::temp_dir().join(format!("xcl_pipelines_used_{}.bin", std::process::id()));
+        std::fs::write(&path, &j).unwrap();
+        let mut f = std::fs::File::open(&path).unwrap();
+        let mut q = Queue { filter: Some([shaders_key_of([1, 4]), shaders_key_of([2]), shaders_key_of([3])].into()), ..Default::default() };
+        assert_eq!(q.ingest(&mut f), 3);
+        assert_eq!((q.picked, q.not_listed), ([2, 1], 1));
+        assert_eq!(std::iter::from_fn(|| q.next().map(|(h, _)| h)).collect::<Vec<_>>(), [10, 13, 11], "biggest first; 12 is not on the list");
         drop(f);
         let _ = std::fs::remove_file(&path);
     }
