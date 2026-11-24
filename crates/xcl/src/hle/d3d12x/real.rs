@@ -1694,6 +1694,9 @@ fn forget_pso(pso: usize) {
     if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
+    if let Some(m) = PSO_SHADERS.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
     if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
@@ -3463,6 +3466,9 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
+    if super::breadcrumbs::on() {
+        PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(cs), 0));
+    }
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
@@ -3810,9 +3816,12 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     note_pso_rs(*ppv, rs);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
+    let ps = || shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
+    if super::present::trace_frame() || super::breadcrumbs::on() {
+        PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps()));
+    }
     if super::present::trace_frame() {
-        let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
-        PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
+        let ps = ps();
         // the input layout (semantic index, format, slot, offset) – what the vertices are read as
         let il = &d.InputLayout;
         let elems: Vec<String> = if il.NumElements > 0 && !il.pInputElementDescs.is_null() {
@@ -5161,6 +5170,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    super::breadcrumbs::executed(this, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::alloc_pool::executed(this, chunk);

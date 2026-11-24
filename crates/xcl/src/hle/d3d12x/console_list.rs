@@ -811,6 +811,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let real = super::pso_async::resolve_wait((*p).pc);
                         if !super::real::is_translated_compute(real) {
                             out.skipped_dispatches += 1;
+                            super::breadcrumbs::skipped(list.as_raw(), (*p).pc, || format!("Dispatch {x}x{y}x{z} (console list) skipped: no translated console shader"));
                             continue;
                         }
                         let user_sgprs = super::real::pso_user_sgprs(real);
@@ -839,9 +840,13 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
                         list.Dispatch(x, y, z);
+                        super::breadcrumbs::after(list.as_raw(), real, || format!("Dispatch {x}x{y}x{z} (console list)"));
                         out.dispatches += 1;
                     }
-                    _ => out.skipped_dispatches += 1,
+                    _ => {
+                        out.skipped_dispatches += 1;
+                        super::breadcrumbs::skipped(list.as_raw(), 0, || format!("Dispatch {x}x{y}x{z} (console list) skipped: no translated pipeline"));
+                    }
                 }
             } else if w0 & 0xC000_0000 == PARAM_BASE {
                 let i = ((w0 >> 10) & 0x3F) as usize;
