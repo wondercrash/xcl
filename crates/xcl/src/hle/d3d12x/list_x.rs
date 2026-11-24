@@ -17,7 +17,7 @@
 //! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
 //! An index buffer at such an address is given to the PC as the window buffer's GPU address.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1062,6 +1062,10 @@ struct SyncCell {
     armed_waits: Vec<ArmedGpuWait>,
     /// Active GPU `queue.Signal(&fence, v)` calls on this cell not yet confirmed completed on GPU.
     submitted_signals: Vec<SubmittedSignal>,
+    /// The last `HISTORY` submissions of a `Write64` of this cell, in submission order: (queue,
+    /// value, how far the cell's submissions had got before it). One below an earlier one can
+    /// land after it on the GPU and lower the cell under its fence.
+    history: VecDeque<(usize, u64, u64)>,
 }
 
 // SAFETY: `ID3D12Fence` is a free-threaded COM object in D3D12.
@@ -1089,6 +1093,9 @@ impl SyncGraph {
         *s
     }
 }
+
+/// Submissions of a cell's `Write64` kept for its gate lines (`SyncCell::history`).
+const HISTORY: usize = 8;
 
 static SYNC_GRAPH: Mutex<Option<SyncGraph>> = Mutex::new(None);
 static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
@@ -1579,12 +1586,31 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
         }
     }
     for (va, val) in max_by_va {
-        let skip = {
-            let g = SYNC_GRAPH.lock().unwrap();
-            g.as_ref()
-                .and_then(|gr| gr.cells.get(&va))
-                .is_some_and(|c| c.non_monotonic || c.submitted_max >= val)
+        let (skip, lower) = {
+            let mut g = SYNC_GRAPH.lock().unwrap();
+            match g.as_mut().and_then(|gr| gr.cells.get_mut(&va)) {
+                Some(c) => {
+                    if c.history.len() == HISTORY {
+                        c.history.pop_front();
+                    }
+                    c.history.push_back((sig_q, val, c.submitted_max));
+                    let lower = (!c.non_monotonic && val < c.submitted_max).then(|| (c.submitted_max, c.submitted_queue));
+                    (c.non_monotonic || c.submitted_max >= val, lower)
+                }
+                None => (false, None),
+            }
         };
+        if let Some((above, by)) = lower {
+            static LOWER: AtomicU64 = AtomicU64::new(0);
+            let n = LOWER.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 32 || n.is_power_of_two() {
+                let by = by.map_or_else(|| "the CPU".to_owned(), queue_label);
+                crate::xlog_warn!(
+                    "D3D12.X: Write64 {va:#x} = {val:#x} submitted on {} after {above:#x} (by {by}): recorded before it, it can land after it on the GPU and lower the cell below its fence ({n} so far)",
+                    queue_label(sig_q)
+                );
+            }
+        }
         if skip {
             continue;
         }
@@ -2029,17 +2055,36 @@ fn describe_gate(queue: usize, seq: u64, waits: &[PendingWait], reached: bool) -
     let label = |q: Option<usize>, none: &str| q.map_or_else(|| none.to_owned(), queue_label);
     let mut out = queue_label(queue);
     for w in waits.iter().filter(|w| unsafe { !w.progress_reached() }) {
-        let at = if real::uma_window_buffer(w.va as usize, 8).is_some() { "unified memory" } else { "title memory" };
-        let _ = write!(out, "; {:#x} >= {:#x}: {at} holds {:x?}, ", w.va, w.value, unsafe { w.read_value() });
+        let at = match crate::gpu::uma::get().and_then(|u| u.window_of(w.va as usize).map(|k| u.is_sparse_window(k))) {
+            Some(true) => "sparse window",
+            Some(false) => "coherent window",
+            None => "title memory",
+        };
+        let _ = write!(out, "; {:#x} >= {:#x}: {at} holds {:x?}", w.va, w.value, unsafe { w.read_value() });
+        // the GPU's own read beside the CPU's: whether the GPU wrote the value at all
+        if at == "coherent window" {
+            match unsafe { real::gpu_read_u64(w.va as usize) } {
+                Ok(v) => {
+                    let _ = write!(out, " (a GPU copy reads {v:#x})");
+                }
+                Err(e) => {
+                    let _ = write!(out, " (no GPU copy: {e})");
+                }
+            }
+        }
+        out.push_str(", ");
         let cell = SYNC_GRAPH.lock().unwrap().as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| {
             let done = c.fence.as_ref().map(|f| unsafe { f.GetCompletedValue() });
-            (c.recorded_max, c.recorded_last_queue, c.submitted_max, c.submitted_queue, done, c.cpu_signaled_max, c.non_monotonic)
+            (c.recorded_max, c.recorded_last_queue, c.submitted_max, c.submitted_queue, done, c.cpu_signaled_max, c.non_monotonic, c.history.clone())
         });
         match cell {
-            Some((rec, rec_q, sub, sub_q, done, cpu, non_mono)) if rec != 0 => {
+            Some((rec, rec_q, sub, sub_q, done, cpu, non_mono, history)) if rec != 0 => {
                 let by = if sub_q.is_none() && sub != 0 { "the CPU".to_owned() } else { label(sub_q, "nobody") };
                 let done = done.map_or_else(|| "no fence".to_owned(), |d| format!("{d:#x}"));
                 let _ = write!(out, "Write64 recorded up to {rec:#x} (list last on {}), signalled up to {sub:#x} by {by}, GPU at {done}", label(rec_q, "no queue"));
+                let subs: Vec<String> =
+                    history.iter().map(|&(q, v, before)| format!("{v:#x} on {}{}", queue_label(q), if v < before { " (lower, after a higher one)" } else { "" })).collect();
+                let _ = write!(out, ", last Write64 submissions [{}]", subs.join(", "));
                 if cpu != 0 {
                     let _ = write!(out, ", released on the CPU up to {cpu:#x}");
                 }
