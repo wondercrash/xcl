@@ -21,8 +21,9 @@
 //! the first mark not passed and the call or op the GPU is in (shaders by their
 //! `XCL_DUMP_SHADERS` dump names). A logged queue that moves on again is logged too (a long op,
 //! not a hang). `XCL_STALL_REMOVE_S=N`: once a queue has stood still N s (at least the 3 s of
-//! its report), the device is removed and the run ends, so that DRED (`XCL_DRED=1`) logs the
-//! operation each command list in flight got to, the commands no mark covers included.
+//! its report), every queue's lists in flight are logged with what each got to by its marks,
+//! then the device is removed and the run ends. (DRED, `XCL_DRED=1`, reports no command list
+//! after a removal by `RemoveDevice`, even one held behind a queue wait: `real::dred_tests`.)
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -80,6 +81,8 @@ struct Entry {
 struct Event {
     n: u64,
     what: String,
+    /// the PC lists it executed, in order (none for a wait or signal)
+    lists: Vec<usize>,
     /// ops of the lists this event executed, in recording order
     ops: Vec<u32>,
 }
@@ -184,6 +187,14 @@ impl Crumbs {
             (true, true, false, false) => "not reached",
         }
     }
+
+    /// Mark `id` as a report shows it.
+    fn view(&self, id: u32) -> OpView {
+        match self.entry(id) {
+            Some(e) => OpView { id, what: e.what.clone(), pso: e.pso, state: self.state(e), call: e.call, list: e.list },
+            None => OpView { id, what: "(overwritten)".to_owned(), pso: 0, state: "unknown", call: false, list: 0 },
+        }
+    }
 }
 
 /// After the PC call of an op of console code on `list` (`pso`: its pipeline as bound).
@@ -212,7 +223,7 @@ pub(super) unsafe fn reached(list: *mut c_void, slot: usize) {
 /// The PC method behind the title's console list slot `slot`, as XCL dispatches it.
 fn call_name(slot: usize) -> &'static str {
     match real::older_list_slot(slot) {
-        9 => "Close (XCL's commands at Close follow)",
+        9 => "Close",
         11 => "ClearState",
         12 => "DrawInstanced",
         13 => "DrawIndexedInstanced",
@@ -359,7 +370,7 @@ unsafe fn mark(queue: *mut c_void, what: impl FnOnce() -> String, lists: &[*mut 
         if line.events.len() >= EVENTS {
             line.events.pop_front();
         }
-        line.events.push_back(Event { n: line.next, what, ops });
+        line.events.push_back(Event { n: line.next, what, lists: lists.iter().map(|&l| l as usize).collect(), ops });
     });
 }
 
@@ -440,16 +451,47 @@ fn finished(state: &str) -> bool {
 /// Where the GPU is in `ops` (an event's marks in recording order): in the commands recorded
 /// between the last mark whose work is behind it and the first one whose work is not. A call
 /// mark sits before every title call that records GPU work, so after a passed call mark these
-/// are that call's commands (with what XCL recorded for it). None: every mark passed.
+/// are that call's commands (with what XCL recorded for it). When the two marks are on
+/// different lists, the GPU is between those lists: past the last mark of the one, before the
+/// first of the other. None: every mark passed.
 fn culprit(ops: &[OpView]) -> Option<String> {
     let i = ops.iter().position(|o| !finished(o.state))?;
     let first = &ops[i];
     // (a skipped op recorded nothing)
     Some(match ops[..i].iter().rev().find(|o| o.state != "skipped") {
+        Some(p) if p.list != first.list => format!(
+            "the GPU is between lists: past the last mark of list {:#x}, {}, and before the first mark of list {:#x}, {} (between them: what list {:#x} records after its last mark, any list without marks, and the start of list {:#x})",
+            p.list,
+            p.text(),
+            first.list,
+            first.text(),
+            p.list,
+            first.list
+        ),
         Some(p) if p.call => format!("the GPU is in the call {} on list {:#x}: its commands; the next mark is {}", p.text(), p.list, first.text()),
         Some(p) => format!("the GPU is in the commands list {:#x} recorded after {} and before {} on list {:#x}", p.list, p.text(), first.text(), first.list),
         None => format!("the GPU is in the commands before the first mark of its lists, {} on list {:#x}", first.text(), first.list),
     })
+}
+
+/// What each of `lists` (an event's, in order) got to by its marks in `ops`: `list 0x…: P/M
+/// passed[, at #N …]` (at: its first mark not passed), or `no marks`.
+fn list_progress(lists: &[usize], ops: &[OpView]) -> String {
+    lists
+        .iter()
+        .map(|&l| {
+            let marks: Vec<&OpView> = ops.iter().filter(|o| o.list == l).collect();
+            if marks.is_empty() {
+                return format!("list {l:#x}: no marks");
+            }
+            let passed = marks.iter().filter(|o| finished(o.state)).count();
+            match marks.iter().find(|o| !finished(o.state)) {
+                Some(o) => format!("list {l:#x}: {passed}/{} passed, at {}", marks.len(), o.text()),
+                None => format!("list {l:#x}: {passed}/{} passed", marks.len()),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// What a report says about one queue, taken under the lock and formatted after it.
@@ -472,8 +514,9 @@ fn remove_after() -> Option<u32> {
     *S
 }
 
-/// Remove the device (`queue` has stood still `secs` s), so that DRED logs the operation each
-/// command list in flight got to (`real::log_device_removed`), and end the run.
+/// Remove the device (`queue` has stood still `secs` s) and end the run. First, what each list
+/// in flight on every queue got to by its marks (`in_flight`): DRED reports no command list
+/// after `RemoveDevice` (`real::dred_lines` then says so).
 fn remove_device(queue: usize, secs: u32) {
     let label = super::list_x::queue_label(queue);
     unsafe {
@@ -482,10 +525,33 @@ fn remove_device(queue: usize, secs: u32) {
             crate::xlog_warn!("D3D12.X: breadcrumbs: XCL_STALL_REMOVE_S: no ID3D12Device5, the device stays");
             return;
         };
-        crate::xlog_warn!("D3D12.X: breadcrumbs: {label} has stood still for {secs} s: the device is removed (XCL_STALL_REMOVE_S) so that DRED logs what each list in flight got to (with XCL_DRED=1)");
+        crate::xlog_warn!("D3D12.X: breadcrumbs: {label} has stood still for {secs} s: the device is removed (XCL_STALL_REMOVE_S); what each list in flight got to:");
+        for (q, event, lists, ops) in in_flight() {
+            // (a wait or signal event runs no list: the queue stands at it)
+            let at = if lists.is_empty() { "no list".to_owned() } else { list_progress(&lists, &ops) };
+            crate::xlog_warn!("D3D12.X: breadcrumbs at the removal: {} is in {event}: {at}", super::list_x::queue_label(q));
+        }
         dev5.RemoveDevice();
     }
     real::stop_if_device_removed();
+}
+
+/// Each queue's event that has not passed (the one it is in), with the lists it executed and
+/// their marks: (queue, event, lists, marks).
+fn in_flight() -> Vec<(usize, String, Vec<usize>, Vec<OpView>)> {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return Vec::new() };
+    let mut out = Vec::new();
+    for (&q, line) in &s.queues {
+        let done = unsafe { line.fence.GetCompletedValue() };
+        if done >= line.next {
+            continue;
+        }
+        let Some(cur) = line.events.iter().find(|e| e.n == done + 1) else { continue };
+        let ops = cur.ops.iter().map(|&id| s.view(id)).collect();
+        out.push((q, format!("#{} {}", cur.n, cur.what), cur.lists.clone(), ops));
+    }
+    out
 }
 
 /// Log each queue whose fence has stood still for 2 s with events still queued, and each
@@ -533,10 +599,7 @@ fn report() {
             let passed = line.events.iter().find(|e| e.n == done).map(|e| format!("#{} {}", e.n, e.what));
             let Some(cur) = line.events.iter().find(|e| e.n == done + 1) else { continue };
             let later: Vec<&Event> = line.events.iter().filter(|e| e.n > done + 1).collect();
-            let ops: Vec<OpView> = cur.ops.iter().map(|&id| match s.entry(id) {
-                Some(e) => OpView { id, what: e.what.clone(), pso: e.pso, state: s.state(e), call: e.call, list: e.list },
-                None => OpView { id, what: "(overwritten)".to_owned(), pso: 0, state: "unknown", call: false, list: 0 },
-            }).collect();
+            let ops: Vec<OpView> = cur.ops.iter().map(|&id| s.view(id)).collect();
             // ops console code skipped on any list just before the stuck one: a stand-in that
             // never wrote what the stuck op reads would be among them
             let anchor = ops.iter().find(|o| !finished(o.state)).map_or(s.next, |o| o.id);
@@ -712,5 +775,34 @@ mod tests {
         let ops = [mark(1, "not reached", true)];
         assert!(culprit(&ops).unwrap().starts_with("the GPU is in the commands before the first mark"));
         assert!(culprit(&[mark(1, "passed", true), mark(2, "done", false)]).is_none());
+    }
+
+    fn on(list: usize, mut m: OpView) -> OpView {
+        m.list = list;
+        m
+    }
+
+    /// The last passed mark ends one list and the first one not passed starts the next: the GPU
+    /// is put between the two lists, not in the call of the first one's last mark (run 7: q2
+    /// "in the call Close" of a list whose work was done, with the next list not started).
+    #[test]
+    fn a_queue_past_one_lists_last_mark_and_before_the_next_lists_first_is_between_them() {
+        let ops = [on(0x10, mark(1, "done", false)), on(0x10, mark(2, "passed", true)), on(0x20, mark(3, "not reached", true))];
+        let at = culprit(&ops).unwrap();
+        assert!(at.starts_with("the GPU is between lists: past the last mark of list 0x10, #2 "), "{at}");
+        assert!(at.contains("before the first mark of list 0x20, #3 "), "{at}");
+        // a skipped op at the end of the first list recorded nothing: still between the lists
+        let ops = [on(0x10, mark(1, "passed", true)), on(0x10, mark(2, "skipped", false)), on(0x20, mark(3, "not started", false))];
+        assert!(culprit(&ops).unwrap().starts_with("the GPU is between lists: past the last mark of list 0x10, #1 "));
+    }
+
+    /// At a removal each list of the event is named with what it got to.
+    #[test]
+    fn each_list_of_an_event_is_named_with_the_marks_it_passed() {
+        let ops = [on(0x10, mark(1, "done", false)), on(0x10, mark(2, "passed", true)), on(0x20, mark(3, "not reached", true))];
+        assert_eq!(
+            list_progress(&[0x10, 0x20, 0x30], &ops),
+            "list 0x10: 2/2 passed; list 0x20: 0/1 passed, at #3 CopyBufferRegion (console #15) (not reached); list 0x30: no marks"
+        );
     }
 }
