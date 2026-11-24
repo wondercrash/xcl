@@ -89,7 +89,8 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) -> usize {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
     p.set_stage(Stage::Building(Instant::now(), Who::me()));
     BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
-    if preload {
+    let low = preload && preload_runs_low();
+    if low {
         let mut d = p.demand.lock().unwrap();
         d.preload_thread = unsafe { GetCurrentThreadId() };
         if d.wanted {
@@ -98,7 +99,7 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) -> usize {
     }
     let real = job();
     complete(p, real);
-    if preload {
+    if low {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
         d.preload_thread = 0;
@@ -108,6 +109,15 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) -> usize {
     }
     BUILDING.with(|b| *b.borrow_mut() = None);
     real
+}
+
+/// The preload workers run at the lowest priority, raised to normal while they build a pipeline a
+/// bind waits for (`build`, `Pending::want`). Not under Wine: it applies a thread priority as a
+/// Linux nice value, and raising one again needs `RLIMIT_NICE` / `CAP_SYS_NICE`, which a desktop
+/// user does not have – a worker lowered once would build the pipelines binds wait for at the
+/// lowest priority for the rest of the run.
+fn preload_runs_low() -> bool {
+    !crate::util::under_wine()
 }
 
 impl Pending {
@@ -378,9 +388,9 @@ fn preload() -> Option<&'static Preload> {
         let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
-                unsafe {
+                if preload_runs_low() {
                     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
-                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
                 }
                 static DONE: AtomicUsize = AtomicUsize::new(0);
                 loop {
