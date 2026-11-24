@@ -202,6 +202,27 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
+    // what a run that ended without its summary (a crash in the driver or DXC) was making: left
+    // to the title, so the same pipeline does not end every run
+    let trying_path = journal.with_extension("trying");
+    let crashed: Vec<u64> = {
+        let t = std::fs::read(&trying_path).unwrap_or_default();
+        let mut g = q.0.lock().unwrap();
+        t.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).filter(|h| g.taken.insert(*h)).collect()
+    };
+    for h in &crashed {
+        let _ = done_file.write_all(&h.to_le_bytes());
+    }
+    if !crashed.is_empty() {
+        eprintln!("xcl pipelines: the last run ended while making {} pipelines: left to the title", crashed.len());
+    }
+    let trying = match std::fs::File::create(&trying_path) {
+        Ok(f) => Mutex::new(f),
+        Err(e) => {
+            eprintln!("xcl pipelines: {}: {e}", trying_path.display());
+            return 2;
+        }
+    };
     let (already, first) = {
         let mut g = q.0.lock().unwrap();
         let first = g.ingest(&mut file);
@@ -245,7 +266,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             });
         }
         for k in 0..threads {
-            let (q, dev, made, failed, skipped, reasons, done_tx, gpu, started) = (&q, &dev, &made, &failed, &skipped, &reasons, &done_tx, &gpu, &started);
+            let (q, dev, made, failed, skipped, reasons, done_tx, gpu, started, trying) = (&q, &dev, &made, &failed, &skipped, &reasons, &done_tx, &gpu, &started, &trying);
             let _ = std::thread::Builder::new().name(format!("xcl-warm-{k}")).stack_size(64 << 20).spawn_scoped(s, move || loop {
                 let item = {
                     let mut g = q.0.lock().unwrap();
@@ -266,6 +287,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
                     }
                 };
                 let (hash, replay) = item;
+                let _ = trying.lock().unwrap().write_all(&hash.to_le_bytes());
                 let r = match &replay {
                     None => Err("not readable from the journal".to_string()),
                     // the driver's compiles, few at once (the biggest take ~1.5 GB each)
@@ -300,6 +322,9 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             });
         }
     });
+    // ended by itself: nothing was cut short
+    drop(trying);
+    let _ = std::fs::remove_file(&trying_path);
     let g = q.0.lock().unwrap();
     println!(
         "made {}, failed {}, left to the title (GS / HS / DS) {}, time {:.1} s",
