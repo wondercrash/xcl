@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::core::GUID;
@@ -61,28 +62,62 @@ struct Vtable(usize);
 /// every other slot a thunk to the currently active PC list's entry (`F_BACKING`).
 fn vtable() -> usize {
     static V: OnceLock<Vtable> = OnceLock::new();
-    V.get_or_init(|| {
-        let mut v = vec![0usize; LIST_SLOTS];
-        let trace = std::env::var_os("XCL_LIST_TRACE").is_some();
-        let crumbs = super::breadcrumbs::on();
-        for (slot, e) in v.iter_mut().enumerate() {
-            // the waits and KickoffX record no GPU work, but they split or submit the list
-            let mark = crumbs && (records_work(slot) || matches!(slot, 71..=74 | 93 | 95));
-            *e = match (trace, mark) {
-                (false, false) => forward(slot),
-                (true, false) => forward_calling(slot, record),
-                (false, true) => forward_calling(slot, mark_call),
-                (true, true) => forward_calling(slot, record_and_mark),
-            };
+    V.get_or_init(|| Vtable(Box::leak(slots(&super::real::QUEUE_SHIFTED).into_boxed_slice()).as_ptr() as usize)).0
+}
+
+/// The vtable's entries (`newer_layout`: the title's runtime has the newer layouts).
+fn slots(newer_layout: &'static AtomicBool) -> Vec<usize> {
+    let mut v = vec![0usize; LIST_SLOTS];
+    let trace = std::env::var_os("XCL_LIST_TRACE").is_some();
+    let crumbs = super::breadcrumbs::on();
+    for (slot, e) in v.iter_mut().enumerate() {
+        // the waits and KickoffX record no GPU work, but they split or submit the list
+        let mark = crumbs && (records_work(slot) || matches!(slot, 71..=74 | 93 | 95));
+        *e = match (trace, mark) {
+            (false, false) => forward(slot),
+            (true, false) => forward_calling(slot, record),
+            (false, true) => forward_calling(slot, mark_call),
+            (true, true) => forward_calling(slot, record_and_mark),
+        };
+    }
+    v[0] = qi as usize;
+    v[1] = add_ref as usize;
+    v[2] = release as usize;
+    v[9] = close as usize;
+    v[10] = reset as usize;
+    // The newer layout's Reset (#139: allocator, pipeline, one argument more) is this object's
+    // Reset as well. Forwarded like any other slot it reset the active PC list only: after a
+    // split at a recorded memory wait that is the last segment, so the recording went on
+    // there, the object kept its segments, and every later ExecuteCommandLists ran the
+    // primary list again with the first part of the recording it was split in – that part's
+    // draws and dispatches on memory used for other things since, and its Write64 values
+    // after newer ones (a retail title resets the lists of its pool this way).
+    for (newer, older) in super::real::NEWER_LIST_SLOTS {
+        if older == 10 {
+            v[newer] = by_layout(newer_layout, reset as usize, v[newer]);
         }
-        v[0] = qi as usize;
-        v[1] = add_ref as usize;
-        v[2] = release as usize;
-        v[9] = close as usize;
-        v[10] = reset as usize;
-        Vtable(Box::leak(v.into_boxed_slice()).as_ptr() as usize)
-    })
-    .0
+    }
+    v
+}
+
+/// An entry that goes to `newer` when the title's runtime has the newer layouts (found out
+/// while the title runs, so looked at in each call) and to `older` otherwise, with the
+/// registers as they are.
+fn by_layout(newer_layout: &'static AtomicBool, newer: usize, older: usize) -> usize {
+    let mut c: Vec<u8> = vec![0x48, 0xB8]; // mov rax, newer_layout
+    c.extend_from_slice(&(newer_layout as *const AtomicBool as u64).to_le_bytes());
+    c.extend_from_slice(&[0x80, 0x38, 0x00]); // cmp byte ptr [rax], 0
+    c.extend_from_slice(&[0x74, 0x0C]); // je older
+    for target in [newer, older] {
+        c.extend_from_slice(&[0x48, 0xB8]); // mov rax, target
+        c.extend_from_slice(&(target as u64).to_le_bytes());
+        c.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+    }
+    let p = crate::stubs::alloc_code(c.len());
+    unsafe {
+        std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
+    }
+    p as usize
 }
 
 /// Draws, copies, barriers, queries, clears and known GPU console extensions. Slots 71–74 are
@@ -173,10 +208,10 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     hr
 }
 
-/// #10 Reset(allocator, initial_pso): resets the primary PC list (`F_PRIMARY`) via `list_x::reset_x`
-/// (calling directly rather than through the dual-dispatch vtable thunk so console state always
-/// resets even though this wrapper sits in `xcl.exe`), restores `F_BACKING = F_PRIMARY`, and moves
-/// any extra split segments into the per-list spare pool.
+/// #10 Reset(allocator, initial_pso), and the newer layout's #139 (`slots`): resets the primary PC
+/// list (`F_PRIMARY`) via `list_x::reset_x` (calling directly rather than through the dual-dispatch
+/// vtable thunk so console state always resets even though this wrapper sits in `xcl.exe`),
+/// restores `F_BACKING = F_PRIMARY`, and moves any extra split segments into the per-list spare pool.
 unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> HRESULT {
     let primary = *((this as usize + F_PRIMARY) as *const *mut c_void);
     let hr = if super::real::is_adopted(primary) {
@@ -500,6 +535,67 @@ mod tests {
             assert_eq!(r(o), 1);
             assert_eq!(r(o), 0); // the object is freed with it
             drop(Box::from_raw(fake));
+        }
+    }
+
+    /// The newer layout's Reset (#139) on a list split at a recorded wait resets the primary
+    /// list and ends the split, as #10 does. Forwarded to the active segment (as on the older
+    /// layout, where #139 is another method) the primary list kept the first part of the old
+    /// recording and went to the queue with every later submission of the list.
+    #[test]
+    fn the_newer_layouts_reset_resets_the_primary_list_and_ends_the_split() {
+        static NEWER: AtomicBool = AtomicBool::new(true);
+        static OLDER: AtomicBool = AtomicBool::new(false);
+        // (slot, the PC list it was called on, first argument)
+        static CALLS: std::sync::Mutex<Vec<(usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+        unsafe extern "system" fn fake_reset(this: *mut c_void, alloc: usize, _pso: usize) -> HRESULT {
+            CALLS.lock().unwrap().push((10, this as usize, alloc));
+            0
+        }
+        unsafe extern "system" fn fake_139(this: *mut c_void, a: usize, _b: usize, _c: usize) -> usize {
+            CALLS.lock().unwrap().push((139, this as usize, a));
+            0
+        }
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[10] = fake_reset as usize;
+        vt[139] = fake_139 as usize;
+        let primary = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 })) as *mut c_void;
+        let segment = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 })) as *mut c_void;
+        let layout = std::alloc::Layout::from_size_align(OBJECT_BYTES, 64).unwrap();
+        for flag in [&NEWER, &OLDER] {
+            let newer = flag.load(std::sync::atomic::Ordering::Relaxed);
+            let table = slots(flag);
+            unsafe {
+                let o = std::alloc::alloc_zeroed(layout) as *mut c_void;
+                *(o as *mut usize) = table.as_ptr() as usize;
+                *((o as usize + F_PRIMARY) as *mut usize) = primary as usize;
+                *((o as usize + F_BACKING) as *mut usize) = primary as usize;
+                // the recording was split: it goes on in `segment`
+                activate_segment(o, primary, segment);
+                CALLS.lock().unwrap().clear();
+                let reset_139: unsafe extern "system" fn(*mut c_void, usize, usize, usize) -> usize = std::mem::transmute(table[139]);
+                reset_139(o, 0x1111, 0, 0);
+                let calls = std::mem::take(&mut *CALLS.lock().unwrap());
+                let active = *((o as usize + F_BACKING) as *const usize);
+                let book = SEGMENTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(o as usize))).unwrap();
+                if let Some(m) = WRAPPER_OF.lock().unwrap().as_mut() {
+                    m.remove(&(primary as usize));
+                    m.remove(&(segment as usize));
+                }
+                std::alloc::dealloc(o as *mut u8, layout);
+                if newer {
+                    assert_eq!(calls, vec![(10, primary as usize, 0x1111)], "Reset of the primary list");
+                    assert_eq!(active, primary as usize, "the new recording starts on the primary list");
+                    assert_eq!((book.extra_active, book.spares), (Vec::new(), vec![segment as usize]), "the segment is a spare: it does not go to the queue again");
+                } else {
+                    assert_eq!(calls, vec![(139, segment as usize, 0x1111)], "the older layout's #139 is not Reset: forwarded");
+                    assert_eq!((active, book.extra_active, book.spares), (segment as usize, vec![segment as usize], Vec::new()));
+                }
+            }
+        }
+        unsafe {
+            drop(Box::from_raw(primary as *mut Fake));
+            drop(Box::from_raw(segment as *mut Fake));
         }
     }
 }
