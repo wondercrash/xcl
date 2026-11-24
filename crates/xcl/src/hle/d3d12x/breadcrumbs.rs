@@ -59,10 +59,10 @@ const STUCK_REPORTS: u32 = 3;
 /// ops before the stuck one searched for skipped ones, on any list
 const SKIP_WINDOW: u32 = 4096;
 
-/// Breadcrumbs on for the current thread's calls only, so a test that turns them on (and one
-/// that fails with them on) does not turn them on for other tests' fake lists.
 #[cfg(test)]
 thread_local! {
+    /// Breadcrumbs on for the current thread's calls only, so a test that turns them on (and
+    /// one that fails with them on) does not turn them on for other tests' fake lists.
     static FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
