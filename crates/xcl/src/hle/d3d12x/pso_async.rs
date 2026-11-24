@@ -83,9 +83,9 @@ pub(super) fn build_want() -> Want {
     BUILDING.with(|b| b.borrow().as_ref().map_or(Want::No, |p| p.want_now(skip_huge())))
 }
 
-/// This thread is a worker and one of the title's threads waits, or waited, for what it builds.
-#[cfg(test)]
-fn build_is_wanted() -> bool {
+/// This thread is a worker and one of the title's threads waits, or waited, for what it builds
+/// (the huge-pipeline gate of `real::driver_compile` and of two-pass pipelines).
+pub(super) fn build_is_wanted() -> bool {
     build_want() != Want::No
 }
 

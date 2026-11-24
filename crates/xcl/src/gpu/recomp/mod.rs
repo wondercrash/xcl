@@ -552,6 +552,9 @@ struct Ctx<'a> {
     loops: &'a [(u64, u64)],
     /// every branch in instruction order: (address of the branch, target)
     edges: &'a [(u64, u64)],
+    /// split wave64 geometry mode: the ES's s_setpc ends the ES phase and `gs_start` is the GS
+    /// phase's entry, so no structured stretch may run across it
+    phase_split: bool,
     /// `structurable_to` results: (lo, hi, exit) → targets leaving the range
     memo: std::cell::RefCell<std::collections::HashMap<MemoKey, Option<BTreeSet<u64>>>>,
 }
@@ -1133,6 +1136,9 @@ fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
     let mut j = i;
     while j < c.leaders.len() && c.leaders[j] < hi {
         let (s, e) = (c.leaders[j], block_end(c, j));
+        if c.phase_split && insts_in(c, s, e).last().is_some_and(|d| d.inst.name == "S_SETPC_B64" && d.far_target.is_none()) {
+            break;
+        }
         match term(c, s, e) {
             Term::End | Term::Other => break,
             Term::Cond(t) | Term::Jump(t) if t > s => reach = reach.max(t),
@@ -1617,11 +1623,12 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(&insts);
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
-        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
+        let phase_split = gs_jump.is_some_and(|t| t.is_some()) && opt.split_wave64 && opt.wave64;
+        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, phase_split, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
         let nested = nested_loop_ranges(&insts);
-        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, memo: Default::default() };
+        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, phase_split, memo: Default::default() };
         if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&sctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
