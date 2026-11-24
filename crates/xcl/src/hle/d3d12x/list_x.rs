@@ -691,6 +691,7 @@ pub(super) fn on_queue_release(queue: usize) {
             }
         }
     }
+    super::cpu_writes::forget_queue(queue);
 }
 
 #[cfg(test)]
@@ -1902,6 +1903,17 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
     super::cpu_writes::after(queue, writes);
 }
 
+#[cfg(test)]
+pub(super) fn take_cpu_writes_for_test(list: *mut c_void, progress_va: u64) -> Vec<super::cpu_writes::Write> {
+    let list = list as usize;
+    let writes = std::mem::take(&mut LISTS.lock().unwrap().as_mut().unwrap().get_mut(&list).unwrap().cpu_writes);
+    on_release(list);
+    if let Some(graph) = SYNC_GRAPH.lock().unwrap().as_mut() {
+        graph.cells.remove(&progress_va);
+    }
+    writes
+}
+
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
 /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
 /// When `queue` is non-null, monotonic 64-bit waits backed by a recorded `Write64BitValue*` are
@@ -2079,7 +2091,12 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         // the title's own memory: written by the CPU once the GPU is there
         if super::cpu_writes::writable(va as usize, n as usize) {
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-                s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
+                s.cpu_writes.push(match words {
+                    [lo, hi] if mode == D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT => {
+                        super::cpu_writes::Write::ImmediateU64(va as usize, (*hi as u64) << 32 | *lo as u64)
+                    }
+                    _ => super::cpu_writes::Write::Immediate(va as usize, words.to_vec()),
+                });
                 return;
             }
         }
@@ -4976,6 +4993,7 @@ mod tests {
             assert_ne!(*bottom_ts, 0);
 
             on_release(list_ptr as usize);
+            on_queue_release(q.as_raw() as usize);
         }
     }
 
