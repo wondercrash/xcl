@@ -37,6 +37,8 @@ pub(super) struct Em {
     uses_lds: bool,
     /// scratch_* used: declare the per-lane private memory
     uses_scratch: bool,
+    /// buffer / tbuffer format loads: define `fmt_sel` (`PRELUDE_FMT_SEL`)
+    uses_fmt_sel: bool,
     /// split wave64 (`x64`): words one exchange carries (1: masks and lane reads, up to 16:
     /// coherent scalar loads, 32: `ds_bpermute`)
     x64_words: usize,
@@ -479,6 +481,7 @@ impl Em {
             ps_done: false,
             uses_lds: false,
             uses_scratch: false,
+            uses_fmt_sel: false,
             x64_words: 1,
             x64_whole_live: BTreeMap::new(),
             upper: None,
@@ -1555,15 +1558,19 @@ impl Em {
             }
         }
         // split wave64, a coherent load (GLC / DLC: memory other waves may be writing): both
-        // halves take the lower half's values, so they cannot see two different ones
+        // halves take the lower half's values, so they cannot see two different ones. In a
+        // group of one console wave every scalar load does: memory written during the dispatch
+        // is the only thing that could make the halves' scalar values (and so their branches
+        // and, in the group-barrier form, their barriers) differ. Every thread takes the word
+        // from half 0's slot, so half 0's own lanes agree as well (each did its own load)
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
-        if self.x64() && coherent {
+        if self.x64() && (coherent || self.x64_threads() <= 64) {
             self.x64_words = self.x64_words.max(vals.len());
             for (i, v) in vals.iter().enumerate() {
                 self.line(&format!("xcl_x_put({i}u, {v});"));
             }
-            let get: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!("{v} = xcl_x_get({i}u);")).collect();
-            self.line(&format!("if (xcl_x_meet() && xcl_half != 0u) {{ {} }}", get.join(" ")));
+            let get: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!("{v} = xcl_x_get0({i}u);")).collect();
+            self.line(&format!("if (xcl_x_meet()) {{ {} }}", get.join(" ")));
         }
         for (i, v) in vals.iter().enumerate() {
             let s = self.sreg(sdata + i as u64);
@@ -1780,15 +1787,33 @@ impl Em {
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
-                self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
-                self.line(&format!(
-                    "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
-                ));
+                self.uses_fmt_sel = true;
+                // only the components the destinations select are decoded: the decoder is
+                // inlined at every load, and a retail program of 3 281 format_x loads made
+                // 13 125 copies of it when all four were decoded each time. One component
+                // (format_x, d16_x, d16_hi_x) reads just its own dwords (`fmt_x`), several
+                // share one `ld_raw`
+                let used: Vec<u64> = match d16_format {
+                    Some((_, _, true)) => vec![0],
+                    Some((_, components, false)) => (0..2 * count).filter(|&c| c % 2 == 0 || c < components).collect(),
+                    None => (0..count).collect(),
+                };
+                let single = used.len() == 1;
+                if !single {
+                    self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
+                }
+                let sel = |component: u64| {
+                    if single {
+                        format!("fmt_x({t}_a, {t}_info, ({d3} >> {}u) & 7u, {t}_int)", 3 * component)
+                    } else {
+                        format!("fmt_sel({t}_r, {t}_info, ({d3} >> {}u) & 7u, {t}_int)", 3 * component)
+                    }
+                };
                 if let Some((_, components, high)) = d16_format {
-                    let half = |component: u64| {
-                        let selected = format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
-                        format!("select({t}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
-                    };
+                    for &c in &used {
+                        self.line(&format!("uint {t}_s{c} = {};", sel(c)));
+                    }
+                    let half = |component: u64| format!("select({t}_int, {t}_s{component} & 0xFFFFu, f32tof16(asfloat({t}_s{component})))");
                     let mut assigns = Vec::new();
                     if high {
                         let v = self.vreg(vdata);
@@ -1804,10 +1829,17 @@ impl Em {
                     self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
                     return Ok(());
                 }
+                if single {
+                    // decoded before the `if`, which then holds a select (no branch)
+                    let v = self.vreg(vdata);
+                    self.line(&format!("uint {t}_x = {};", sel(0)));
+                    self.line(&format!("if ({act}) {{ {v} = select({t}_ok, {t}_x, 0u); }}"));
+                    return Ok(());
+                }
                 let mut assigns = Vec::new();
                 for i in 0..count {
                     let v = self.vreg(vdata + i);
-                    assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
+                    assigns.push(format!("{v} = select({t}_ok, {}, 0u);", sel(i)));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
             }
@@ -4169,12 +4201,19 @@ impl Em {
         }
     }
 
-    /// Split wave64: meet through bounded arrival counters (`XCL_X_SPIN 1`) by default so
-    /// divergent wave32 halves can never permanently deadlock a GPU SM at an unbounded
-    /// `GroupMemoryBarrierWithGroupSync()`. Set `XCL_WAVE64_SPIN=0` to force group barriers
-    /// for 1-wave64 groups.
+    /// Split wave64: whether the pairs meet through bounded arrival counters (`XCL_X_SPIN 1`)
+    /// whatever the program's size: several console waves per group, or `XCL_WAVE64_SPIN=1`.
+    /// A group of one console wave is its two halves, which take the same branches as long as
+    /// their scalar values agree: masks and lane reads are exchanged, and in such a group
+    /// every scalar load is too (`smem`), so memory written during the dispatch cannot give
+    /// the halves different values, and both reach every barrier. The counters' wait loop at
+    /// each of a program's exchanges is what costs: the NVIDIA driver took twice as long on
+    /// them (a 1/8 part of a retail CS with 845 exchanges: 32 s against 16 s). So one-wave
+    /// programs of `FLAT_WINDOW_LOADS_FROM` bytes of HLSL or more meet at group barriers
+    /// (`finish`); smaller ones keep the counters, whose failure (a desynchronised pair) is
+    /// bounded garbage rather than a dispatch that never ends.
     fn x64_spin(&self) -> bool {
-        self.x64_threads() > 64 || std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0")
+        self.x64_threads() > 64 || std::env::var("XCL_WAVE64_SPIN").is_ok_and(|v| v.trim() == "1")
     }
 
     /// The console LDS block (`xcl_lds`) is declared before the split-wave64 prelude, which
@@ -4184,21 +4223,28 @@ impl Em {
         self.x64() && (self.uses_lds || matches!(self.opt.mode, Mode::Geometry(_)))
     }
 
+    /// Split wave64 with console LDS: the first word of the exchange in `xcl_lds`. The D3D12
+    /// limit (32 KB) is the whole block already: the slots (console wave, half, parity), the
+    /// arrival counters (console wave, half), the wave counter of `xcl_x_thread` and the
+    /// optional safe-barrier words at 8189..8190 take its top, and the program's LDS accesses
+    /// stop below it (`XCL_X_LDS_TOP`, the word every access above is clamped onto).
+    pub(super) fn x64_lds_base(&self) -> Option<usize> {
+        if !self.x64_lds() {
+            return None;
+        }
+        let waves = self.x64_threads().div_ceil(64).max(1) as usize;
+        let bar_words = if self.safe_barrier { 2 } else { 0 };
+        Some(8192 - waves * 4 * self.x64_words - waves * 2 - 1 - bar_words)
+    }
+
     /// Storage and functions of the split wave64 form (`PRELUDE_X64`).
     fn x64_prelude(&self, h: &mut String) {
         let threads = self.x64_threads();
         let waves = threads.div_ceil(64).max(1) as usize;
         let slot = self.x64_words;
-        // slots (console wave, half, parity), the arrival counters (console wave, half), the
-        // wave counter of `xcl_x_thread`
         let (slots, counters) = (waves * 4 * slot, waves * 2);
         let _ = writeln!(h, "#define XCL_X_THREADS {threads}u\n#define XCL_X_WAVES {waves}u\n#define XCL_X_SLOT {slot}u\n#define XCL_X_SPIN {}", self.x64_spin() as u32);
-        if self.x64_lds() {
-            // the D3D12 limit (32 KB) is the whole block already: the exchange (and optional
-            // safe-barrier words at 8189..8190) takes its top, the program's LDS accesses stop
-            // below it (`XCL_X_LDS_TOP`)
-            let bar_words = if self.safe_barrier { 2 } else { 0 };
-            let base = 8192 - slots - counters - 1 - bar_words;
+        if let Some(base) = self.x64_lds_base() {
             h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB); the top holds the wave64 exchange\n");
             let _ = writeln!(h, "#define XCL_X_LDS_TOP {}u", base - 1);
             let _ = writeln!(h, "#define XCL_XS(i) xcl_lds[{base}u + (i)]\n#define XCL_XC(i) xcl_lds[{}u + (i)]\n#define XCL_XW xcl_lds[8191u]", base + slots);
@@ -4273,6 +4319,9 @@ impl Em {
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
         h.push_str(PRELUDE_MEM);
+        if self.uses_fmt_sel {
+            h.push_str(PRELUDE_FMT_SEL);
+        }
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }
@@ -4701,6 +4750,11 @@ impl Em {
                 }
                 h.push_str("    return xo;\n}\n");
             }
+        }
+        if self.x64() && !self.x64_spin() && h.len() < FLAT_WINDOW_LOADS_FROM {
+            // a small one-wave program keeps the bounded counters (`x64_spin`); the define is
+            // one line of the prelude, so its size (and the size gate) is the same either way
+            h = h.replacen("\n#define XCL_X_SPIN 0\n", "\n#define XCL_X_SPIN 1\n", 1);
         }
         if windows > 1 {
             // compute passes (CS, and the MS / GS compute passes) only: the driver times were
@@ -5280,7 +5334,7 @@ void scr_st(uint a, uint v, uint n) {
 }
 "#;
 
-const PRELUDE_MEM: &str = r#"
+pub(super) const PRELUDE_MEM: &str = r#"
 uint4 ld_raw(uint a) {
     // one Load4 + one Load (with several memory windows each is a switch) and no branch
     uint b = a & ~3u; uint s = (a & 3u) * 8u;
@@ -5409,6 +5463,42 @@ void st_bytes(uint a, uint4 r, uint n) {
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), c[(sel - 4u) & 3u])); }
 "#;
 
+/// DST_SEL of a V# (0: 0, 1: 1, 4 – 7: component 0 – 3) on format data: only the component
+/// it picks is decoded, and once – the decoder is inlined at every load, so a retail program
+/// with 3 281 format_x loads carried that many copies. Its own block, after `PRELUDE_MEM`, in
+/// programs with format loads only: the HLSL of the others, and so their DXIL and driver
+/// cache keys, stay as they were (`dst_sel` and `fmt_comp` above are no longer called).
+/// `fmt_cvt` gives `fmt_comp`'s values: unorm and snorm share one division (of the same
+/// operands; `max(x, -1)` keeps an unorm quotient, which is never negative).
+const PRELUDE_FMT_SEL: &str = r#"uint fmt_off(uint info, uint c) { return select(c > 0u, (info >> 8) & 63u, 0u) + select(c > 1u, (info >> 14) & 63u, 0u) + select(c > 2u, (info >> 20) & 63u, 0u); }
+uint fmt_width(uint info, uint c) { return (info >> ((8u + 6u * c) & 31u)) & 63u; }
+// the selected value from the bits `v` (cut to their width) of component (sel - 4) & 3
+uint fmt_cvt(uint v, uint info, uint sel, bool isint) {
+    uint c = (sel - 4u) & 3u; uint n = info & 7u; uint ty = (info >> 3) & 7u; uint w = fmt_width(info, c);
+    uint sh = (32u - w) & 31u;
+    int sv = select(w >= 32u, (int)v, ((int)(v << sh)) >> sh);
+    bool sg = or(or(ty == 1u, ty == 3u), ty == 5u);
+    float fx = select(sg, (float)sv, (float)v);
+    float mx = select(sg, select(w >= 32u, 2147483647.0f, (float)((1u << ((w - 1u) & 31u)) - 1u)), select(w >= 32u, 4294967295.0f, (float)((1u << (w & 31u)) - 1u)));
+    // exact endpoints (the hardware conversion is exact; DXC divides approximately)
+    uint nrm = asuint(select(select(sg, sv == 0, v == 0u), 0.0f, select(fx >= mx, 1.0f, max(fx / mx, -1.0f))));
+    uint flt = select(w == 32u, v, select(w == 16u, asuint(f16tof32(v)), asuint(uf_small(v, select(w == 11u, 6u, 5u)))));
+    uint res = select(ty <= 1u, nrm, select(ty <= 3u, asuint(fx), select(ty <= 5u, select(sg, (uint)sv, v), flt)));
+    uint one = select(isint, 1u, 0x3F800000u);
+    return select(sel == 0u, 0u, select(sel == 1u, one, select(c >= n, select(c == 3u, one, 0u), res)));
+}
+uint fmt_sel(uint4 r, uint info, uint sel, bool isint) { uint c = (sel - 4u) & 3u; return fmt_cvt(bits_at(r, fmt_off(info, c), fmt_width(info, c)), info, sel, isint); }
+// one component at byte address `a`: only the two dwords that hold its bits are read (a
+// component ends within the element's 128 bits, so these are dwords ld_raw(a) reads too)
+uint fmt_x(uint a, uint info, uint sel, bool isint) {
+    uint c = (sel - 4u) & 3u; uint w = fmt_width(info, c);
+    uint p = (a & 3u) * 8u + fmt_off(info, c); uint s = p & 31u;
+    uint2 d = mem.Load2((a & ~3u) + (p >> 5) * 4u);
+    uint v = select(s == 0u, d.x, (d.x >> s) | (d.y << ((32u - s) & 31u)));
+    return fmt_cvt(select(w >= 32u, v, v & ((1u << (w & 31u)) - 1u)), info, sel, isint);
+}
+"#;
+
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
 /// per-lane code is unchanged, and the halves meet ("exchange") wherever a value has to be
 /// the whole wave's – masks, lane reads, coherent scalar loads – so both hold the same SGPRs
@@ -5443,6 +5533,8 @@ uint xcl_x_thread(uint gi) {
 uint xcl_x_at(uint half, uint k) { return ((xcl_cw * 2u + half) * 2u + (k & 1u)) * XCL_X_SLOT; }
 void xcl_x_put(uint i, uint v) { XCL_XS(xcl_x_at(xcl_half, xcl_xk) + i) = v; }
 uint xcl_x_get(uint i) { return XCL_XS(xcl_x_at(xcl_half ^ 1u, xcl_xk - 1u) + i); }
+// half 0's word of the last exchange, in both halves (a scalar load: one value for all 64)
+uint xcl_x_get0(uint i) { return XCL_XS(xcl_x_at(0u, xcl_xk - 1u) + i); }
 // meet the other half after `xcl_x_put`: true = its words are readable (`xcl_x_get`)
 bool xcl_x_meet() {
     uint k = xcl_xk;

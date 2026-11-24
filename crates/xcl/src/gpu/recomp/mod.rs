@@ -519,6 +519,9 @@ pub struct Translation {
     /// console root signature's static samplers): (S#, comparison), register
     /// `static_sampler_base + i` in space 1
     pub static_samplers: Vec<([u32; 4], bool)>,
+    /// split wave64 with console LDS: the bytes of `xcl_lds` below the exchange; the program's
+    /// LDS accesses above them are clamped onto their last word
+    pub lds_below_exchange: Option<u32>,
 }
 
 impl Translation {
@@ -1489,9 +1492,24 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         body.push_str(&code);
     }
     let hlsl = em.finish(&body);
+    // Structuring copies code into every place a block is reached from: on one retail compute
+    // program (ScreenProbes_ActivateRays, 76 699 instructions) that made 154 MB of HLSL where
+    // the block dispatcher takes 15 MB; every other one of the pack's 2 682 compute programs
+    // grows by 1.5 times at most. A big structured program is also made in the dispatcher form,
+    // and that is taken when it is under half the size.
+    if branches != 0 && hlsl.len() >= STRUCTURED_CHECK_FROM && !hlsl.contains("\n    uint pc = ") {
+        let blocks = translate(code, &Options { structured: false, ..opt.clone() })?;
+        if blocks.hlsl.len().saturating_mul(2) < hlsl.len() {
+            return Ok(blocks);
+        }
+    }
     let static_samplers = em.static_used.clone();
-    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+    let lds_below_exchange = em.x64_lds_base().map(|base| 4 * base as u32);
+    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers, lds_below_exchange })
 }
+
+/// HLSL bytes from which a structured translation is compared with its dispatcher form.
+const STRUCTURED_CHECK_FROM: usize = 8 << 20;
 
 #[cfg(test)]
 mod attribute_tests {

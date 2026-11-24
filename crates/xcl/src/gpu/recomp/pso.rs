@@ -486,6 +486,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
         }
+        warn_lds_clamped(blob, &t, rsrc2_lds_bytes(f.rsrc2));
         return Ok((t, "cs_6_6"));
     }
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
@@ -509,12 +510,40 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
+    // COMPUTE_PGM_RSRC2 at +0x38 of the stage descriptor (`CsInterface::from_descriptor`)
+    let lds = match mode {
+        Mode::Compute(_) => f.stages.first().and_then(|s| f.data.get(s.offset + 0x38..s.offset + 0x3C)).map(|r| rsrc2_lds_bytes(u32::from_le_bytes(r.try_into().unwrap()))),
+        _ => None,
+    };
     let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
+    if let Some(lds) = lds {
+        warn_lds_clamped(blob, &t, lds);
+    }
     Ok((t, profile))
+}
+
+/// LDS bytes a console compute program allocates: COMPUTE_PGM_RSRC2.LDS_SIZE, in 512-byte
+/// granules.
+fn rsrc2_lds_bytes(rsrc2: u32) -> u32 {
+    ((rsrc2 >> 15) & 0x1FF) * 512
+}
+
+/// A split wave64 program that allocates more LDS than the exchange leaves it gets its accesses
+/// above that clamped onto one word (wrong data, no error), so its translation says so. The
+/// retail census found no program of one console wave doing it (2 420 B to spare at least,
+/// with the wider slots of every scalar load being exchanged); four 1024-thread ones
+/// allocate the whole 32 KB.
+fn warn_lds_clamped(blob: &[u8], t: &super::Translation, allocated: u32) {
+    if let Some(below) = t.lds_below_exchange.filter(|&below| allocated > below) {
+        crate::xlog_warn!(
+            "[SHADER] {:016x}: allocates {allocated} B of LDS, the split wave64 exchange leaves it {below} B; accesses above are clamped",
+            crate::gpu::shader::fnv64(blob)
+        );
+    }
 }
 
 /// A console geometry stage as XCL runs it, in two passes: the console program as a compute
@@ -985,6 +1014,35 @@ mod shader_cache_tests {
                 assert_eq!(thread.join().unwrap().unwrap().dxil[0], 1);
             }
         });
+    }
+}
+
+/// `XCL_SAMPLE_RPF` (a retail `shaders.rpf`): a compute program that structuring would make 10
+/// times bigger (ScreenProbes_ActivateRays, 154 MB of HLSL) is translated in the dispatcher
+/// form (15 MB); a big one structuring keeps in proportion (ScreenProbes_ActivateProbes, 30 MB)
+/// stays structured. Does nothing without the pack.
+#[cfg(test)]
+mod structuring_tests {
+    use super::*;
+
+    #[test]
+    fn retail_structuring_that_multiplies_the_hlsl_falls_back_to_blocks() {
+        let Ok(rpf) = std::env::var("XCL_SAMPLE_RPF") else { return };
+        let data = std::fs::read(rpf).unwrap();
+        let (mut rays, mut probes) = (None, None);
+        for r in crate::gpu::pack::scan(&data, 0x40).iter() {
+            let Some(blob) = crate::gpu::pack::inflate(&data, r) else { continue };
+            match crate::gpu::shader::fnv64(&blob) {
+                0x95cc_1328_8a27_a96e => rays = Some(blob),
+                0x56c0_cd3b_82a0_0c6e => probes = Some(blob),
+                _ => {}
+            }
+        }
+        let (Some(rays), Some(probes)) = (rays, probes) else { return };
+        let (t, _) = console_translation(&rays, Stage::Compute, 0, 4, true).unwrap();
+        assert!(t.complete() && t.hlsl.contains("\n    uint pc = ") && t.hlsl.len() < 20 << 20, "{} B", t.hlsl.len());
+        let (t, _) = console_translation(&probes, Stage::Compute, 0, 4, true).unwrap();
+        assert!(t.complete() && !t.hlsl.contains("\n    uint pc = ") && t.hlsl.len() > 20 << 20, "{} B", t.hlsl.len());
     }
 }
 

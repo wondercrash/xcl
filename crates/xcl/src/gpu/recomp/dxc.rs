@@ -477,21 +477,43 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
+/// HLSL past this size is enormous (a retail pack has six compute programs of 9.9 - 30 MB).
+const HUGE_HLSL: usize = 8 * 1024 * 1024;
+
+/// The optimisation level DXC gets for `src` when the caller gives none.
+/// DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
+/// `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
+/// With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
+/// 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
+/// compile).
+/// -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
+/// a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL).
+/// Enormous sources too: -O0 left the driver 20 – 30 MB of DXIL it did not finish in 15+
+/// CPU-minutes, while -O1 of the structured 30 MB HLSL of an 88 863-instruction CS took 160 s
+/// of CPU and 3.4 GB (9.5 MB DXIL instead of 20 MB). -O0 stays only for enormous programs in
+/// the `pc` dispatcher form (`uint pc`, unstructured control flow), where DXC's loop passes
+/// blow up: a 76 696-instruction one had not finished -O1 or -O3 after 13 CPU-minutes.
+/// -O0 also past `O1_MAX_HLSL`, structured or not.
+fn default_level(src: &str) -> Option<&'static str> {
+    if src.len() > HUGE_HLSL {
+        Some(if src.len() > O1_MAX_HLSL || src.contains("\n    uint pc = ") { "-O0" } else { "-O1" })
+    } else if src.len() > 1024 * 1024 {
+        Some("-O1")
+    } else {
+        None
+    }
+}
+
+/// Structured HLSL past this size is not optimised either: a retail program's 154 MB (5.7 M
+/// short-circuit `||` terms in its skip guards) is far past what -O1 was measured on (30 MB).
+const O1_MAX_HLSL: usize = 64 * 1024 * 1024;
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
-    // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
-    // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
-    // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
-    // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
-    // compile). -O0 only as a safety net for enormous sources.
-    // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
-    // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
-        } else if src.len() > 1024 * 1024 {
-            args.push(crate::util::wide("-O1"));
+        if let Some(level) = default_level(src) {
+            args.push(crate::util::wide(level));
         }
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
@@ -547,10 +569,13 @@ pub(super) fn toolchain_identity() -> &'static str {
     })
 }
 
-/// FNV-1a 64 of the inputs that determine the DXIL.
+/// FNV-1a 64 of the inputs that determine the DXIL. An enormous source compiled at -O1 also
+/// hashes its level (`default_level`): those were compiled at -O0 before, and a cached -O0
+/// result must not stand in for the -O1 one. Every other source keeps its key.
 fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &str) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src] {
+    let level = (src.len() > HUGE_HLSL).then(|| default_level(src)).flatten().filter(|&l| l != "-O0");
+    for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src].into_iter().chain(level) {
         for b in part.bytes().chain([0u8]) {
             h ^= b as u64;
             h = h.wrapping_mul(0x100_0000_01b3);
@@ -798,6 +823,8 @@ where
         return Err("DXIL not compiled yet".into());
     }
     counters.misses.fetch_add(1, Ordering::Relaxed);
+    // a pipeline build: a bind may go on without a program this big (`XCL_PSO_SKIP_HUGE`)
+    crate::hle::d3d12x::pso_async::hlsl_known(src.len());
     let flight = cache_flight((dir.clone(), key));
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
     let _process_guard = process_cache_lock(&file)?;
@@ -1020,6 +1047,45 @@ mod cache_tests {
         assert_eq!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-a"));
         assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-b/signer-a"));
         assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-b"));
+    }
+
+    #[test]
+    fn enormous_structured_sources_get_o1_and_their_own_keys() {
+        let body = |pc: bool| {
+            let mut s = String::from(if pc { "void main()\n{\n    uint pc = 0;\n" } else { "void main()\n{\n" });
+            while s.len() <= HUGE_HLSL {
+                s.push_str("    // filler line of a translated program\n");
+            }
+            s
+        };
+        let (structured, dispatch) = (body(false), body(true));
+        assert_eq!(default_level("void main() {}"), None);
+        assert_eq!(default_level(&structured[..2 << 20]), Some("-O1"));
+        assert_eq!(default_level(&structured), Some("-O1"));
+        assert_eq!(default_level(&dispatch), Some("-O0"));
+        // the key of a source under the limit is the plain hash of its inputs (unchanged); an
+        // enormous one also hashes its level
+        let plain = |src: &str| {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for part in [env!("CARGO_PKG_VERSION"), "tc", "cs_6_6", "main", src] {
+                for b in part.bytes().chain([0u8]) {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            h
+        };
+        assert_eq!(cache_key_for_toolchain(&structured[..2 << 20], "main", "cs_6_6", "tc"), plain(&structured[..2 << 20]));
+        assert_ne!(cache_key_for_toolchain(&structured, "main", "cs_6_6", "tc"), plain(&structured));
+        // still -O0 as before: the same key
+        assert_eq!(cache_key_for_toolchain(&dispatch, "main", "cs_6_6", "tc"), plain(&dispatch));
+        // structured but past the -O1 cap: -O0, with the key it had before -O1
+        let mut over = structured.repeat(O1_MAX_HLSL / structured.len() + 1);
+        over.truncate(O1_MAX_HLSL + 1);
+        assert!(!over.contains("\n    uint pc = "));
+        assert_eq!(default_level(&over), Some("-O0"));
+        assert_eq!(default_level(&over[..O1_MAX_HLSL]), Some("-O1"));
+        assert_eq!(cache_key_for_toolchain(&over, "main", "cs_6_6", "tc"), plain(&over));
     }
 
     #[test]
