@@ -966,7 +966,7 @@ impl Pipelines {
     fn from_cache(&self, c: &recomp::pso::Compiled) -> bool {
         use crate::hle::d3d12x::real::driver_cache;
         use windows::Win32::Graphics::Direct3D12::D3D12_PIPELINE_STATE_FLAG_NONE;
-        let Some(bytes) = driver_cache::path(&c.dxil, D3D12_PIPELINE_STATE_FLAG_NONE.0).as_deref().and_then(driver_cache::load) else { return false };
+        let Some(bytes) = driver_cache::path(&c.dxil, &c.samplers, D3D12_PIPELINE_STATE_FLAG_NONE.0).as_deref().and_then(driver_cache::load) else { return false };
         match self.create(c, Some(&bytes)) {
             None => true,
             Some(Ok(_)) => {
@@ -983,7 +983,7 @@ impl Pipelines {
         use crate::hle::d3d12x::real::driver_cache;
         use windows::Win32::Graphics::Direct3D12::D3D12_PIPELINE_STATE_FLAG_NONE;
         let Some(r) = self.create(c, None) else { return };
-        if let (Some(path), Ok(pso)) = (driver_cache::path(&c.dxil, D3D12_PIPELINE_STATE_FLAG_NONE.0), &r) {
+        if let (Some(path), Ok(pso)) = (driver_cache::path(&c.dxil, &c.samplers, D3D12_PIPELINE_STATE_FLAG_NONE.0), &r) {
             if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                 let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
                 let len = unsafe { blob.GetBufferSize() };
@@ -1646,6 +1646,36 @@ mod tests {
         assert_eq!(order.len(), 3);
         let cov = coverage(&a, &order, &[1, 3]);
         assert_eq!(cov, vec![(1, 0), (3, 2)]);
+    }
+
+    /// The driver cache's key (`driver_cache::name`): the runtime refuses the blob of a program
+    /// for the same DXIL with other static samplers, so they need a file each; it takes one
+    /// made with node mask 0 (`--pipelines`) for a title's pipeline of node mask 1.
+    #[test]
+    fn a_driver_blob_is_refused_for_other_static_samplers() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let src = "SamplerState s0 : register(s0, space1);\nRWByteAddressBuffer o : register(u0);\n[numthreads(1,1,1)] void main() { Texture2D t = ResourceDescriptorHeap[0]; o.Store(0, asuint(t.SampleLevel(s0, float2(0.3, 0.7), 0).x)); }\n";
+        let Ok(dxil) = recomp::dxc::compile(src, "main", "cs_6_6", &[]) else { return recomp::runner::skip_test("no DXC") };
+        let Ok(p) = Pipelines::new() else { return recomp::runner::skip_test("no GPU") };
+        let wrap = recomp::pso::Compiled { dxil: dxil.clone(), samplers: vec![([0, 0, 0, 0], false)] };
+        // clamp in u, v and w instead of wrap
+        let clamp = recomp::pso::Compiled { dxil: dxil.clone(), samplers: vec![([2 | 2 << 3 | 2 << 6, 0, 0, 0], false)] };
+        let made = p.create(&wrap, None).unwrap().unwrap();
+        let blob = unsafe { made.GetCachedBlob() }.unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()) }.to_vec();
+        assert!(p.create(&wrap, Some(&bytes)).unwrap().is_ok());
+        assert_eq!(p.create(&clamp, Some(&bytes)).unwrap().map(|_| ()).map_err(|e| e.code()), Err(windows::Win32::Foundation::E_INVALIDARG));
+        let rs = p.signatures.lock().unwrap().get(&vec![0u32; 5]).cloned().unwrap();
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+            NodeMask: 1,
+            CachedPSO: D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() },
+            ..Default::default()
+        };
+        let r = unsafe { p.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        assert!(r.is_ok(), "{r:?}");
     }
 
     /// Real data check (skipped unless XCL_SAMPLE_RPF points at an RPF9 shader pack).
