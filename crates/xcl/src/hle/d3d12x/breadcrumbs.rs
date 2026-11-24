@@ -527,7 +527,9 @@ fn remove_device(queue: usize, secs: u32) {
         };
         crate::xlog_warn!("D3D12.X: breadcrumbs: {label} has stood still for {secs} s: the device is removed (XCL_STALL_REMOVE_S); what each list in flight got to:");
         for (q, event, lists, ops) in in_flight() {
-            crate::xlog_warn!("D3D12.X: breadcrumbs at the removal: {} is in {event}: {}", super::list_x::queue_label(q), list_progress(&lists, &ops));
+            // (a wait or signal event runs no list: the queue stands at it)
+            let at = if lists.is_empty() { "no list".to_owned() } else { list_progress(&lists, &ops) };
+            crate::xlog_warn!("D3D12.X: breadcrumbs at the removal: {} is in {event}: {at}", super::list_x::queue_label(q));
         }
         dev5.RemoveDevice();
     }

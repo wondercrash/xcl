@@ -5328,8 +5328,13 @@ unsafe fn dred_lines(dev: &ID3D12Device) -> Vec<String> {
                 v.join(", ")
             };
             let va = pf.PageFaultVA;
-            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
-            out.push(format!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode)));
+            if va == 0 && pf.pHeadExistingAllocationNode.is_null() && pf.pHeadRecentFreedAllocationNode.is_null() {
+                // (what a removal without a fault gives, as `RemoveDevice` – `dred_tests`)
+                out.push("DRED: no page fault recorded".to_owned());
+            } else {
+                let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
+                out.push(format!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode)));
+            }
         }
         Err(e) => out.push(format!("DRED page fault: none given ({e})")),
     }
