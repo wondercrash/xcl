@@ -703,7 +703,10 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         return;
     }
     p.copy_source = None;
-    p.dumps.clear();
+    // dumps whose copy outlasted the wait after their present (a GPU at < 1 frame/s): written now
+    for dump in p.dumps.drain(..) {
+        write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag, &dump.suffix);
+    }
     if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
         return;
     }

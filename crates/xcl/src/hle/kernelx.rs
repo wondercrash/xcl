@@ -307,6 +307,18 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         static ASKED: AtomicUsize = AtomicUsize::new(0);
         let asked = ASKED.fetch_add(size, Ordering::Relaxed) + size;
         crate::gpu::uma::note_coherent_need(asked);
+        // `XCL_COHERENT_SPARSE_MIN_MB=n` (diagnostic): heaps of n MB or more go to the sparse
+        // windows instead, as MEM_GRAPHICS commits do (video memory, CPU writes copied up before
+        // each submit; shader writes are not copied back to the CPU's view). The GPU writes the
+        // coherent window (process memory) at ~0.1 GB/s on an RTX 5090: 16-byte stores over 59 MB
+        // take 600 ms (video memory 0.03 ms). Still counted above: the learned window size stays.
+        if coherent_sparse_min().is_some_and(|min| size >= min) {
+            let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
+            if let Some((q, rounded)) = crate::hle::d3d12x::sparse::alloc(size.max(1).div_ceil(align) * align, align) {
+                trace_mem("VirtualAlloc (graphics, sparse VRAM: XCL_COHERENT_SPARSE_MIN_MB)", 0, rounded, t as u64, p, q);
+                return q as *mut c_void;
+            }
+        }
         if let Some(u) = uma {
             let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
             // what XCL keeps of the window for itself (readback heaps; its per-draw arguments have
@@ -360,6 +372,14 @@ unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
 /// PAGE_GRAPHICS_NOACCESS … PAGE_GRAPHICS_NOCACHE (0x800 – 0x40000): the console's protection of
 /// GPU-visible memory
 const PAGE_GRAPHICS_ANY: u32 = 0x7_F800;
+
+/// `XCL_COHERENT_SPARSE_MIN_MB=n`: bytes from which a title's graphics heap goes to the sparse
+/// windows instead of the coherent window (unset: none does)
+fn coherent_sparse_min() -> Option<usize> {
+    static MIN: std::sync::LazyLock<Option<usize>> =
+        std::sync::LazyLock::new(|| keep_last_error(|| std::env::var("XCL_COHERENT_SPARSE_MIN_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).map(|mb| mb << 20)));
+    *MIN
+}
 
 /// `XCL_TRACE_MEM=1`: the title's allocations of 64 KiB or more (the first 60; `XCL_TRACE_MEM=n`:
 /// the first n when n > 1)
