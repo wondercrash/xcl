@@ -302,62 +302,256 @@ pub(super) unsafe fn gpu_read_u64(p: usize) -> Result<u64, String> {
 
 /// What the GPU reads now at each of `parts` (a buffer, the offset in it, bytes: up to 256
 /// together), back to back: copies on a copy queue of XCL's own (no title queue holds it),
-/// waited for up to 500 ms. The list goes to the PC's ExecuteCommandLists, not the title's
-/// entry: there the queue first waited, as a title queue does, for the uploads of what the CPU
-/// wrote, and a read for the line of a GPU that stood still stood still behind them (run 14:
-/// five such queues never finished, and the thread that opens the gates slept in the uploads'
-/// 5 s waits).
+/// waited for up to 500 ms. The buffers are alive at the call; a reference of the read keeps
+/// each until its copy has run.
+///
+/// The callers are the threads that report a GPU standing still (the gates', the
+/// breadcrumbs'), so nothing here may wait for that GPU without a bound:
+/// * the read runs on a thread of its own (`ReadThread`) and the caller waits 2 s at most for
+///   its answer; while that thread has not come back from a read, later ones are refused at
+///   once.
+/// * its queue, allocator, list, fence and readback buffer are made once and kept
+///   (`Reader`). Made for each read, the queue's last Release stood still in the kernel for
+///   as long as the device's GPU work did: run 15 lost both reporting threads that way 2 s
+///   into the stall (no report after it, no gate opened, no removal by `XCL_STALL_REMOVE_S`),
+///   and the two kept the ended process and its GPU work alive. Before, such a queue was
+///   never released (`present` kept a reference of every queue the title's entry saw).
+/// * a read the GPU has not finished in 500 ms keeps the reader: the next ones are refused
+///   at once until it has.
+/// The objects are the PC's own (`pc_method`), and the list goes to the PC's
+/// ExecuteCommandLists: through the title's entry the queue first waited, as a title queue
+/// does, for the uploads of what the CPU wrote (run 14).
 pub(super) unsafe fn gpu_read(parts: &[(usize, u64, usize)]) -> Result<Vec<u8>, String> {
-    const ROOM: usize = 256;
-    let total: usize = parts.iter().map(|p| p.2).sum();
-    if total > ROOM {
-        return Err(format!("{total} bytes asked, {ROOM} at most"));
-    }
     let raw = device_raw();
     let device = ID3D12Device::from_raw_borrowed(&raw).ok_or("no device")?;
-    let ty = D3D12_COMMAND_LIST_TYPE_COPY;
-    let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).map_err(|e| format!("queue: {e}"))?;
-    let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(ty).map_err(|e| format!("allocator: {e}"))?;
-    let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, ty, &alloc, None).map_err(|e| format!("list: {e}"))?;
-    let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|e| format!("fence: {e}"))?;
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: ROOM as u64,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        ..Default::default()
+    gpu_read_on(device, parts)
+}
+
+/// `gpu_read` on `device`.
+pub(super) unsafe fn gpu_read_on(device: &ID3D12Device, parts: &[(usize, u64, usize)]) -> Result<Vec<u8>, String> {
+    static THREAD: OnceLock<ReadThread> = OnceLock::new();
+    THREAD.get_or_init(ReadThread::start).read(device, parts, READ_ANSWER)
+}
+
+/// bytes one `gpu_read` returns at most
+const READ_ROOM: usize = 256;
+/// how long a read waits for the GPU
+const READ_GPU_MS: u32 = 500;
+/// how long a caller waits for the read thread (a read behind another one's 500 ms included)
+const READ_ANSWER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The PC method at `slot` of `obj`, past XCL's hooks when the object is adopted.
+unsafe fn pc_method(obj: *mut c_void, slot: usize) -> usize {
+    if is_adopted(obj) {
+        orig_fn(obj, slot)
+    } else {
+        *vt(obj).add(slot)
+    }
+}
+
+macro_rules! device_slot {
+    ($method:ident) => {
+        std::mem::offset_of!(ID3D12Device_Vtbl, $method) / std::mem::size_of::<usize>()
     };
-    let mut readback: Option<ID3D12Resource> = None;
-    device
-        .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback)
-        .map_err(|e| format!("readback buffer: {e}"))?;
-    let readback = readback.ok_or("readback buffer")?;
-    let mut at = 0u64;
-    for &(buf, off, len) in parts {
-        let buf = buf as *mut c_void;
-        let src = ID3D12Resource::from_raw_borrowed(&buf).ok_or("no buffer")?;
-        list.CopyBufferRegion(&readback, at, src, off, len as u64);
-        at += len as u64;
+}
+
+/// What `gpu_read` copies with, on one device: PC objects XCL does not adopt (the title's
+/// entries do nothing for them), kept for the device's life.
+struct Reader {
+    device: ID3D12Device,
+    queue: ID3D12CommandQueue,
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    readback: ID3D12Resource,
+    /// the fence value of the last read
+    value: u64,
+    /// the buffers the last read copies from, until it has run
+    sources: Vec<ID3D12Resource>,
+}
+
+impl Reader {
+    unsafe fn new(device: &ID3D12Device) -> Result<Reader, String> {
+        let dev = device.as_raw();
+        let made = |hr: windows::core::HRESULT, what: &str| hr.ok().map_err(|e| format!("{what}: {e}"));
+        let ty = D3D12_COMMAND_LIST_TYPE_COPY;
+
+        type MakeQueue = unsafe extern "system" fn(*mut c_void, *const D3D12_COMMAND_QUEUE_DESC, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
+        let mut queue = std::ptr::null_mut();
+        let f: MakeQueue = std::mem::transmute(pc_method(dev, device_slot!(CreateCommandQueue)));
+        made(f(dev, &D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }, &ID3D12CommandQueue::IID, &mut queue), "queue")?;
+        let queue = ID3D12CommandQueue::from_raw(queue);
+
+        type MakeAllocator = unsafe extern "system" fn(*mut c_void, D3D12_COMMAND_LIST_TYPE, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
+        let mut alloc = std::ptr::null_mut();
+        let f: MakeAllocator = std::mem::transmute(pc_method(dev, device_slot!(CreateCommandAllocator)));
+        made(f(dev, ty, &ID3D12CommandAllocator::IID, &mut alloc), "allocator")?;
+        let alloc = ID3D12CommandAllocator::from_raw(alloc);
+
+        type MakeList = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, *mut c_void, *mut c_void, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
+        let mut list = std::ptr::null_mut();
+        let f: MakeList = std::mem::transmute(pc_method(dev, device_slot!(CreateCommandList)));
+        made(f(dev, 0, ty, alloc.as_raw(), std::ptr::null_mut(), &ID3D12GraphicsCommandList::IID, &mut list), "list")?;
+        let list = ID3D12GraphicsCommandList::from_raw(list);
+        list.Close().map_err(|e| format!("Close: {e}"))?;
+
+        type MakeFence = unsafe extern "system" fn(*mut c_void, u64, D3D12_FENCE_FLAGS, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
+        let mut fence = std::ptr::null_mut();
+        let f: MakeFence = std::mem::transmute(pc_method(dev, device_slot!(CreateFence)));
+        made(f(dev, 0, D3D12_FENCE_FLAG_NONE, &ID3D12Fence::IID, &mut fence), "fence")?;
+        let fence = ID3D12Fence::from_raw(fence);
+
+        type MakeBuffer = unsafe extern "system" fn(
+            *mut c_void,
+            *const D3D12_HEAP_PROPERTIES,
+            D3D12_HEAP_FLAGS,
+            *const D3D12_RESOURCE_DESC,
+            D3D12_RESOURCE_STATES,
+            *const D3D12_CLEAR_VALUE,
+            *const windows::core::GUID,
+            *mut *mut c_void,
+        ) -> windows::core::HRESULT;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: READ_ROOM as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback = std::ptr::null_mut();
+        let f: MakeBuffer = std::mem::transmute(pc_method(dev, device_slot!(CreateCommittedResource)));
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        made(f(dev, &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, std::ptr::null(), &ID3D12Resource::IID, &mut readback), "readback buffer")?;
+        let readback = ID3D12Resource::from_raw(readback);
+
+        Ok(Reader { device: device.clone(), queue, alloc, list, fence, readback, value: 0, sources: Vec::new() })
     }
-    list.Close().map_err(|e| format!("Close: {e}"))?;
-    type Execute = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
-    let q = queue.as_raw();
-    let execute: Execute = if is_adopted(q) { std::mem::transmute(orig_fn(q, slot_of(q, "ExecuteCommandLists"))) } else { std::mem::transmute(queue.vtable().ExecuteCommandLists) };
-    execute(q, 1, &list.as_raw());
-    queue.Signal(&fence, 1).map_err(|e| format!("Signal: {e}"))?;
-    if let Err(e) = crate::gpu::fence::wait(&fence, 1, device, None, 500) {
-        // still in use by the GPU: kept alive for good rather than released under it
-        std::mem::forget((queue, alloc, list, readback, fence));
-        return Err(format!("not done in 500 ms: {e}"));
+
+    /// The bytes of `parts`, back to back.
+    unsafe fn read(&mut self, parts: Vec<(ID3D12Resource, u64, usize)>) -> Result<Vec<u8>, String> {
+        let total: usize = parts.iter().map(|p| p.2).sum();
+        // (a removed device completes every fence: the Reset then says so)
+        if self.fence.GetCompletedValue() < self.value {
+            return Err("the read before it has not finished".to_owned());
+        }
+        self.sources.clear();
+        self.alloc.Reset().map_err(|e| format!("allocator Reset: {e}"))?;
+        self.list.Reset(&self.alloc, None).map_err(|e| format!("list Reset: {e}"))?;
+        let mut at = 0u64;
+        for (src, off, len) in &parts {
+            self.list.CopyBufferRegion(&self.readback, at, src, *off, *len as u64);
+            at += *len as u64;
+        }
+        self.list.Close().map_err(|e| format!("Close: {e}"))?;
+        self.queue.ExecuteCommandLists(&[Some(self.list.cast().map_err(|e| format!("list: {e}"))?)]);
+        self.sources = parts.into_iter().map(|p| p.0).collect();
+        self.value += 1;
+        self.queue.Signal(&self.fence, self.value).map_err(|e| format!("Signal: {e}"))?;
+        crate::gpu::fence::wait(&self.fence, self.value, &self.device, None, READ_GPU_MS).map_err(|e| format!("not done in {READ_GPU_MS} ms: {e}"))?;
+        self.sources.clear();
+        let mut m = std::ptr::null_mut();
+        self.readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: total }), Some(&mut m)).map_err(|e| format!("Map: {e}"))?;
+        let v = std::slice::from_raw_parts(m as *const u8, total).to_vec();
+        self.readback.Unmap(0, Some(&D3D12_RANGE::default()));
+        Ok(v)
     }
-    let mut m = std::ptr::null_mut();
-    readback.Map(0, None, Some(&mut m)).map_err(|e| format!("Map: {e}"))?;
-    let v = std::slice::from_raw_parts(m as *const u8, total).to_vec();
-    readback.Unmap(0, None);
-    Ok(v)
+}
+
+struct ReadJob {
+    device: ID3D12Device,
+    parts: Vec<(ID3D12Resource, u64, usize)>,
+    /// (tests) the thread sleeps this long first: a read that does not come back
+    stall: std::time::Duration,
+    answer: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+}
+// SAFETY: D3D12 objects are free-threaded; the job is used by the read thread alone
+unsafe impl Send for ReadJob {}
+
+/// The thread `gpu_read`s run on, so that one standing still in D3D12 leaves its callers.
+struct ReadThread {
+    jobs: std::sync::mpsc::Sender<ReadJob>,
+    /// a caller gave up waiting, and the thread has not finished a read since
+    away: std::sync::Arc<AtomicBool>,
+    /// readers made (one for each device)
+    #[cfg(test)]
+    readers: std::sync::Arc<AtomicUsize>,
+}
+
+impl ReadThread {
+    fn start() -> ReadThread {
+        let (jobs, todo) = std::sync::mpsc::channel::<ReadJob>();
+        let away = std::sync::Arc::new(AtomicBool::new(false));
+        let away_there = away.clone();
+        #[cfg(test)]
+        let readers = std::sync::Arc::new(AtomicUsize::new(0));
+        #[cfg(test)]
+        let readers_there = readers.clone();
+        let _ = std::thread::Builder::new().name("xcl-gpu-read".into()).spawn(move || {
+            let mut reader: Option<Reader> = None;
+            for job in todo {
+                std::thread::sleep(job.stall);
+                let result = unsafe {
+                    if reader.as_ref().is_none_or(|r| r.device != job.device) {
+                        // (another device's reader goes: tests; a title has one device)
+                        reader = None;
+                        match Reader::new(&job.device) {
+                            Ok(r) => {
+                                #[cfg(test)]
+                                readers_there.fetch_add(1, Ordering::Relaxed);
+                                reader = Some(r);
+                            }
+                            Err(e) => {
+                                let _ = job.answer.send(Err(e));
+                                away_there.store(false, Ordering::Release);
+                                continue;
+                            }
+                        }
+                    }
+                    reader.as_mut().unwrap().read(job.parts)
+                };
+                let _ = job.answer.send(result);
+                away_there.store(false, Ordering::Release);
+            }
+        });
+        ReadThread {
+            jobs,
+            away,
+            #[cfg(test)]
+            readers,
+        }
+    }
+
+    /// `gpu_read` on `device`, waiting `patience` for the thread's answer.
+    unsafe fn read(&self, device: &ID3D12Device, parts: &[(usize, u64, usize)], patience: std::time::Duration) -> Result<Vec<u8>, String> {
+        self.ask(device, parts, std::time::Duration::ZERO, patience)
+    }
+
+    unsafe fn ask(&self, device: &ID3D12Device, parts: &[(usize, u64, usize)], stall: std::time::Duration, patience: std::time::Duration) -> Result<Vec<u8>, String> {
+        let total: usize = parts.iter().map(|p| p.2).sum();
+        if total > READ_ROOM {
+            return Err(format!("{total} bytes asked, {READ_ROOM} at most"));
+        }
+        if self.away.load(Ordering::Acquire) {
+            return Err("an earlier read has not come back from D3D12".to_owned());
+        }
+        let mut sources = Vec::with_capacity(parts.len());
+        for &(buf, off, len) in parts {
+            let buf = buf as *mut c_void;
+            sources.push((ID3D12Resource::from_raw_borrowed(&buf).ok_or("no buffer")?.clone(), off, len));
+        }
+        let (answer, there) = std::sync::mpsc::channel();
+        self.jobs.send(ReadJob { device: device.clone(), parts: sources, stall, answer }).map_err(|_| "no read thread".to_owned())?;
+        match there.recv_timeout(patience) {
+            Ok(r) => r,
+            Err(_) => {
+                self.away.store(true, Ordering::Release);
+                Err(format!("no answer from D3D12 in {} ms", patience.as_millis()))
+            }
+        }
+    }
 }
 
 unsafe fn open_uma(device: &ID3D12Device) {
@@ -5823,6 +6017,78 @@ fn a_gpu_copy_reads_a_coherent_window_word() {
     }
     u.free(p as _);
     assert!(unsafe { gpu_read_u64(0x10) }.is_err(), "outside the windows");
+}
+
+/// The device of a GPU test of the reads (None: no GPU).
+#[cfg(test)]
+unsafe fn read_test_device() -> Option<(ID3D12Device, ID3D12Resource)> {
+    let mut dev: Option<ID3D12Device> = None;
+    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
+    let dev = dev?;
+    // a buffer to read: 16 bytes written by the CPU
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: 64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buf: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut buf).ok()?;
+    let buf = buf?;
+    let mut p = std::ptr::null_mut();
+    buf.Map(0, None, Some(&mut p)).ok()?;
+    (p as *mut [u64; 2]).write([0x5843_4C00_0000_0506, 0x0102_0304_0506_0708]);
+    buf.Unmap(0, None);
+    Some((dev, buf))
+}
+
+/// The reads of one device share one queue, allocator, list, fence and readback buffer: none
+/// is made, or released, for a read (the release of a queue stood still with the GPU: run 15).
+#[cfg(test)]
+#[test]
+fn gpu_reads_keep_one_reader_for_a_device() {
+    let Some((dev, buf)) = (unsafe { read_test_device() }) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+    let thread = ReadThread::start();
+    let b = buf.as_raw() as usize;
+    for (off, want) in [(0u64, 0x5843_4C00_0000_0506u64), (8, 0x0102_0304_0506_0708), (0, 0x5843_4C00_0000_0506)] {
+        let got = unsafe { thread.read(&dev, &[(b, off, 8)], READ_ANSWER) }.expect("read");
+        assert_eq!(u64::from_le_bytes(got.try_into().unwrap()), want);
+    }
+    assert_eq!(unsafe { thread.read(&dev, &[(b, 0, 4), (b, 12, 4)], READ_ANSWER) }, Ok(vec![0x06, 0x05, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01]));
+    assert_eq!(thread.readers.load(Ordering::Relaxed), 1);
+    assert!(unsafe { thread.read(&dev, &[(b, 0, 200), (b, 0, 100)], READ_ANSWER) }.is_err(), "more than the readback buffer holds");
+}
+
+/// A read that does not come back from D3D12 leaves its caller after the caller's patience,
+/// later reads are refused at once while it is away, and they work again once it is back.
+#[cfg(test)]
+#[test]
+fn a_gpu_read_that_does_not_come_back_leaves_its_callers() {
+    use std::time::{Duration, Instant};
+    let Some((dev, buf)) = (unsafe { read_test_device() }) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+    let thread = ReadThread::start();
+    let part = [(buf.as_raw() as usize, 0u64, 8usize)];
+    let t = Instant::now();
+    let e = unsafe { thread.ask(&dev, &part, Duration::from_millis(600), Duration::from_millis(50)) }.expect_err("no answer");
+    assert_eq!(e, "no answer from D3D12 in 50 ms");
+    assert!(t.elapsed() < Duration::from_millis(400), "the caller waited {:?}", t.elapsed());
+    let t = Instant::now();
+    let e = unsafe { thread.read(&dev, &part, READ_ANSWER) }.expect_err("refused");
+    assert_eq!(e, "an earlier read has not come back from D3D12");
+    assert!(t.elapsed() < Duration::from_millis(100), "refused after {:?}", t.elapsed());
+    // (the thread comes back: 600 ms after the first call)
+    let t = Instant::now();
+    let back = loop {
+        match unsafe { thread.read(&dev, &part, READ_ANSWER) } {
+            Err(e) if e.starts_with("an earlier read") && t.elapsed() < Duration::from_secs(5) => std::thread::sleep(Duration::from_millis(20)),
+            r => break r,
+        }
+    };
+    assert_eq!(back.map(|b| u64::from_le_bytes(b.try_into().unwrap())), Ok(0x5843_4C00_0000_0506));
 }
 
 #[cfg(test)]
