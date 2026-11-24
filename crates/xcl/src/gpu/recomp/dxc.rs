@@ -818,6 +818,8 @@ where
         return Err("DXIL not compiled yet".into());
     }
     counters.misses.fetch_add(1, Ordering::Relaxed);
+    // a pipeline build: a bind may go on without a program this big (`XCL_PSO_SKIP_HUGE`)
+    crate::hle::d3d12x::pso_async::hlsl_known(src.len());
     let flight = cache_flight((dir.clone(), key));
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
     let _process_guard = process_cache_lock(&file)?;
