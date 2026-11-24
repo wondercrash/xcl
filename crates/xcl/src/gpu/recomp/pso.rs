@@ -1017,6 +1017,45 @@ mod shader_cache_tests {
     }
 }
 
+/// `XCL_SAMPLE_RPF` (a retail `shaders.rpf`): the compute programs whose structured form was
+/// many times their dispatcher form stay structured and near its size – ScreenProbes_ActivateRays
+/// (95cc13288a27a96e: 154 MB of skip-flag guards and indentation against 15 MB in blocks) and
+/// ScreenProbes_ActivateProbes (56c0cd3b82a00c6e). Does nothing without the pack.
+#[cfg(test)]
+mod structuring_tests {
+    use super::*;
+
+    #[test]
+    fn retail_structured_forms_stay_near_the_block_form() {
+        let Ok(rpf) = std::env::var("XCL_SAMPLE_RPF") else { return };
+        let data = std::fs::read(rpf).unwrap();
+        let mut found = 0;
+        for r in crate::gpu::pack::scan(&data, 0x40).iter() {
+            let Some(blob) = crate::gpu::pack::inflate(&data, r) else { continue };
+            let h = crate::gpu::shader::fnv64(&blob);
+            if ![0x95cc_1328_8a27_a96e, 0x56c0_cd3b_82a0_0c6e].contains(&h) {
+                continue;
+            }
+            found += 1;
+            let sh = xbox::parse(&blob).unwrap();
+            let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).unwrap();
+            let mode = interface(&blob, &sh, f).unwrap();
+            let p = &f.programs[0];
+            let code = &f.data[p.offset..p.offset + p.len];
+            let t = |structured: bool| {
+                let o = Options { mode: mode.clone(), wave64: super::super::detect_wave64(code), split_wave64: true, mem_windows: 4, structured, ..Default::default() };
+                let t = translate(code, &o).unwrap();
+                assert!(t.complete(), "{h:016x}: {:?}", t.unsupported_why);
+                t.hlsl
+            };
+            let (s, b) = (t(true), t(false));
+            assert!(!s.contains("\n    uint pc = ") && b.contains("\n    uint pc = "), "{h:016x}: not structured");
+            assert!(s.len() * 2 < b.len() * 3, "{h:016x}: {} B structured, {} B in blocks", s.len(), b.len());
+        }
+        assert_eq!(found, 2, "programs not in the pack");
+    }
+}
+
 #[cfg(test)]
 mod compile_time_bench {
     use super::*;
