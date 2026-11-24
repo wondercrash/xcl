@@ -191,6 +191,30 @@ fn complete(p: &Pending, real: usize) {
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
+/// binds waiting right now for a pipeline still being built (`title_held`)
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a bind is waiting for a pipeline still being built: one of the title's threads is
+/// held where a console title never waits (`kernelx::Sleep` does not count that time).
+pub fn title_held() -> bool {
+    HELD.load(Ordering::Acquire) != 0
+}
+
+/// A bind's wait for a pipeline still being built (`title_held`).
+struct Held;
+
+impl Held {
+    fn new() -> Held {
+        HELD.fetch_add(1, Ordering::AcqRel);
+        Held
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
@@ -462,6 +486,31 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    /// While a bind waits for a pipeline still being built, the title is held (`title_held`):
+    /// `kernelx::Sleep` does not count that time.
+    #[test]
+    fn a_bind_waiting_for_a_build_holds_the_title() {
+        let standin = 0x7E57_B002usize;
+        let (started, building) = mpsc::channel();
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = started.send(());
+            let _ = finish.recv();
+            0x5252
+        }), 0);
+        let bind = std::thread::spawn(move || resolve_wait_for(standin, None, None));
+        building.recv_timeout(std::time::Duration::from_secs(10)).expect("the pipeline is being built");
+        // (built in the bind, or by a worker with the bind about to wait for it)
+        let t = std::time::Instant::now();
+        while !title_held() && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(title_held(), "a bind waits for a build, but the title is not held");
+        go.send(()).unwrap();
+        assert_eq!(bind.join().unwrap(), 0x5252);
+        let _ = released(standin);
+    }
 
     /// A bind waits for a pipeline still being built no longer than its budget and goes on with
     /// the stand-in; later binds do not wait for it again; once built it is the real one.
@@ -760,6 +809,9 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>, huge: Optio
 /// bytes or more (None: no limit).
 fn resolve_wait_in(p: &Arc<Pending>, pso: usize, budget: Option<std::time::Duration>, huge: Option<usize>) -> usize {
     p.note_use();
+    // (the title's thread is held from here until the pipeline is built, the budget is over or
+    // it goes on without a pipeline too big to wait for)
+    let _held = (!*p.done.lock().unwrap()).then(Held::new);
     p.want();
     // only a call that waits is counted: not one for a pipeline built already, late
     // (`XCL_PSO_WAIT_MS`, `XCL_PSO_WAIT_MS_GRAPHICS`) or known to be too big to wait for (`XCL_PSO_SKIP_HUGE`)

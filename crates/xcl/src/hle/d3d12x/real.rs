@@ -2030,6 +2030,29 @@ pub fn is_translated_compute(pso: usize) -> bool {
     pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
+/// compute pipelines the title made from a console shader that runs untranslated: a background
+/// build's stand-in (until it is resolved) and the fallback of a console shader that failed
+static CONSOLE_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+unsafe fn note_console_compute(hr: HRESULT, ppv: *mut *mut c_void) {
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        CONSOLE_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    }
+}
+
+/// Whether `pso` was made from a console compute shader (translated or not); a native PC
+/// compute pipeline is not.
+pub fn is_console_compute(pso: usize) -> bool {
+    pso != 0 && CONSOLE_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+}
+
+#[cfg(test)]
+pub(super) fn register_console_compute_for_test(pso: usize) {
+    if pso != 0 {
+        CONSOLE_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    }
+}
+
 #[cfg(test)]
 pub(super) fn register_translated_compute_for_test(pso: usize) {
     if pso != 0 {
@@ -2068,6 +2091,9 @@ pub(super) fn forget_pso_for_test(pso: usize) {
 
 fn forget_pso(pso: usize) {
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
+        s.remove(&pso);
+    }
+    if let Some(s) = CONSOLE_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
     if let Some(s) = TRANSLATED_GRAPHICS.lock().unwrap().as_mut() {
@@ -5046,6 +5072,7 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
             // ExecuteIndirect never bind XCL's ABI root signature onto it)
             LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
             LAST_COMPUTE_RS.with(|c| c.set(0));
+            note_console_compute(hr, ppv);
             return hr;
         }
         console = translated_compute_pso(this, f, desc, riid, ppv);
@@ -5065,6 +5092,9 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     note_fallback("compute PSO", hr, hr2 >= 0);
+    if console.is_some() {
+        note_console_compute(hr2, ppv);
+    }
     if hr2 >= 0 {
         hr2
     } else {
