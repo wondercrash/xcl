@@ -248,6 +248,12 @@ pub(super) fn wrapper_of(pc: *mut c_void) -> Option<*mut c_void> {
     WRAPPER_OF.lock().unwrap().as_ref()?.get(&(pc as usize)).map(|&w| w as *mut c_void)
 }
 
+/// The PC list `wrapper` currently records into (tests drive console slots on it directly).
+#[cfg(test)]
+pub(super) unsafe fn active(wrapper: *mut c_void) -> *mut c_void {
+    *((wrapper as usize + F_BACKING) as *const *mut c_void)
+}
+
 pub(super) unsafe fn has_recorded_work(wrapper: *mut c_void) -> bool {
     *((wrapper as usize + F_RECORDED_WORK) as *const u8) != 0
 }

@@ -215,6 +215,12 @@ pub fn note_rt0(list: usize, handle: usize) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(list, handle);
 }
 
+pub(super) fn forget_list(list: usize) {
+    if let Some(lists) = LISTS.lock().unwrap().as_mut() {
+        lists.remove(&list);
+    }
+}
+
 /// Format the swap chain uses for a back buffer of `f` (None = not presentable).
 pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match f {
@@ -245,6 +251,18 @@ static QUEUES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// The queues the title submitted work to.
 pub fn known_queues() -> Vec<usize> {
     QUEUES.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+pub(super) unsafe fn forget_test_queue(queue: *mut c_void) {
+    let queue = queue as usize;
+    let removed = {
+        let mut queues = QUEUES.lock().unwrap();
+        queues.iter().position(|&q| q == queue).map(|i| queues.swap_remove(i))
+    };
+    if let Some(queue) = removed {
+        release(queue);
+    }
 }
 
 static EXECUTES: AtomicU64 = AtomicU64::new(0);

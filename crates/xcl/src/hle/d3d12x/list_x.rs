@@ -185,6 +185,9 @@ struct PendingWait {
     /// True if this list already recorded a `Write64BitValue*` before this wait (potential
     /// intra-list fork-join where hoisting a GPU wait before list submission could deadlock).
     after_write64: bool,
+    /// A Wait64 GE on a CPU-readable progress value at the start of its PC segment: the queue
+    /// waits on a `wait_gate` the CPU opens once it sees the value, not on another queue.
+    gate: bool,
 }
 
 fn compare_u64(op: u32, lhs: u64, rhs: u64) -> Option<bool> {
@@ -212,6 +215,10 @@ impl PendingWait {
             8 => Some((*(addr as *const AtomicU64)).load(Ordering::Acquire)),
             _ => None,
         }
+    }
+
+    unsafe fn progress_reached(&self) -> bool {
+        self.read_value().is_some_and(|current| current >= self.value)
     }
 
     unsafe fn is_satisfied(&self) -> bool {
@@ -768,6 +775,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
     super::title_textures::list_reset(list);
+    super::present::forget_list(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
         if !old.pending_waits.is_empty() {
@@ -1916,39 +1924,75 @@ pub(super) fn take_cpu_writes_for_test(list: *mut c_void, progress_va: u64) -> V
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
 /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
-/// When `queue` is non-null, monotonic 64-bit waits backed by a recorded `Write64BitValue*` are
-/// bridged to GPU-side `queue.Wait` without blocking the submitter thread on the CPU.
+/// When `queue` is non-null, gated waits (`PendingWait::gate`) become queue-side gates and other
+/// monotonic 64-bit waits backed by a recorded `Write64BitValue*` are bridged to GPU-side
+/// `queue.Wait`, without blocking the submitter thread on the CPU.
 pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
     if lists.is_empty() || PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
         submit(lists);
         return;
     }
-    let per_list: Vec<(Vec<PendingWait>, Vec<(u64, u64)>)> = {
+    let per_list: Vec<(Vec<PendingWait>, Vec<(u64, u64)>, bool)> = {
         let g = LISTS.lock().unwrap();
         lists
             .iter()
             .map(|&l| {
                 g.as_ref()
                     .and_then(|m| m.get(&(l as usize)))
-                    .map(|s| (s.pending_waits.clone(), s.write64_signals.clone()))
+                    .map(|s| (s.pending_waits.clone(), s.write64_signals.clone(), !s.sparse_writes.is_empty()))
                     .unwrap_or_default()
             })
             .collect()
     };
+    let last_sparse = per_list.iter().rposition(|(_, _, sparse)| *sparse);
     let mut start = 0usize;
-    for (i, (waits, list_writes)) in per_list.iter().enumerate() {
+    for (i, (waits, list_writes, _)) in per_list.iter().enumerate() {
         if waits.is_empty() || waits.iter().all(|w| w.is_satisfied()) {
             continue;
         }
         if i > start {
             submit(&lists[start..i]);
         }
-        wait_all_on(queue, waits, list_writes);
+        wait_or_gate(queue, waits, list_writes, last_sparse.is_some_and(|last| last >= i));
         start = i;
     }
     if start < lists.len() {
         submit(&lists[start..]);
     }
+}
+
+/// Wait for `waits` before the list that recorded them goes to `queue`. Gated waits arm a
+/// queue-side gate (`wait_gate`) that the CPU opens once it sees the progress value, so XCL adds
+/// no GPU-to-GPU wait that another queue's later submission could close into a cycle. With
+/// sparse writes at or after the gated list in the same submission, the synchronous sparse
+/// readback would block on this very queue and keep the submitting thread from submitting the
+/// producer on another queue: those waits keep the bounded CPU wait.
+unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)], sparse_after: bool) {
+    let (gated, other): (Vec<PendingWait>, Vec<PendingWait>) = waits.iter().copied().partition(|w| w.gate);
+    wait_all_on(queue, &other, list_writes);
+    let gated: Vec<PendingWait> = gated.into_iter().filter(|w| !w.progress_reached()).collect();
+    if gated.is_empty() {
+        return;
+    }
+    if queue.is_null() || sparse_after {
+        wait_all_on(std::ptr::null_mut(), &gated, list_writes);
+    } else if let Err(reason) = super::wait_gate::arm(queue, move || gated.iter().all(|w| w.progress_reached())) {
+        fail_submission(reason);
+    }
+}
+
+/// The queue may already wait on a gate nothing can open: stop the title rather than run on.
+pub(super) fn fail_submission(reason: String) -> ! {
+    real::stop_if_device_removed();
+    let msg = format!("D3D12.X: cannot submit a progress-wait recording: {reason} – the title is stopped");
+    crate::xlog_error!("{msg}");
+    crate::report::write_final(Some(msg));
+    crate::log::flush();
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        TerminateProcess(GetCurrentProcess(), crate::util::E_FAIL as u32);
+    }
+    std::process::abort()
 }
 
 #[cfg(test)]
@@ -2430,7 +2474,9 @@ unsafe fn try_split_for_wait(list: *mut c_void, after_write64: bool) -> Option<*
 /// `COMMON -> COPY_DEST -> COMMON` barrier around that write already orders subsequent work
 /// on the GPU, so we do not stall before submission (which would deadlock waiting on our own
 /// unsubmitted list). Otherwise split after tracked Write64 signals or before a Wait64 GE that
-/// follows ordinary recorded work, so the wait gates only the continuation.
+/// follows ordinary recorded work, so the wait gates only the continuation. A Wait64 GE on a
+/// progress value the CPU can read that starts its PC segment is gated (`PendingWait::gate`):
+/// the queue waits there for the CPU to see the value, not for another queue's GPU signal.
 unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, value: u64, mask: u64, what: &str) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = width as u64;
@@ -2438,7 +2484,8 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
         return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
     }
     // (the wait reads the memory on the CPU: the title's own memory too, which `cpu_writes` fills)
-    if real::uma_window_buffer(va as usize, width as usize).is_none() && !crate::gpu::shader::readable(va as usize, width as usize) {
+    let in_uma = real::uma_window_buffer(va as usize, width as usize).is_some();
+    if !in_uma && !crate::gpu::shader::readable(va as usize, width as usize) {
         return warn(&N, what, format_args!("{va:#x} is not readable memory"));
     }
     if compare_u64(comparison, 0, 0).is_none() {
@@ -2459,16 +2506,27 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
         }
         let after_write64 = !s.write64_signals.is_empty();
         if !after_write64 && !positional_wait {
-            s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64: false });
+            s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64: false, gate: false });
             return;
         }
         after_write64
     };
-    let target = try_split_for_wait(list, after_write64).unwrap_or(list);
+    let split = try_split_for_wait(list, after_write64);
+    let target = split.unwrap_or(list);
+    // unsplit: the wait still starts its segment when nothing was recorded before it
+    let starts_segment = split.is_some() || (!after_write64 && super::title_list::wrapper_of(list).is_some_and(|w| !super::title_list::has_recorded_work(w)));
     let mut g = LISTS.lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
     let after_write64 = !s.write64_signals.is_empty();
-    s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64 });
+    let gate = positional_wait
+        && starts_segment
+        && mask == u64::MAX
+        && matches!(s.list_type, Some(D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE))
+        && !crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize))
+        && (!in_uma || crate::gpu::shader::readable(va as usize, 8))
+        && s.sparse_writes.is_empty()
+        && (split.is_some() || s.written_ranges.is_empty());
+    s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64, gate });
 }
 
 /// command list #71 Wait32BitValueX(address, comparison, value, mask, flags)
@@ -2792,7 +2850,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     if !waits.is_empty() {
-        wait_all_on(q_raw, &waits, &write64_signals);
+        wait_or_gate(q_raw, &waits, &write64_signals, !sparse_writes.is_empty());
     }
 
     let one = [this];
@@ -3847,6 +3905,10 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 }
 
 #[cfg(test)]
+#[path = "list_x/wait_tests.rs"]
+mod wait_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -3990,6 +4052,7 @@ mod tests {
             value: 0x0000_005A,
             mask: 0x0000_00FF,
             after_write64: false,
+            gate: false,
         };
         unsafe {
             assert!(!w32.is_satisfied());
@@ -4010,6 +4073,7 @@ mod tests {
             value: 0x0000_0002_0000_0000,
             mask: u64::MAX,
             after_write64: false,
+            gate: false,
         };
         unsafe {
             assert!(!w64.is_satisfied());
@@ -4108,6 +4172,7 @@ mod tests {
                 value: 42,
                 mask: u32::MAX as u64,
                 after_write64: false,
+                gate: false,
             });
         }
 
