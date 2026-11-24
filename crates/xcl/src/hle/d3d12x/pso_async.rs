@@ -99,7 +99,7 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
 }
 
 /// A build of `p` on this thread – a worker's (`preload`: by one of the lowest-priority
-/// workers), or a bind's – known to `build_is_wanted`, `dxil_known` and the logs meanwhile: its
+/// workers), or a bind's – known to `build_want`, `dxil_known` and the logs meanwhile: its
 /// pipeline (0 = failed).
 fn build(p: &Arc<Pending>, job: Job, preload: bool) -> usize {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
