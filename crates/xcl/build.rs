@@ -41,4 +41,11 @@ fn main() {
         add(&mut h, &[0]);
     }
     println!("cargo:rustc-env=XCL_TRANSLATOR_SOURCE_ID={h:016x}");
+    // xcl.exe is linked without high-entropy ASLR (#585): with it, `VirtualAlloc(NULL)` lands
+    // above 2^40 and a retail game's XboxBvhBuilder refuses acceleration structures there.
+    match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+        Ok("msvc") => println!("cargo:rustc-link-arg-bin=xcl=/HIGHENTROPYVA:NO"),
+        Ok("gnu") => println!("cargo:rustc-link-arg-bin=xcl=-Wl,--disable-high-entropy-va"),
+        _ => {}
+    }
 }
