@@ -990,12 +990,16 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     // most derived PC interface this object implements
     let chain = layout::chain(kind.base());
     let qi: QiFn = std::mem::transmute(*ot);
-    let release: RefFn = std::mem::transmute(*ot.add(2));
     let mut iface = *chain.last().expect("layout chain");
     for i in &chain {
         let iid = layout::parse_guid(i.iid);
         let mut out = std::ptr::null_mut();
         if qi(obj, &iid, &mut out) >= 0 && !out.is_null() {
+            // released through its own vtable: an object the runtime aggregates answers with
+            // its outer object (DRED's breadcrumb buffer under the debug layer: D3D12Core's
+            // inner resource, whose Release taken as the outer's read a field of the debug
+            // layer's object as a pointer – 0xC0000005 in D3D12Core)
+            let release: RefFn = std::mem::transmute(*vt(out).add(2));
             release(out);
             iface = i;
             break;
