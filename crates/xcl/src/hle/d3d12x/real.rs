@@ -4782,9 +4782,16 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    // for `xcl pipelines`, which compiles them in its own process (`pso_journal`)
+    let journal = match &owned {
+        OwnedDesc::Graphics(d, ..) => super::pso_journal::graphics(d),
+        OwnedDesc::Compute(d, _) => super::pso_journal::compute(d),
+        OwnedDesc::Stream(..) => 0,
+    };
     let job: super::pso_async::Job = Box::new(move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+            super::pso_journal::used(journal);
             out as usize
         } else {
             0
