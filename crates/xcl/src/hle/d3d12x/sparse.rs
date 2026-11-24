@@ -91,11 +91,21 @@ struct TileEntry {
     holes: u16,
     /// per-4 KiB-page hashes of the 64-byte chunks last sent to the GPU (`None` = all zero)
     sent: [Option<Box<[u64; CHUNKS]>>; PAGES_PER_TILE],
+    /// changes whenever a page of the tile is committed or decommitted (`TILE_EPOCH`): a copy
+    /// back recorded before that is stale for this tile (`Readback::land`)
+    epoch: u64,
+}
+
+/// source of `TileEntry::epoch`
+static TILE_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_epoch() -> u64 {
+    TILE_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
 impl TileEntry {
     fn with_holes(pool: (u32, u32), holes: u16) -> Self {
-        Self { pool, holes, sent: std::array::from_fn(|_| None) }
+        Self { pool, holes, sent: std::array::from_fn(|_| None), epoch: next_epoch() }
     }
 }
 
@@ -162,6 +172,9 @@ fn decommit_tiles(
                     newly_holed |= bit;
                 }
                 p += PAGE;
+            }
+            if newly_holed != 0 {
+                entry.epoch = next_epoch();
             }
             if entry.holes == 0xFFFF {
                 unmapped.push(t);
@@ -1135,7 +1148,8 @@ impl State {
         }
         let (fence, value) = self.queue_rb.get_mut(&q)?;
         *value += 1;
-        let job = Readback { queue: q, fence: fence.clone(), value: *value, buf, parts, _list: (alloc, list) };
+        let epochs = parts.iter().map(|&(va, _, _)| self.mapped.get(&(va & !(TILE - 1))).map_or(0, |e| e.epoch)).collect();
+        let job = Readback { queue: q, fence: fence.clone(), value: *value, buf, parts, epochs, _list: (alloc, list) };
         execute_own(queue, &l);
         if super::breadcrumbs::labelled(|| "sparse readback signal".to_owned(), || queue.Signal(&job.fence, job.value)).is_err() {
             // nothing tells when the copy is done: its buffer and list stay alive for good
@@ -1389,6 +1403,8 @@ struct Readback {
     buf: ID3D12Resource,
     /// (address, offset in `buf`, bytes)
     parts: Vec<(usize, usize, usize)>,
+    /// `TileEntry::epoch` of each part's tile when the copy was recorded
+    epochs: Vec<u64>,
     /// in use by the GPU until `fence` reaches `value`
     _list: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
 }
@@ -1419,7 +1435,13 @@ impl Readback {
         let mapped = self.fence.GetCompletedValue() != u64::MAX && self.buf.Map(0, None, Some(&mut p)).is_ok();
         if let Some(s) = STATE.lock().unwrap().as_mut() {
             if mapped {
-                s.copy_back(p as *const u8, &self.parts);
+                // only tiles nobody committed or decommitted a page of since: the copy of one
+                // decommitted (parked, unmapped, or committed again and cleared) is stale
+                let parts: Vec<(usize, usize, usize)> = self.parts.iter().zip(&self.epochs)
+                    .filter(|&(&(va, _, _), &epoch)| s.mapped.get(&(va & !(TILE - 1))).is_some_and(|e| e.epoch == epoch))
+                    .map(|(&part, _)| part)
+                    .collect();
+                s.copy_back(p as *const u8, &parts);
             }
             if let Some(n) = s.unlanded.get_mut(&self.queue) {
                 *n = n.saturating_sub(1);
@@ -1531,9 +1553,13 @@ impl State {
             let tile_end = t.saturating_add(TILE).min(end);
             if let Some(entry) = self.mapped.get_mut(&t) {
                 let mut p = pg;
+                let before = entry.holes;
                 while p < tile_end {
                     entry.holes &= !(1u16 << ((p - t) / PAGE));
                     p += PAGE;
+                }
+                if entry.holes != before {
+                    entry.epoch = next_epoch();
                 }
             }
             if tile_end <= pg {
@@ -2223,6 +2249,27 @@ mod tests {
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
+    }
+
+    /// A copy back of a gated queue lands only on tiles whose pages nobody committed or
+    /// decommitted since it was recorded (`TileEntry::epoch`): a page decommitted (and cleared)
+    /// in between changes the tile's epoch; a decommit of nothing new does not.
+    #[test]
+    fn a_page_decommitted_changes_its_tiles_epoch() {
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let pinned: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+        let (mut free, mut to_zero) = (Vec::new(), Vec::new());
+        let t = 0x20_0000usize;
+        mapped.insert(t, TileEntry::with_holes((0, 1), 0));
+        let other = TileEntry::with_holes((0, 2), 0).epoch;
+        let recorded = mapped[&t].epoch;
+        assert_ne!(recorded, other, "every new tile entry has its own epoch");
+        decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t + PAGE, PAGE);
+        let after = mapped[&t].epoch;
+        assert_ne!(after, recorded, "a decommitted page makes an earlier copy back stale");
+        assert_eq!(to_zero, vec![(t + PAGE, PAGE)], "the page is still cleared");
+        decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t + PAGE, PAGE);
+        assert_eq!(mapped[&t].epoch, after, "decommitting a hole again changes nothing");
     }
 
     /// Sub-tile decommits (two 32 KiB halves, sixteen 4 KiB pages, or decommitting the last
