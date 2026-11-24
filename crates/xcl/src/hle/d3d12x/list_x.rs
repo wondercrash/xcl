@@ -804,6 +804,8 @@ pub(super) fn on_release(list: usize) {
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
     super::title_textures::list_reset(list);
+    // (a spare holds no recording: only its submitted work still holds the PC allocator)
+    super::alloc_pool::forget_list(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
@@ -2697,14 +2699,22 @@ unsafe fn try_split_for_wait(list: *mut c_void, after_write64: bool) -> Option<*
     }
     let next_pc = match next_pc {
         Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
-            Some(p) => p,
-            None => {
-                static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
-                warn(&CREATE_ERR, "Wait64 mid-list split", format_args!("CreateCommandList failed"));
-                return None;
+        None => {
+            let backing = super::alloc_pool::current(alloc);
+            match real::create_raw_pc_command_list(dev.as_raw(), ty, backing, init_pso) {
+                Some(p) => {
+                    // (its recording holds the PC allocator like any list's: the segment after
+                    // a wait is submitted on its own, and waits in the queue)
+                    super::alloc_pool::created_on(p as usize, backing, ty.0);
+                    p
+                }
+                None => {
+                    static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
+                    warn(&CREATE_ERR, "Wait64 mid-list split", format_args!("CreateCommandList failed"));
+                    return None;
+                }
             }
-        },
+        }
     };
 
     let old_next = {
@@ -6633,6 +6643,11 @@ mod tests {
                 assert_ne!(segs_c[1], pc_c0);
                 if frame == 1 {
                     first_seg1 = segs_c[1];
+                    assert_eq!(
+                        super::super::alloc_pool::recording_backing(first_seg1 as usize),
+                        Some(a_comp.as_raw() as usize),
+                        "a segment made at the split holds the PC allocator it records on"
+                    );
                 } else {
                     assert_eq!(segs_c[1], first_seg1, "frame 2 split must reuse spare PC command list");
                 }
