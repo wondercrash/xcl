@@ -6,10 +6,8 @@
 fn retail_chunks_match_the_reference() {
     let Some(dir) = std::env::var_os("XCL_SAMPLE_BCPACK") else { return };
     let dir = std::path::Path::new(&dir);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        eprintln!("no cases at {}", dir.display());
-        return;
-    };
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("XCL_SAMPLE_BCPACK {}: {e}", dir.display()));
     let mut cases = 0;
     let mut identical = 0;
     let mut bad_bytes = 0u64;

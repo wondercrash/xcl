@@ -1,6 +1,8 @@
 //! BCPack: lossless packing of BC1-BC7 block streams, as the console's
 //! DirectStorage hardware unpacks them. Decode only; BC2 is left out (no
-//! title data uses it). Ported from VIctory's victory-formats/src/bcpack.rs on 2026-11-23.
+//! title data uses it). Ported from VIctory's victory-formats/src/bcpack.rs on 2026-11-23
+//! (https://github.com/Marvisak/VIctory, GPL-3.0; used here under GPL-2.0-only with its
+//! author's permission, see THIRD_PARTY.md).
 //!
 //! A packed stream has no header. It is 12 or 16 interleaved rANS *lanes*;
 //! each lane is a run of fragments (header byte, length, payload) coded with
@@ -105,14 +107,7 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         return Err(Error("destination is not a whole number of blocks"));
     }
     let blocks = dst.len() / block;
-    let (widths, per): (&[u8], usize) = match bc {
-        1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
-        3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
-        4 => (&[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
-        5 => (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
-        6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
-        _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
-    };
+    let (widths, per) = lane_layout(bc);
     let stride = widths.len() * per;
     let mut records = vec![0u8; blocks * stride];
     let mut next = src.iter().copied();
@@ -131,6 +126,28 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
 }
 
 // Lanes.
+
+/// Format `bc`'s lanes (symbol bits - 1 of each) and the symbols each lane gives per block.
+fn lane_layout(bc: u8) -> (&'static [u8], usize) {
+    match bc {
+        1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
+        3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
+        4 => (&[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
+        5 => (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
+        6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
+        _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
+    }
+}
+
+/// The lane stage alone (tests): the records of `blocks` blocks of format `bc` in `src`.
+#[cfg(test)]
+pub(super) fn records(bc: u8, src: &[u8], blocks: usize) -> Result<(Vec<u8>, usize, usize), Error> {
+    let (widths, per) = lane_layout(bc);
+    let mut records = vec![0u8; blocks * widths.len() * per];
+    let mut next = src.iter().copied();
+    lanes(Tables::builtin(), widths, per, blocks, |_| next.next(), &mut records)?;
+    Ok((records, widths.len(), per))
+}
 
 #[derive(Clone, Copy, Default)]
 struct Lane {

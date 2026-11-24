@@ -41,7 +41,7 @@ impl std::fmt::Display for Error {
 }
 
 /// The bytes of one block of `mode`.
-fn block_size(mode: u8) -> Option<usize> {
+pub fn block_size(mode: u8) -> Option<usize> {
     Some(match mode {
         1 | 4 => 8,
         3 | 5 | 6 | 7 => 16,

@@ -730,12 +730,7 @@ impl Request {
     }
 
     /// What a queue of `source_memory` refuses at enqueue.
-    #[cfg(test)]
     fn check(&self, source_memory: bool) -> Result<(), HRESULT> {
-        self.check_with_bc1(source_memory)
-    }
-
-    fn check_with_bc1(&self, source_memory: bool) -> Result<(), HRESULT> {
         if self.memory_source() != source_memory || (self.source_physical_pages() && !self.memory_source()) {
             return Err(E_SOURCE_TYPE);
         }
@@ -787,8 +782,10 @@ impl Request {
                 }
             }
         }
-        if self.bcpack() == 1 && (self.destination_size == 0 || self.destination_size % 8 != 0) {
-            return Err(E_DESTINATION_SIZE);
+        if let Some(block) = super::bcpack::block_size(self.bcpack()) {
+            if self.destination_size == 0 || self.destination_size as usize % block != 0 {
+                return Err(E_DESTINATION_SIZE);
+            }
         }
         Ok(())
     }
@@ -1304,7 +1301,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         return;
     }
     let r = Request::parse(&*(req as *const [u8; REQUEST_BYTES]));
-    if let Err(hr) = r.check_with_bc1(q.source_memory) {
+    if let Err(hr) = r.check(q.source_memory) {
         warn_once("EnqueueRequest", format_args!("refused ({hr:#x}): {r:x?}"));
         let mut fill = None;
         if hr == E_DECOMPRESSION && r.bcpack() != 0 {
@@ -1540,7 +1537,10 @@ mod tests {
         let mem = Request::parse(&request(SOURCE_MEMORY_BIT | 1, 0x1000, 64, 0x2000, 0x99, 20));
         assert_eq!((mem.offset, mem.check(true)), (0, Ok(())), "a memory source has no offset");
         assert_eq!(Request::parse(&request(1, 0x1000, 20, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request(5, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack BC2");
+        assert_eq!(Request::parse(&request(2 << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack BC2");
+        assert_eq!(Request::parse(&request(6 << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20)).check(false), Ok(()), "BCPack BC6H");
+        assert_eq!(Request::parse(&request(7 << BCPACK_SHIFT, 0x1000, 24, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC7 part block");
+        assert_eq!(Request::parse(&request(4 << BCPACK_SHIFT, 0x1000, 12, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC4 part block");
         assert_eq!(Request::parse(&request(0, 0, 64, 0x2000, 0, 64)).check(false), Err(E_ACCESS_VIOLATION));
     }
 
@@ -1757,6 +1757,7 @@ mod tests {
         // Validation matrix for Request::check
         let bc1 = 1u64 << BCPACK_SHIFT;
         let bc2 = 2u64 << BCPACK_SHIFT;
+        let bc6h = 6u64 << BCPACK_SHIFT;
         let swiz = 1u64 << SWIZZLE_SHIFT;
 
         // Zlib only with valid intermediate_size (== dst and < dst)
@@ -1765,13 +1766,15 @@ mod tests {
         // Zlib only with invalid intermediate_size (<= src or > dst)
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 128, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 64, 0x2000, 0, 20, 96, 0)).check(false), Err(E_DESTINATION_SIZE));
-        // Two-stage zlib + BCPack: valid sizes -> E_DECOMPRESSION without a decoder for the mode, invalid intermediate -> E_DESTINATION_SIZE
+        // Two-stage zlib + BCPack: valid sizes -> Ok for a mode with a decoder, E_DECOMPRESSION for BC2; invalid intermediate -> E_DESTINATION_SIZE
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc6h, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Ok(()));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc2, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Ok(()));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc2, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc2, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
-        // Single-stage BCPack: intermediate must be 0, then E_DECOMPRESSION without a decoder for the mode
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc6h, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc6h, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
+        // Single-stage BCPack: intermediate must be 0, then E_DECOMPRESSION for BC2
+        assert_eq!(Request::parse(&request_ex(bc6h, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Ok(()));
         assert_eq!(Request::parse(&request_ex(bc2, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
         assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Ok(()));
         assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
@@ -2373,14 +2376,22 @@ mod tests {
             }
         }
         // Bytes that are not a stream: the queue's answer is the decoder's.
+        let mut attempts = 0u64;
         let mut failures = 0;
         for src in [junk[..junk.len() / 2].to_vec(), junk.clone()] {
+            attempts += 1;
             let dst: usize = if src.len() == junk.len() { 136 } else { 128 };
             let blocks = crate::hle::bcpack::decode(1, &src, dst);
             failures += u64::from(blocks.is_err());
             let status = if blocks.is_ok() { S_OK } else { E_DECOMPRESSION };
             cases.push((bc1, src, dst, 0, status, blocks.ok()));
         }
+        // one byte cannot hold a block, whatever the stream says
+        let one = vec![0xFFu8];
+        assert!(crate::hle::bcpack::decode(1, &one, 8).is_err(), "a one-byte stream is not a block");
+        cases.push((bc1, one, 8, 0, E_DECOMPRESSION, None));
+        attempts += 1;
+        failures += 1;
         // control: the same bytes without the BCPack stage are copied, not decoded
         cases.push((SOURCE_MEMORY_BIT, junk[..128].to_vec(), 128, 0, S_OK, Some(junk[..128].to_vec())));
         unsafe {
@@ -2425,7 +2436,7 @@ mod tests {
                 assert!(dst[c.2..].iter().all(|&b| b == 0xCD), "request {i}: nothing past the destination size");
             }
             let after = stats().bcpack_unpacked["BC1"].clone();
-            assert_eq!(after.requests - before.requests, unpacked + 2 - failures);
+            assert_eq!(after.requests - before.requests, unpacked + attempts - failures);
             assert_eq!(after.failed - before.failed, failures);
             queue_close(q);
             queue_release(q);
@@ -2435,6 +2446,9 @@ mod tests {
 
     #[test]
     fn a_refused_bcpack_request_is_filled_only_under_the_switch() {
+        if bcpack_fill_from_env() {
+            return; // the switch starts on, so there is nothing to turn on
+        }
         unsafe {
             let mut f = std::ptr::null_mut();
             assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
@@ -2468,7 +2482,7 @@ mod tests {
                 }
                 hresult(s, index)
             };
-            // a BC6H destination of 0x1008 bytes (a part block at the end), then guard bytes
+            // a BC2 destination of 0x1008 bytes, then guard bytes
             let n = 0x1008usize;
             let mut dst = vec![0xCDu8; n + 64];
             assert!(!queue(q).bcpack_fill.load(Ordering::Relaxed), "off unless XCL_DSTORAGE_BCPACK_FILL is set");
@@ -2479,7 +2493,7 @@ mod tests {
             let before = BCPACK.filled_bytes[2].load(Ordering::Relaxed);
             assert_eq!(run(&mut dst, n as u32, 1), E_DECOMPRESSION, "the fill does not change the status");
             let block = bcpack_fill_block(2).unwrap();
-            assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC6H blocks up to the destination size");
+            assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC2 blocks up to the destination size");
             assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
             assert!(BCPACK.filled_bytes[2].load(Ordering::Relaxed) >= before + n as u64);
             queue_close(q);
