@@ -28,11 +28,14 @@
 //! the first mark not passed and the call or op the GPU is in (shaders by their
 //! `XCL_DUMP_SHADERS` dump names; an ExecuteIndirect there with its arguments, group or draw
 //! counts the GPU made: as the CPU sees them and as the GPU reads them now, in their buffer
-//! and in the memory window). A logged queue that moves on again is logged too (a long op,
-//! not a hang). `XCL_STALL_REMOVE_S=N`: once a queue has stood still N s (at least the 3 s of
-//! its report), every queue's lists in flight are logged with what each got to by its marks,
-//! then the device is removed and the run ends. (DRED, `XCL_DRED=1`, reports no command list
-//! after a removal by `RemoveDevice`, even one held behind a queue wait: `real::dred_tests`.)
+//! and in the memory window). With those reports, the marks on any list whose start the GPU
+//! wrote and whose end it did not are logged: what it works on, whatever the queue (none: it
+//! is busy with work that is not an op of console code). A logged queue that moves on again
+//! is logged too (a long op, not a hang). `XCL_STALL_REMOVE_S=N`: once a queue has stood still
+//! N s (at least the 3 s of its report), every queue's lists in flight are logged with what
+//! each got to by its marks, then the device is removed and the run ends. (DRED, `XCL_DRED=1`,
+//! reports no command list after a removal by `RemoveDevice`, even one held behind a queue
+//! wait: `real::dred_tests`.)
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -777,7 +780,7 @@ fn report() {
     // (queue, mark it stood at, mark it is at now, reports it stood)
     let mut moved: Vec<(usize, u64, u64, u32)> = Vec::new();
     let mut remove: Option<(usize, u32)> = None;
-    let stuck: Vec<Stuck> = {
+    let (stuck, running) = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
         let mut out = Vec::new();
@@ -842,7 +845,19 @@ fn report() {
                 skips,
             });
         }
-        out
+        // with a queue newly logged: the marks the GPU has started and not finished, on any
+        // list and queue (a stuck queue's line names only its own event's marks)
+        let running: Option<Vec<(OpView, Option<(usize, u64)>)>> = (!out.is_empty()).then(|| {
+            started_not_finished(&s.entries, |slot, k| s.word(slot, k))
+                .into_iter()
+                .map(|id| {
+                    let view = s.view(id);
+                    let at = s.recordings.get(&view.list).and_then(|r| r.last);
+                    (view, at)
+                })
+                .collect()
+        });
+        (out, running)
     };
     for (q, from, to, reports) in moved {
         if LOGGED.fetch_add(1, Ordering::Relaxed) < 256 {
@@ -887,12 +902,43 @@ fn report() {
             crate::xlog_warn!("{line}");
         }
     }
+    if let Some(running) = running {
+        let shown: Vec<String> = running
+            .iter()
+            .take(SHOWN)
+            .map(|(o, at)| match at {
+                Some((q, n)) => format!("{} on list {:#x} ({} event #{n})", o.text(), o.list, super::list_x::queue_label(*q)),
+                None => format!("{} on list {:#x} (no queue event known)", o.text(), o.list),
+            })
+            .collect();
+        let line = if running.is_empty() {
+            "D3D12.X: breadcrumbs: no mark on any list has its start written without its end: no op of console code is running on the GPU (what keeps it busy is XCL's own work, a list without marks, or work that is not an op of console code)".to_owned()
+        } else {
+            format!("D3D12.X: breadcrumbs: marks the GPU started and has not finished, on any list: {} [{}]", running.len(), shown.join("; "))
+        };
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 256 {
+            crate::xlog_warn!("{line}");
+        }
+    }
     if let Some((q, secs)) = remove {
         static REMOVED: AtomicBool = AtomicBool::new(false);
         if !REMOVED.swap(true, Ordering::AcqRel) {
             remove_device(q, secs);
         }
     }
+}
+
+/// Ids of the marks in `entries` (slot = index, the ring of `Crumbs`) whose start the GPU wrote
+/// (`word(slot, 0)`) and whose end it did not (`word(slot, 1)`): an op running, or a call mark
+/// whose work before it is running. Skipped ops wrote neither.
+fn started_not_finished(entries: &[Option<Entry>], word: impl Fn(usize, usize) -> u32) -> Vec<u32> {
+    let mut ids: Vec<u32> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, e)| e.as_ref().filter(|e| e.gpu && word(slot, 0) == e.id && word(slot, 1) != e.id).map(|e| e.id))
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 #[cfg(test)]
@@ -1115,6 +1161,19 @@ mod tests {
         // a skipped op at the end of the first list recorded nothing: still between the lists
         let ops = [on(0x10, mark(1, "passed", true)), on(0x10, mark(2, "skipped", false)), on(0x20, mark(3, "not started", false))];
         assert!(culprit(&ops).unwrap().starts_with("the GPU is between lists: past the last mark of list 0x10, #1 "));
+    }
+
+    /// The marks started and not finished are found on any list: an op running and a call mark
+    /// whose work before it runs; not one done, one not started, a skipped op (it wrote
+    /// nothing) or a slot whose words are an older mark's.
+    #[test]
+    fn the_marks_the_gpu_started_and_has_not_finished_are_found_on_any_list() {
+        let entry = |id: u32, gpu: bool, call: bool, list: usize| Some(Entry { id, pso: 0, what: String::new(), gpu, call, list, args: 0, args_buf: (0, 0) });
+        let entries = [None, entry(1, true, false, 0x10), entry(2, true, false, 0x10), entry(3, true, true, 0x20), entry(4, true, false, 0x30), entry(5, false, false, 0x30), entry(6, true, false, 0x40)];
+        // (start, end) words of each slot: 1 done, 2 running, 3 reached, 4 not started, 5 skipped,
+        // 6's slot still holds another mark's start
+        let words: [[u32; 2]; 7] = [[0, 0], [1, 1], [2, 0], [3, 0], [0, 0], [0, 0], [9, 0]];
+        assert_eq!(started_not_finished(&entries, |slot, k| words[slot][k]), vec![2, 3]);
     }
 
     /// At a removal each list of the event is named with what it got to.
