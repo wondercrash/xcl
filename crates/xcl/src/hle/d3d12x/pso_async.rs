@@ -740,7 +740,8 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>, huge: Optio
 }
 
 /// The build of `p` a bind would run on its own thread, on a new thread instead (named so that it
-/// takes no big-compile slot, as on the binding thread): whether one was started.
+/// takes its turn like a worker's, `real::big_compile_turn`: at once while its bind waits, at its
+/// lane once binds go on without it): whether one was started.
 fn build_aside(p: &Arc<Pending>) -> bool {
     let p = p.clone();
     std::thread::Builder::new()
