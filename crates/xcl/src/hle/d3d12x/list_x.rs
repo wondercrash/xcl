@@ -106,7 +106,7 @@ unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
     pc::<unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE>(list, PC_GET_TYPE)(list)
 }
 
-unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
+pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
