@@ -1558,12 +1558,12 @@ impl Em {
             }
         }
         // split wave64, a coherent load (GLC / DLC: memory other waves may be writing): both
-        // halves take the lower half's values, so they cannot see two different ones. With
-        // group barriers every scalar load does: memory written during the dispatch is the
-        // only thing that could make the halves' scalar values (and so their branches and
-        // barriers) differ
+        // halves take the lower half's values, so they cannot see two different ones. In a
+        // group of one console wave every scalar load does: memory written during the dispatch
+        // is the only thing that could make the halves' scalar values (and so their branches
+        // and, in the group-barrier form, their barriers) differ
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
-        if self.x64() && (coherent || !self.x64_spin()) {
+        if self.x64() && (coherent || self.x64_threads() <= 64) {
             self.x64_words = self.x64_words.max(vals.len());
             for (i, v) in vals.iter().enumerate() {
                 self.line(&format!("xcl_x_put({i}u, {v});"));
@@ -4200,14 +4200,17 @@ impl Em {
         }
     }
 
-    /// Split wave64: whether the pairs meet through bounded arrival counters (`XCL_X_SPIN 1`:
-    /// several console waves per group, or `XCL_WAVE64_SPIN=1`) instead of group barriers. A
-    /// group of one console wave is its two halves, which take the same branches as long as
-    /// their scalar values agree: masks and lane reads are exchanged, and in this form every
-    /// scalar load is too (`smem`), so memory written during the dispatch cannot give the
-    /// halves different values, and both reach every barrier. The counters' wait loop at each
-    /// of a program's exchanges is what costs: the NVIDIA driver took twice as long on them
-    /// (a 1/8 part of a retail CS with 845 exchanges: 32 s against 16 s).
+    /// Split wave64: whether the pairs meet through bounded arrival counters (`XCL_X_SPIN 1`)
+    /// whatever the program's size: several console waves per group, or `XCL_WAVE64_SPIN=1`.
+    /// A group of one console wave is its two halves, which take the same branches as long as
+    /// their scalar values agree: masks and lane reads are exchanged, and in such a group
+    /// every scalar load is too (`smem`), so memory written during the dispatch cannot give
+    /// the halves different values, and both reach every barrier. The counters' wait loop at
+    /// each of a program's exchanges is what costs: the NVIDIA driver took twice as long on
+    /// them (a 1/8 part of a retail CS with 845 exchanges: 32 s against 16 s). So one-wave
+    /// programs of `FLAT_WINDOW_LOADS_FROM` bytes of HLSL or more meet at group barriers
+    /// (`finish`); smaller ones keep the counters, whose failure (a desynchronised pair) is
+    /// bounded garbage rather than a dispatch that never ends.
     fn x64_spin(&self) -> bool {
         self.x64_threads() > 64 || std::env::var("XCL_WAVE64_SPIN").is_ok_and(|v| v.trim() == "1")
     }
@@ -4739,6 +4742,11 @@ impl Em {
                 }
                 h.push_str("    return xo;\n}\n");
             }
+        }
+        if self.x64() && !self.x64_spin() && h.len() < FLAT_WINDOW_LOADS_FROM {
+            // a small one-wave program keeps the bounded counters (`x64_spin`); the define is
+            // one line of the prelude, so its size (and the size gate) is the same either way
+            h = h.replacen("\n#define XCL_X_SPIN 0\n", "\n#define XCL_X_SPIN 1\n", 1);
         }
         if windows > 1 {
             // compute passes (CS, and the MS / GS compute passes) only: the driver times were

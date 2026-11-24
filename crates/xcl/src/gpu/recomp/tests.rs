@@ -6183,16 +6183,22 @@ fn gpu_split_wave64_waves_diverge() {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
         ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
     ]);
-    for dims in [[256u32, 1, 1], [64, 1, 1], [8, 8, 4], [16, 4, 1]] {
+    // one-wave groups also in the group-barrier form (of programs of 1 MiB of HLSL or more)
+    for (dims, barrier) in [([256u32, 1, 1], false), ([64, 1, 1], false), ([64, 1, 1], true), ([8, 8, 4], false), ([16, 4, 1], false), ([16, 4, 1], true)] {
         let threads = dims.iter().product::<u32>();
         let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
         let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         if runner::split_wave64() && std::env::var_os("XCL_WAVE64_SPIN").is_none() {
-            let spin = if threads > 64 { "#define XCL_X_SPIN 1" } else { "#define XCL_X_SPIN 0" };
-            assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains(spin), "{dims:?}");
+            // a small program: counters whatever the group
+            assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("\n#define XCL_X_SPIN 1\n"), "{dims:?}");
         }
-        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        if barrier && !runner::split_wave64() {
+            continue;
+        }
+        let hlsl = if barrier { t.hlsl.replacen("\n#define XCL_X_SPIN 1\n", "\n#define XCL_X_SPIN 0\n", 1) } else { t.hlsl.clone() };
+        assert!(threads <= 64 || !barrier);
+        let dxil = dxc::compile(&hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
         let base = 0x100usize;
         let mut io = vec![0u32; 128];
         io[0] = base as u32;

@@ -42,7 +42,7 @@ whole-wave:
 | `v_readlane`, `v_readfirstlane` (lane index uniform) | one word: each half gives the value of lane `l & 31`, the half that owns `l` wins |
 | `ds_bpermute` (any lane) | 32 words: each half gives its lanes |
 | DPP16, DPP8, `ds_swizzle`, `v_permlane(x)16` | none: the ISA keeps them inside a 32-lane half (`WaveReadLaneAt(v, l & 31)`) |
-| `s_load*` / `s_buffer_load*` with GLC (or DLC) | up to 16 words: half 0's values for both (memory another wave writes may change between the two halves' loads; without GLC the console's scalar cache is not coherent either, so plain loads are read by both halves) |
+| `s_load*` / `s_buffer_load*` with GLC (or DLC), and every one in a group of one console wave | up to 16 words: half 0's values for both (memory another wave writes may change between the two halves' loads; without GLC the console's scalar cache is not coherent either, so in groups of several console waves plain loads are read by both halves) |
 
 So both halves hold the full 64-bit EXEC / VCC / masks and identical SGPRs; every branch is
 taken the same way by both, and the existing scalar code (`s_bcnt1_i32_b64`, `s_ff1`,
@@ -51,21 +51,26 @@ SGPRs of both halves and the tests fail if they ever differ.
 
 ### Synchronisation
 
-* **One console wave per group** (≤ 64 threads: kernel mode, most compute, ES+GS):
-  `GroupMemoryBarrierWithGroupSync` between writing and reading the slot. All hardware
-  waves of the group are the two halves of the same console wave, which execute the same
-  sequence of exchanges, so every barrier is reached by both. In this form every scalar
-  load is exchanged (half 0's values), so not even memory written during the dispatch can
-  give the halves different scalar values (see hazards). Portable (no forward-progress
-  assumption) and cheap, also for the NVIDIA driver's compiler: the spin's wait loop at
-  every exchange doubled its compile time of big wave64 programs.
-* **Several console waves per group** (mesh: 128 threads, compute > 64 threads): a group
-  barrier would also wait for the *other* console waves, whose control flow may differ (wave
-  index, per-wave data). Each pair instead meets through groupshared arrival counters:
-  every lane stores its slot word(s) and fences (`GroupMemoryBarrier`); the wave's lane
-  count (`WaveActiveCountBits` – a wave operation, so all its lanes have fenced) goes into
-  its half's counter in one atomic; one lane waits until the partner's counter reaches
-  `lanes × (k + 1)` (k = exchange number, identical in both halves) and the others take its
+* **One console wave per group** (≤ 64 threads: kernel mode, most compute, ES+GS) **with
+  1 MiB of HLSL or more** (the size from which compute programs also read their memory
+  windows without a switch): `GroupMemoryBarrierWithGroupSync` between writing and reading
+  the slot. All hardware waves of the group are the two halves of the same console wave,
+  which execute the same sequence of exchanges, so every barrier is reached by both. In a
+  group of one console wave every scalar load is exchanged (half 0's values, whatever the
+  form), so not even memory written during the dispatch can give the halves different
+  scalar values (see hazards). Portable (no forward-progress assumption) and cheap, also for
+  the NVIDIA driver's compiler: the spin's wait loop at every exchange doubled its compile
+  time of big wave64 programs. Smaller one-wave programs keep the arrival counters below:
+  they compile fast either way, and if a pair did desynchronise, the counters end in
+  garbage where a barrier would never end the dispatch.
+* **Several console waves per group** (mesh: 128 threads, compute > 64 threads), and one-wave
+  programs under 1 MiB of HLSL: a group barrier would also wait for the *other* console
+  waves, whose control flow may differ (wave index, per-wave data). Each pair instead meets
+  through groupshared arrival counters: every lane stores its slot word(s) and fences
+  (`GroupMemoryBarrier`); the wave's lane count (`WaveActiveCountBits` – a wave operation,
+  so all its lanes have fenced) goes into its half's counter in one atomic; one lane waits
+  until the partner's counter reaches `lanes × (k + 1)` (k = exchange number, identical in
+  both halves) and the others take its
   verdict (`WaveReadLaneFirst`); a fence, then the read. Slots are double-buffered by the
   parity of k: the partner can be at most one exchange ahead, so it never overwrites the
   slot being read. The wait is bounded (2^20 polls): if it ever runs out (a desynchronised
@@ -82,7 +87,7 @@ GS phase of ES+GS runs in the lower half only (≤ 21 primitives), likewise with
 ### Memory
 
 The exchange needs groupshared space: per console wave 2 counters + 2 halves × 2 parities ×
-slot (1 word, 16 with wide GLC scalar loads, 32 with `ds_bpermute`). Without console LDS it
+slot (1 word, 16 with wide scalar loads, 32 with `ds_bpermute`). Without console LDS it
 has arrays of its own; with LDS (`xcl_lds`, already the full 32 KB D3D12 limit) it lives in
 the top of the LDS block (as PR #33 did), and the program's LDS accesses are clamped below
 it. A program that really uses the whole 32 KB of LDS therefore loses its top dwords on a
@@ -92,19 +97,21 @@ it. A program that really uses the whole 32 KB of LDS therefore loses its top dw
 
 1. **Divergent halves** – anything that lets the two halves compute different scalar values
    desynchronises the exchanges. Covered: masks and lane reads (exchanged), GLC scalar loads
-   (half 0's value), `s_memtime` (constant 0), and with group barriers every other scalar
-   load too. With arrival counters non-GLC scalar loads of memory that changes during the
-   dispatch are not exchanged (incoherent on the console as well); the bounded wait covers
-   a pair they desynchronise.
+   and every scalar load in a group of one console wave (half 0's value), `s_memtime`
+   (constant 0). In groups of several console waves (arrival counters) non-GLC scalar loads
+   of memory that changes during the dispatch are not exchanged (incoherent on the console
+   as well); the bounded wait covers a pair they desynchronise.
 2. **Barriers in divergent control flow** – the barrier variant is only used when the group
-   is exactly one console wave, whose control flow is identical in both halves; console
-   `s_barrier` stays a group barrier (all console waves reach it, as on the console). The GS
-   phase (lower half only) has no exchanges and its `s_barrier` is dropped (one wave).
+   is exactly one console wave (and the program is big), whose control flow is identical in
+   both halves; console `s_barrier` stays a group barrier (all console waves reach it, as on
+   the console). The GS phase (lower half only) has no exchanges and its `s_barrier` is
+   dropped (one wave).
 3. **Lane numbering** – handled by `xcl_x_thread` (see above); NVIDIA really does form waves
    of non-consecutive thread indices for 3-D groups (`gpu_split_wave64_waves_diverge` fails
    without the remap).
 4. **`WaveReadLaneAt` with a per-lane index** – used inside a half as before.
-5. **Forward progress** – only the multi-wave variant spins; see above.
+5. **Forward progress** – only the counters spin (multi-wave groups, small one-wave
+   programs); see above.
 
 ### Masks read lane by lane
 
