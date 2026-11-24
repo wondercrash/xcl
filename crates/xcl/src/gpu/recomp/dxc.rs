@@ -493,16 +493,47 @@ const HUGE_HLSL: usize = 8 * 1024 * 1024;
 /// of CPU and 3.4 GB (9.5 MB DXIL instead of 20 MB). -O0 stays only for enormous programs in
 /// the `pc` dispatcher form (`uint pc`, unstructured control flow), where DXC's loop passes
 /// blow up: a 76 696-instruction one had not finished -O1 or -O3 after 13 CPU-minutes.
-/// -O0 also past `O1_MAX_HLSL`, structured or not.
+/// -O0 also past `O1_MAX_HLSL`, structured or not, and for structured programs whose loops nest
+/// deeper than `O1_MAX_LOOP_NEST`.
 fn default_level(src: &str) -> Option<&'static str> {
     if src.len() > HUGE_HLSL {
-        Some(if src.len() > O1_MAX_HLSL || src.contains("\n    uint pc = ") { "-O0" } else { "-O1" })
+        Some(if src.len() > O1_MAX_HLSL || src.contains("\n    uint pc = ") || loop_nest(src) > O1_MAX_LOOP_NEST { "-O0" } else { "-O1" })
     } else if src.len() > 1024 * 1024 {
         Some("-O1")
     } else {
         None
     }
 }
+
+/// Deepest nest of `[loop]`s in translated HLSL, by braces (the translator opens a loop's body on
+/// its `[loop]` line).
+fn loop_nest(src: &str) -> usize {
+    let (mut depth, mut open, mut deepest) = (0usize, Vec::new(), 0);
+    for line in src.lines() {
+        let l = line.trim_start();
+        if l.starts_with("[loop]") {
+            open.push(depth);
+        }
+        for b in l.split("//").next().unwrap_or("").bytes() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        while open.last().is_some_and(|&d| depth <= d) {
+            open.pop();
+        }
+        deepest = deepest.max(open.len());
+    }
+    deepest
+}
+
+/// Structured HLSL whose loops nest deeper than this is not optimised: DXC -O1 of the 18.9 MB
+/// HLSL of a 76 699-instruction CS (ScreenProbes_ActivateRays) with loops 65 deep had not finished
+/// after 9 CPU-minutes (-O0: 93 s, 9.8 MB DXIL), while the 20.8 MB of an 88 863-instruction one
+/// with loops 1 deep took 40 s.
+const O1_MAX_LOOP_NEST: usize = 16;
 
 /// Structured HLSL past this size is not optimised either: a retail program's 154 MB (5.7 M
 /// short-circuit `||` terms in its skip guards) is far past what -O1 was measured on (30 MB).
@@ -1086,6 +1117,21 @@ mod cache_tests {
         assert_eq!(default_level(&over), Some("-O0"));
         assert_eq!(default_level(&over[..O1_MAX_HLSL]), Some("-O1"));
         assert_eq!(cache_key_for_toolchain(&over, "main", "cs_6_6", "tc"), plain(&over));
+        // structured, with loops nested past the -O1 limit: -O0 and the plain key; at the limit -O1
+        let nested = |n: usize| {
+            let mut s = String::from("void main()\n{\n");
+            for k in 0..n {
+                s.push_str(&format!("{}[loop] for (;;) {{ // {k}: s_branch {{\n", "    ".repeat(k + 1)));
+            }
+            s.push_str(&"    }\n".repeat(n));
+            s.push_str(structured.strip_prefix("void main()\n{\n").unwrap());
+            s
+        };
+        assert_eq!(loop_nest(&nested(O1_MAX_LOOP_NEST + 1)), O1_MAX_LOOP_NEST + 1);
+        assert_eq!(default_level(&nested(O1_MAX_LOOP_NEST)), Some("-O1"));
+        let deep = nested(O1_MAX_LOOP_NEST + 1);
+        assert_eq!(default_level(&deep), Some("-O0"));
+        assert_eq!(cache_key_for_toolchain(&deep, "main", "cs_6_6", "tc"), plain(&deep));
     }
 
     #[test]
