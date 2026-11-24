@@ -5261,7 +5261,7 @@ pub fn log_device_removed() {
                 let count = node.BreadcrumbCount as usize;
                 let done = if node.pLastBreadcrumbValue.is_null() { 0 } else { *node.pLastBreadcrumbValue as usize };
                 if done < count {
-                    let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
+                    let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, breadcrumb_op_name((*node.pCommandHistory.add(i)).0))).collect();
                     crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
                 }
                 n = node.pNext;
@@ -5269,6 +5269,22 @@ pub fn log_device_removed() {
             }
         }
     }
+}
+
+/// A DRED auto-breadcrumb operation (`D3D12_AUTO_BREADCRUMB_OP`) by name.
+fn breadcrumb_op_name(op: i32) -> String {
+    const NAMES: [&str; 46] = [
+        "SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced", "ExecuteIndirect", "Dispatch",
+        "CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles", "ResolveSubresource", "ClearRenderTargetView",
+        "ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier", "ExecuteBundle", "Present", "ResolveQueryData",
+        "BeginSubmission", "EndSubmission", "DecodeFrame", "ProcessFrames", "AtomicCopyBufferUINT", "AtomicCopyBufferUINT64",
+        "ResolveSubresourceRegion", "WriteBufferImmediate", "DecodeFrame1", "SetProtectedResourceSession", "DecodeFrame2",
+        "ProcessFrames1", "BuildRaytracingAccelerationStructure", "EmitRaytracingAccelerationStructurePostbuildInfo",
+        "CopyRaytracingAccelerationStructure", "DispatchRays", "InitializeMetaCommand", "ExecuteMetaCommand", "EstimateMotion",
+        "ResolveMotionVectorHeap", "SetPipelineState1", "InitializeExtensionCommand", "ExecuteExtensionCommand", "DispatchMesh",
+        "EncodeFrame", "ResolveEncoderOutputMetadata", "Barrier",
+    ];
+    usize::try_from(op).ok().and_then(|i| NAMES.get(i)).map_or_else(|| op.to_string(), |n| (*n).to_owned())
 }
 
 /// The GPU hung or the device was removed: the title is stopped at once (a title that goes on
