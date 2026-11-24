@@ -1922,21 +1922,27 @@ impl State {
 
     /// `forget_buffer` with the state locked.
     fn forget_buffer(&mut self, res: usize) {
-        let Some(tiles) = self.buffers.remove(&res) else { return };
-        for tile in tiles {
-            if let Some(c) = self.pinned.get_mut(&tile) {
-                *c -= 1;
-                if *c == 0 {
-                    self.pinned.remove(&tile);
-                    // (kept mapped for the buffer alone: parked, the next flush unmaps and
-                    // frees it)
-                    if let Some(x) = self.kept.iter().find_map(|(&x, &t)| (t == tile).then_some(x)) {
-                        self.kept.remove(&x);
-                        self.parked.insert(x, tile);
-                    }
-                    self.release_if_unused(tile);
+        let Some(mut tiles) = self.buffers.remove(&res) else { return };
+        // those no buffer has any more
+        tiles.retain(|tile| {
+            let Some(c) = self.pinned.get_mut(tile) else { return false };
+            *c -= 1;
+            *c == 0 && self.pinned.remove(tile).is_some()
+        });
+        // (kept mapped for the buffer alone: parked, the next flush unmaps and frees them)
+        if !self.kept.is_empty() && !tiles.is_empty() {
+            tiles.sort_unstable();
+            let parked = &mut self.parked;
+            self.kept.retain(|&x, tile| {
+                let gone = tiles.binary_search(tile).is_ok();
+                if gone {
+                    parked.insert(x, *tile);
                 }
-            }
+                !gone
+            });
+        }
+        for tile in tiles {
+            self.release_if_unused(tile);
         }
     }
 
