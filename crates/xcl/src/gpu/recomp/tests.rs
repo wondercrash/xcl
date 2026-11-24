@@ -1491,6 +1491,35 @@ fn buffer_format_d16_packs_and_unpacks_halves() {
 }
 
 #[test]
+fn buffer_format_loads_decode_only_the_selected_components() {
+    // `fmt_comp` is inlined at every call: a retail CS of 3 281 format_x loads made 29 MB of DXIL
+    // when each load decoded all four components
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 4), ("SOFFSET", 128)], None),
+        ("TBUFFER_LOAD_FORMAT_XY", "ENC_MTBUF", &[("VDATA", 12), ("SRSRC", 4), ("SOFFSET", 128), ("FORMAT", 64)], None),
+        ("BUFFER_LOAD_FORMAT_D16_XYZ", "ENC_MUBUF", &[("VDATA", 14), ("SRSRC", 4), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", "ENC_MUBUF", &[("VDATA", 16), ("SRSRC", 4), ("SOFFSET", 128)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    // one component: `fmt_x` reads only its dwords (no `ld_raw`); several share one `ld_raw`
+    for (k, n) in [(1, 0), (2, 2), (3, 3), (4, 0)] {
+        assert_eq!(t.hlsl.matches(&format!("fmt_sel(t{k}_r, ")).count(), n, "load {k}\n{}", t.hlsl);
+        assert_eq!(t.hlsl.matches(&format!("fmt_x(t{k}_a, ")).count(), (n == 0) as usize, "load {k}\n{}", t.hlsl);
+        assert_eq!(t.hlsl.contains(&format!("uint4 t{k}_r = ld_raw(")), n != 0, "load {k}\n{}", t.hlsl);
+    }
+    assert!(!t.hlsl.contains("fmt_comp(t"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+    // a program without format loads keeps its HLSL as it was (no `fmt_sel`): its DXIL and
+    // driver cache keys do not change
+    let plain = prog(&[("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 4), ("SOFFSET", 128)], None)]);
+    let p = translate(&plain, &Options::default()).unwrap();
+    assert!(p.complete() && !p.hlsl.contains("fmt_sel") && p.hlsl.contains(super::emit::PRELUDE_MEM), "{}", p.hlsl);
+}
+
+#[test]
 fn gpu_typed_buffer_loads_and_stores() {
     if !gpu_ready() {
         return;
@@ -1574,6 +1603,79 @@ fn gpu_typed_buffer_loads_and_stores() {
     }
     assert_eq!(r.mem[0x130 / 4], 0xB800_4000, "d16 store 16_16_float");
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
+}
+
+/// Format loads give the values of the full decoder they replace (`dst_sel` of all four
+/// `fmt_comp`s on `ld_raw`, still in `PRELUDE_MEM`) for every format, DST_SEL (including
+/// 0 / 1 and the reserved 2 / 3), byte alignment and out-of-range lane: one-component loads
+/// (`fmt_x`, which reads only the component's dwords: format_x, d16_x, d16_hi_x) and
+/// several-component ones (`fmt_sel`), bit for bit on the GPU.
+#[test]
+fn gpu_format_loads_match_the_full_decoder() {
+    if !gpu_ready() {
+        return;
+    }
+    // V# k at s[12 + 4k] (SRSRC 3 + k); per-lane byte offset v1
+    let ld = |name: &'static str, vdata: u64, k: u64| (name, "ENC_MUBUF", vec![("VDATA", vdata), ("VADDR", 1), ("SRSRC", 3 + k), ("SOFFSET", 128), ("OFFEN", 1)], None);
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = (0..8).map(|k| ld("BUFFER_LOAD_FORMAT_X", 10 + k, k)).collect();
+    list.push(ld("BUFFER_LOAD_FORMAT_XYZW", 20, 8));
+    list.push(ld("BUFFER_LOAD_FORMAT_XYZW", 24, 9));
+    list.push(ld("BUFFER_LOAD_FORMAT_D16_X", 28, 10));
+    list.push(ld("BUFFER_LOAD_FORMAT_D16_HI_X", 29, 11));
+    list.push(ld("BUFFER_LOAD_FORMAT_XY", 30, 2));
+    let code = prog(&list.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect::<Vec<_>>());
+    let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(t.hlsl.matches("= fmt_x(t").count(), 10, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches(" fmt_sel(t").count(), 10, "{}", t.hlsl);
+    // the reference: the same program with the decoder the format loads used before
+    let reference = t
+        .hlsl
+        .replacen(
+            "uint fmt_x(",
+            "uint xcl_ref_sel(uint4 r, uint info, uint sel, bool isint) { return dst_sel(uint4(fmt_comp(r, info, 0u), fmt_comp(r, info, 1u), fmt_comp(r, info, 2u), fmt_comp(r, info, 3u)), sel, isint); }\n\
+             uint xcl_ref_x(uint a, uint info, uint sel, bool isint) { return xcl_ref_sel(ld_raw(a), info, sel, isint); }\nuint fmt_x(",
+            1,
+        )
+        .replace("= fmt_x(t", "= xcl_ref_x(t")
+        .replace(" fmt_sel(t", " xcl_ref_sel(t");
+    assert!(!reference.contains("= fmt_x(t") && !reference.contains(" fmt_sel(t"));
+    let new = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let old = super::dxc::compile(&reference, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{reference}"));
+    // varied bytes: every float format sees normals, denormals, infinities and NaNs
+    let mut x = 0x2545_F491u32;
+    let mem: Vec<u32> = (0..512)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        })
+        .collect();
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = 5 * l as u32 + (l as u32 & 3); // every byte alignment; the last lanes run past num_records
+    }
+    let sels = [4, 5, 6, 7, 0, 1, 2, 3];
+    let mut nonzero = 0;
+    for fmt in 0..78u32 {
+        for k in 0..12 {
+            let sel = match k {
+                0..=7 => sels[k],
+                8 => 4 | 5 << 3 | 6 << 6 | 7 << 9,
+                9 => 7 | 1 << 3 | 6 << 9, // w, 1, 0, z
+                10 => 5,
+                _ => 6 | 4 << 3,
+            };
+            st.sgpr[12 + 4 * k..16 + 4 * k].copy_from_slice(&[0x100, 0, 0x150, sel | fmt << 12]);
+        }
+        let (a, b) = (runner::run(&new, &st, &mem).unwrap(), runner::run(&old, &st, &mem).unwrap());
+        for l in 0..64 {
+            assert_eq!(a.vgpr[l][10..32], b.vgpr[l][10..32], "format {fmt} lane {l} (v10..v31)");
+            nonzero += a.vgpr[l][10..32].iter().filter(|&&v| v != 0).count();
+        }
+    }
+    assert!(nonzero > 78 * 64 * 8, "{nonzero} non-zero results");
 }
 
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
@@ -5804,6 +5906,71 @@ fn gpu_split_wave64_cross_half_operations() {
     }
 }
 
+/// Scalar loads in the split form: in a group of one console wave every one is exchanged
+/// (half 0's words for all 64 threads), GLC or not, so memory written during the dispatch
+/// cannot give the halves different branches; with several console waves per group only GLC
+/// ones are. One-wave programs meet at group barriers from 1 MiB of HLSL on, smaller ones and
+/// multi-wave ones through the bounded counters. On the GPU both forms give the loaded words.
+#[test]
+fn gpu_split_wave64_scalar_loads_and_the_barrier_form() {
+    use super::{dxc, CsInterface};
+    type Inst<'a> = (&'a str, &'a str, &'a [(&'a str, u64)], Option<u32>);
+    // s[8:9] = 0: the test memory
+    let plain: Inst = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 4), ("OFFSET", 0), ("SOFFSET", 125)], None);
+    let glc: Inst = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 4), ("OFFSET", 0), ("SOFFSET", 125), ("GLC", 1)], None);
+    let add: Inst = ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 5), ("VSRC1", 5)], None);
+    let small = prog(&[plain, glc]);
+    let mut list = vec![plain, glc];
+    list.extend(std::iter::repeat(add).take(20_000));
+    let big = prog(&list);
+    let split = |code: &[u8], threads: u32| {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        let t = translate(code, &Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl
+    };
+    let spin = |h: &str| if h.contains("\n#define XCL_X_SPIN 1\n") { 1 } else { assert!(h.contains("\n#define XCL_X_SPIN 0\n")); 0 };
+    if std::env::var_os("XCL_WAVE64_SPIN").is_none() {
+        for (code, threads, words, want_spin) in [(&small, 64, 8, 1), (&small, 128, 4, 1), (&big, 64, 8, 0), (&big, 128, 4, 1)] {
+            let h = split(code, threads);
+            assert_eq!(h.len() >= 1 << 20, code.len() > small.len(), "{} B of HLSL", h.len());
+            assert_eq!(h.matches("= xcl_x_get0(").count(), words, "{threads} threads, {} B: exchanged load words", h.len());
+            assert_eq!(spin(&h), want_spin, "{threads} threads, {} B: XCL_X_SPIN", h.len());
+        }
+    }
+    if !gpu_ready() || !runner::split_wave64() {
+        return;
+    }
+    // a one-wave kernel: as translated (small: counters) and in the group-barrier form
+    let t = translate(&small, &runner::options(Mode::Kernel)).unwrap();
+    assert_eq!(spin(&t.hlsl), 1);
+    let mem = [0xABCDu32, 0x1234, 0x5678, 0x9ABC];
+    for h in [t.hlsl.clone(), t.hlsl.replacen("\n#define XCL_X_SPIN 1\n", "\n#define XCL_X_SPIN 0\n", 1)] {
+        let dxil = dxc::compile(&h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let r = runner::run(&dxil, &KernelState::default(), &mem).unwrap();
+        assert_eq!(&r.sgpr[12..16], &mem, "s_load_dwordx4, spin {}", spin(&h));
+        assert_eq!(&r.sgpr[16..20], &mem, "s_load_dwordx4 glc, spin {}", spin(&h));
+    }
+}
+
+/// A split wave64 program with console LDS says what the exchange leaves of `xcl_lds` (`pso`
+/// warns when the console program allocates more): the words up to `XCL_X_LDS_TOP`, which
+/// every access above is clamped onto.
+#[test]
+fn split_wave64_lds_below_the_exchange() {
+    let code = prog(&[
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None),
+        ("S_LOAD_DWORDX16", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 4), ("OFFSET", 0), ("SOFFSET", 125)], None),
+    ]);
+    let t = translate(&code, &Options { split_wave64: true, ..Default::default() }).unwrap();
+    let top: u32 = t.hlsl.split("#define XCL_X_LDS_TOP ").nth(1).unwrap().split('u').next().unwrap().parse().unwrap();
+    assert_eq!(t.lds_below_exchange, Some(4 * (top + 1)));
+    // one console wave: 2 x 2 slots of 16 words (the exchanged s_load_dwordx16), 2 counters and
+    // the wave counter take the top
+    assert_eq!(t.lds_below_exchange, Some(4 * (8192 - 64 - 3)));
+    assert_eq!(translate(&code, &Options::default()).unwrap().lds_below_exchange, None);
+}
+
 /// Masks only read lane by lane (`x64_masks`): a v_cndmask selector and a 64-bit carry chain,
 /// both with bits in the two halves, need no exchange in the split form – and give the same
 /// lanes as a whole-wave mask.
@@ -6081,15 +6248,22 @@ fn gpu_split_wave64_waves_diverge() {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
         ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
     ]);
-    for dims in [[256u32, 1, 1], [64, 1, 1], [8, 8, 4], [16, 4, 1]] {
+    // one-wave groups also in the group-barrier form (of programs of 1 MiB of HLSL or more)
+    for (dims, barrier) in [([256u32, 1, 1], false), ([64, 1, 1], false), ([64, 1, 1], true), ([8, 8, 4], false), ([16, 4, 1], false), ([16, 4, 1], true)] {
         let threads = dims.iter().product::<u32>();
         let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
         let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
-        if runner::split_wave64() && std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0") {
-            assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("#define XCL_X_SPIN 1"), "{dims:?}");
+        if runner::split_wave64() && std::env::var_os("XCL_WAVE64_SPIN").is_none() {
+            // a small program: counters whatever the group
+            assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("\n#define XCL_X_SPIN 1\n"), "{dims:?}");
         }
-        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        if barrier && !runner::split_wave64() {
+            continue;
+        }
+        let hlsl = if barrier { t.hlsl.replacen("\n#define XCL_X_SPIN 1\n", "\n#define XCL_X_SPIN 0\n", 1) } else { t.hlsl.clone() };
+        assert!(threads <= 64 || !barrier);
+        let dxil = dxc::compile(&hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
         let base = 0x100usize;
         let mut io = vec![0u32; 128];
         io[0] = base as u32;
@@ -7630,11 +7804,13 @@ fn jumps_to_outer_loop_heads_are_structured() {
         }
         work(&mut code, 5);
         code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
-        let t = |s: bool| translate(&code, &Options { structured: s, ..Options::default() }).unwrap();
+        // a wave32 program where the GPU has no 64-lane waves (the control flow is scalar either way)
+        let wave64 = runner::wave64_supported() == Ok(true);
+        let t = |s: bool| translate(&code, &Options { structured: s, wave64, ..Options::default() }).unwrap();
         let (a, b) = (t(true), t(false));
         assert!(a.complete() && b.complete(), "{:?}", a.unsupported_why);
         structured += !a.hlsl.contains("if (pc ==") as usize;
-        if !gpu_waves().contains(&true) {
+        if gpu_waves().is_empty() {
             continue;
         }
         ran += 1;
@@ -7651,4 +7827,61 @@ fn jumps_to_outer_loop_heads_are_structured() {
     }
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}
+
+/// Forward jumps that cross each other – each one past the targets of the ones before it, as the
+/// console compiler lays out 95cc13288a27a96e (ScreenProbes_ActivateRays, 11 408 forward jumps
+/// over 29 KB on the median) – are skip flags pending all at once. Every guard tests the one skip
+/// variable, not each pending target: with a flag per target the guards grew with the square of
+/// the jumps (104 of that program's 154 MB of HLSL). Structured and dispatcher forms agree on
+/// the GPU.
+#[test]
+fn crossing_forward_jumps_keep_the_guards_short() {
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    // k tests of bits of s10, jump j to the j-th of the k blocks behind them: s0 counts the tests
+    // that ran, s1 the blocks
+    let program = |k: u64| {
+        let mut code = Vec::new();
+        let mut jumps = Vec::new();
+        for j in 0..k {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+            code.extend(i("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128 + j % 32)]));
+            jumps.push(code.len());
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        }
+        for at in jumps {
+            let d = ((code.len() - at) / 4 - 1) as u16;
+            code[at..at + 2].copy_from_slice(&d.to_le_bytes());
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        code
+    };
+    let wave64 = runner::wave64_supported() == Ok(true);
+    let t = |code: &[u8], structured: bool| {
+        let t = translate(code, &Options { structured, wave64, ..Options::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t
+    };
+    let big = t(&program(64), true);
+    assert!(!big.hlsl.contains("if (pc =="), "not structured");
+    let longest = big.hlsl.lines().filter(|l| l.contains("xcl_skip")).map(|l| l.trim().len()).max().unwrap_or(0);
+    assert!(longest < 80, "a line of {longest} B tests the skip flag:\n{}", big.hlsl);
+    if gpu_waves().is_empty() {
+        return;
+    }
+    let code = program(12);
+    let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    for structured in [true, false] {
+        let h = t(&code, structured).hlsl;
+        let dxil = super::dxc::compile(&h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}"));
+        // (s10, first jump taken)
+        for (s10, first) in [(0u32, 12u32), (1, 0), (0x20, 5), (0x800, 11), (0xA0, 5), (0xC00, 10)] {
+            let mut st = KernelState::default();
+            st.sgpr[10] = s10;
+            let r = runner::run(&dxil, &st, &mem).unwrap();
+            let want = if first == 12 { [12, 12] } else { [first + 1, 12 - first] };
+            assert_eq!(r.sgpr[..2], want, "structured={structured}, s10={s10:#x}\n{h}");
+        }
+    }
 }

@@ -486,6 +486,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
         }
+        warn_lds_clamped(blob, &t, rsrc2_lds_bytes(f.rsrc2));
         return Ok((t, "cs_6_6"));
     }
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
@@ -509,12 +510,40 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
+    // COMPUTE_PGM_RSRC2 at +0x38 of the stage descriptor (`CsInterface::from_descriptor`)
+    let lds = match mode {
+        Mode::Compute(_) => f.stages.first().and_then(|s| f.data.get(s.offset + 0x38..s.offset + 0x3C)).map(|r| rsrc2_lds_bytes(u32::from_le_bytes(r.try_into().unwrap()))),
+        _ => None,
+    };
     let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
+    if let Some(lds) = lds {
+        warn_lds_clamped(blob, &t, lds);
+    }
     Ok((t, profile))
+}
+
+/// LDS bytes a console compute program allocates: COMPUTE_PGM_RSRC2.LDS_SIZE, in 512-byte
+/// granules.
+fn rsrc2_lds_bytes(rsrc2: u32) -> u32 {
+    ((rsrc2 >> 15) & 0x1FF) * 512
+}
+
+/// A split wave64 program that allocates more LDS than the exchange leaves it gets its accesses
+/// above that clamped onto one word (wrong data, no error), so its translation says so. The
+/// retail census found no program of one console wave doing it (2 420 B to spare at least,
+/// with the wider slots of every scalar load being exchanged); four 1024-thread ones
+/// allocate the whole 32 KB.
+fn warn_lds_clamped(blob: &[u8], t: &super::Translation, allocated: u32) {
+    if let Some(below) = t.lds_below_exchange.filter(|&below| allocated > below) {
+        crate::xlog_warn!(
+            "[SHADER] {:016x}: allocates {allocated} B of LDS, the split wave64 exchange leaves it {below} B; accesses above are clamped",
+            crate::gpu::shader::fnv64(blob)
+        );
+    }
 }
 
 /// A console geometry stage as XCL runs it, in two passes: the console program as a compute
@@ -985,6 +1014,45 @@ mod shader_cache_tests {
                 assert_eq!(thread.join().unwrap().unwrap().dxil[0], 1);
             }
         });
+    }
+}
+
+/// `XCL_SAMPLE_RPF` (a retail `shaders.rpf`): the compute programs whose structured form was
+/// many times their dispatcher form stay structured and near its size – ScreenProbes_ActivateRays
+/// (95cc13288a27a96e: 154 MB of skip-flag guards and indentation against 15 MB in blocks) and
+/// ScreenProbes_ActivateProbes (56c0cd3b82a00c6e). Does nothing without the pack.
+#[cfg(test)]
+mod structuring_tests {
+    use super::*;
+
+    #[test]
+    fn retail_structured_forms_stay_near_the_block_form() {
+        let Ok(rpf) = std::env::var("XCL_SAMPLE_RPF") else { return };
+        let data = std::fs::read(rpf).unwrap();
+        let mut found = 0;
+        for r in crate::gpu::pack::scan(&data, 0x40).iter() {
+            let Some(blob) = crate::gpu::pack::inflate(&data, r) else { continue };
+            let h = crate::gpu::shader::fnv64(&blob);
+            if ![0x95cc_1328_8a27_a96e, 0x56c0_cd3b_82a0_0c6e].contains(&h) {
+                continue;
+            }
+            found += 1;
+            let sh = xbox::parse(&blob).unwrap();
+            let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).unwrap();
+            let mode = interface(&blob, &sh, f).unwrap();
+            let p = &f.programs[0];
+            let code = &f.data[p.offset..p.offset + p.len];
+            let t = |structured: bool| {
+                let o = Options { mode: mode.clone(), wave64: super::super::detect_wave64(code), split_wave64: true, mem_windows: 4, structured, ..Default::default() };
+                let t = translate(code, &o).unwrap();
+                assert!(t.complete(), "{h:016x}: {:?}", t.unsupported_why);
+                t.hlsl
+            };
+            let (s, b) = (t(true), t(false));
+            assert!(!s.contains("\n    uint pc = ") && b.contains("\n    uint pc = "), "{h:016x}: not structured");
+            assert!(s.len() * 2 < b.len() * 3, "{h:016x}: {} B structured, {} B in blocks", s.len(), b.len());
+        }
+        assert_eq!(found, 2, "programs not in the pack");
     }
 }
 

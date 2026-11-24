@@ -40,6 +40,8 @@ struct Pending {
     hash: AtomicU64,
     /// its DXIL goes to the driver's compiler (no blob of an earlier build), known with `dxil`
     compiles: AtomicBool,
+    /// HLSL bytes DXC was asked to compile for it so far (`hlsl_known`; cache hits not counted)
+    hlsl: AtomicUsize,
     /// its place in the workers' queue (`send`; 0: not sent)
     seq: AtomicUsize,
     /// it went to a list of `Preload`
@@ -270,6 +272,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         dxil: AtomicUsize::new(0),
         hash: AtomicU64::new(0),
         compiles: AtomicBool::new(false),
+        hlsl: AtomicUsize::new(0),
         seq: AtomicUsize::new(0),
         listed: AtomicBool::new(false),
         wait_logged: AtomicBool::new(false),
@@ -517,6 +520,41 @@ mod used_tests {
         released(huge);
         released(small);
         released(blob);
+    }
+
+    /// … and before its DXIL is known, as soon as DXC starts on `HLSL_PER_DXIL` times the limit
+    /// of HLSL for it (a retail program's 154 MB): the bind does not wait for DXC. Less HLSL
+    /// (30 MB, 4.5 MB of DXIL) is waited for.
+    #[test]
+    fn a_bind_does_not_wait_for_dxc_on_huge_hlsl() {
+        let limit = Some(8 << 20);
+        let (huge, big) = (0x7E57_9101usize, 0x7E57_9102usize);
+        let (go, dxc) = mpsc::channel::<()>();
+        submit_lazy(huge, true, Box::new(move || {
+            hlsl_known(153_958_698);
+            // DXC, until the test lets it end
+            let _ = dxc.recv_timeout(std::time::Duration::from_secs(10));
+            0x9101
+        }), 0);
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait_for(huge, None, limit), huge, "the stand-in while DXC runs");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "waited {:?}", t.elapsed());
+        assert!(is_pending(huge) && entry(huge).unwrap().skip_logged.load(Ordering::Acquire));
+        go.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while is_pending(huge) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(resolve_wait_for(huge, None, limit), 0x9101, "built in the background");
+        submit_lazy(big, true, Box::new(|| {
+            hlsl_known(30_263_386);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            dxil_known(4_527_996, b"console", true);
+            0x9102
+        }), 0);
+        assert_eq!(resolve_wait_for(big, None, limit), 0x9102, "30 MB of HLSL is waited for");
+        released(huge);
+        released(big);
     }
 
     /// A compile a worker's build starts is wanted once a bind waits for the build – asked from
@@ -773,10 +811,18 @@ fn wait_budget() -> Option<std::time::Duration> {
 /// build goes on in the background, and a later bind uses it once built. Smaller ones are waited
 /// for as before; with `XCL_PSO_WAIT_MS` both apply. On an NVIDIA GPU the driver never finished
 /// a retail title's 29.75 MB compute program, and its bind at a cutscene waited for good.
+/// DXC comes first and can take minutes on such a program's HLSL, so a bind also goes on as
+/// soon as DXC starts on `HLSL_PER_DXIL` times the limit of HLSL or more (`hlsl_known`).
 fn skip_huge() -> Option<usize> {
     static H: OnceLock<Option<usize>> = OnceLock::new();
     *H.get_or_init(|| std::env::var("XCL_PSO_SKIP_HUGE").ok().and_then(|v| crate::shaders::parse_bytes(&v)).filter(|&n| n > 0))
 }
+
+/// HLSL bytes per DXIL byte at which `skip_huge` applies before DXC: XCL's HLSL is 1 – 7
+/// times the size of its DXIL (retail compute: 3.2 MB → 0.88 MB at -O1, 30.2 MB → 4.5 MB at
+/// -O1, 31 MB → 29.75 MB at -O0). With `8M`, DXC still compiles the 30 MB ScreenProbes
+/// programs (4.5 MB DXIL, ~2 min in the NVIDIA driver) but not a 154 MB one.
+const HLSL_PER_DXIL: usize = 4;
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
 /// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
@@ -946,10 +992,12 @@ impl Pending {
         *self.stage.lock().unwrap() = stage;
     }
 
-    /// Its DXIL goes to the driver's compiler and is `huge` bytes or more (None: no limit;
-    /// `skip_huge`).
+    /// Its DXIL goes to the driver's compiler and is `huge` bytes or more, or DXC is compiling
+    /// `HLSL_PER_DXIL` × `huge` bytes of HLSL or more for it (None: no limit; `skip_huge`).
     fn too_big(&self, huge: Option<usize>) -> bool {
-        huge.is_some_and(|h| self.compiles.load(Ordering::Acquire) && self.dxil.load(Ordering::Relaxed) >= h)
+        huge.is_some_and(|h| {
+            (self.compiles.load(Ordering::Acquire) && self.dxil.load(Ordering::Relaxed) >= h) || self.hlsl.load(Ordering::Acquire) >= h.saturating_mul(HLSL_PER_DXIL)
+        })
     }
 
     /// Whether a bind waits for it now (`Want`; `huge`: `skip_huge`).
@@ -1066,17 +1114,18 @@ fn wait_built(p: &Arc<Pending>, budget: Option<Duration>, huge: Option<usize>) -
     let skipped = !built && p.too_big(huge);
     if skipped && !p.skip_logged.swap(true, Ordering::AcqRel) {
         crate::xlog_warn!(
-            "D3D12.X: XCL_PSO_SKIP_HUGE: {} pipeline {:#x} (console shader {:016x}, {} B DXIL) is not waited for; its {} are skipped until it is built",
+            "D3D12.X: XCL_PSO_SKIP_HUGE: {} pipeline {:#x} (console shader {:016x}, {} B DXIL, {} B HLSL in DXC) is not waited for; its {} are skipped until it is built",
             if p.compute { "compute" } else { "graphics" },
             p.standin,
             p.hash.load(Ordering::Relaxed),
             p.dxil.load(Ordering::Relaxed),
+            p.hlsl.load(Ordering::Relaxed),
             if p.compute { "dispatches" } else { "draws" }
         );
     }
     if logged {
         let end = match (built, p.real.load(Ordering::Acquire)) {
-            (false, _) if skipped => "its DXIL is at least XCL_PSO_SKIP_HUGE: its binds go on without it",
+            (false, _) if skipped => "its DXIL (or the HLSL DXC compiles) is at least XCL_PSO_SKIP_HUGE: its binds go on without it",
             (false, _) => "not built within XCL_PSO_WAIT_MS: its binds go on without it",
             (true, 0) => "its build failed",
             (true, _) => "built",
@@ -1096,6 +1145,16 @@ pub fn dxil_known(dxil: usize, console: &[u8], compiles: bool) {
     p.hash.store(crate::gpu::shader::fnv64(console), Ordering::Relaxed);
     p.compiles.store(compiles, Ordering::Release);
     // under `done`: a bind checks `too_big` under it before it sleeps
+    let _g = p.done.lock().unwrap();
+    p.cv.notify_all();
+}
+
+/// DXC is about to compile `hlsl` bytes of HLSL for the pipeline this thread builds (a DXIL
+/// cache miss, `dxc::compile_cached_in`). A bind waiting for it may go on without it now
+/// (`skip_huge`): it does not wait for DXC on a program that big.
+pub fn hlsl_known(hlsl: usize) {
+    let Some(p) = BUILDING.with(|b| b.borrow().clone()) else { return };
+    p.hlsl.fetch_add(hlsl, Ordering::AcqRel);
     let _g = p.done.lock().unwrap();
     p.cv.notify_all();
 }
