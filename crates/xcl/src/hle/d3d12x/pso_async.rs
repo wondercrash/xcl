@@ -64,16 +64,32 @@ thread_local! {
     static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// This thread is a worker and one of the title's threads waits for what it is building: the
-/// build must not stand back for the title's sake (`real::big_compile_turn`). Not one the binds
-/// go on without (`XCL_PSO_SKIP_HUGE`): it takes its turn like those built ahead.
-pub(super) fn build_is_wanted() -> bool {
-    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.waited_for(skip_huge())))
+/// Whether one of the title's threads waits for a worker's build (`real::big_compile_turn`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Want {
+    /// no: built ahead of its first use, or binds go on without it for its size
+    /// (`XCL_PSO_SKIP_HUGE`: it takes its turn like those built ahead)
+    No,
+    /// a bind waited for it longer than `XCL_PSO_WAIT_MS` (`late`): binds go on without it now
+    Late,
+    /// a bind waits for it: the build must not stand back for the title's sake
+    Waits,
+}
+
+/// `Want` of what this thread builds (`No`: nothing).
+pub(super) fn build_want() -> Want {
+    BUILDING.with(|b| b.borrow().as_ref().map_or(Want::No, |p| p.want_now(skip_huge())))
+}
+
+/// This thread is a worker and one of the title's threads waits, or waited, for what it builds.
+#[cfg(test)]
+fn build_is_wanted() -> bool {
+    build_want() != Want::No
 }
 
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and
-/// from another thread: a worker's build as `build_is_wanted`; a thread that is not XCL's is the
-/// title's own.
+/// from another thread: a worker's build, once a bind has waited for it; a thread that is not
+/// XCL's is the title's own.
 pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
     if let Some(p) = BUILDING.with(|b| b.borrow().clone()) {
         return Box::new(move || p.demand.lock().unwrap().wanted);
@@ -443,6 +459,7 @@ mod used_tests {
         let t = std::time::Instant::now();
         assert_eq!(resolve_wait_for(standin, budget, None), standin);
         assert!(t.elapsed() < std::time::Duration::from_millis(20), "a late pipeline is not waited for again ({:?})", t.elapsed());
+        assert_eq!(entry(standin).unwrap().want_now(None), Want::Late, "its build goes without a slot only a few at a time (`real::slotless_goes`)");
         let start = std::time::Instant::now();
         while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -478,7 +495,8 @@ mod used_tests {
         let p = entry(huge).unwrap();
         assert!(is_pending(huge) && !p.late.load(Ordering::Acquire), "still being built; no budget ran out");
         assert!(p.skip_logged.load(Ordering::Acquire));
-        assert!(p.demand.lock().unwrap().wanted && !p.waited_for(limit), "its driver compile takes its turn: no bind waits for it");
+        let wanted = p.demand.lock().unwrap().wanted;
+        assert!(wanted && p.want_now(limit) == Want::No, "its driver compile takes its turn: no bind waits for it");
         go.send(()).unwrap();
         let start = std::time::Instant::now();
         while is_pending(huge) && start.elapsed() < std::time::Duration::from_secs(10) {
@@ -722,7 +740,8 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>, huge: Optio
 }
 
 /// The build of `p` a bind would run on its own thread, on a new thread instead (named so that it
-/// takes no big-compile slot, as on the binding thread): whether one was started.
+/// takes its turn like a worker's, `real::big_compile_turn`: at once while its bind waits, at its
+/// lane once binds go on without it): whether one was started.
 fn build_aside(p: &Arc<Pending>) -> bool {
     let p = p.clone();
     std::thread::Builder::new()
@@ -933,9 +952,15 @@ impl Pending {
         huge.is_some_and(|h| self.compiles.load(Ordering::Acquire) && self.dxil.load(Ordering::Relaxed) >= h)
     }
 
-    /// A bind waits for it, unless binds go on without it for its size (`too_big`).
-    fn waited_for(&self, huge: Option<usize>) -> bool {
-        self.demand.lock().unwrap().wanted && !self.too_big(huge)
+    /// Whether a bind waits for it now (`Want`; `huge`: `skip_huge`).
+    fn want_now(&self, huge: Option<usize>) -> Want {
+        if !self.demand.lock().unwrap().wanted || self.too_big(huge) {
+            Want::No
+        } else if self.late.load(Ordering::Acquire) {
+            Want::Late
+        } else {
+            Want::Waits
+        }
     }
 
     /// "compute pipeline 0x… (shader set …, console shader …, N B DXIL)": what is known of it.
@@ -1109,7 +1134,15 @@ pub fn driver_start(dxil: usize, console: &[u8], slot: Option<&'static str>, big
         return;
     }
     let (what, waits) = match &mine {
-        Some(p) => (p.describe(), if p.demand.lock().unwrap().wanted { "yes" } else { "no" }),
+        Some(p) => (
+            p.describe(),
+            match p.want_now(skip_huge()) {
+                Want::Waits => "yes",
+                Want::Late => "no, it is late (XCL_PSO_WAIT_MS): binds go on without it",
+                Want::No if p.demand.lock().unwrap().wanted => "no, XCL_PSO_SKIP_HUGE: binds go on without it",
+                Want::No => "no",
+            },
+        ),
         None => (format!("a compute program in the title's call (console shader {:016x}, {dxil} B DXIL)", crate::gpu::shader::fnv64(console)), "the title's call does"),
     };
     crate::xlog_info!("D3D12.X: driver compile of {what} starts on {who}, {}; a bind waits for it: {waits}", slot_text(slot));

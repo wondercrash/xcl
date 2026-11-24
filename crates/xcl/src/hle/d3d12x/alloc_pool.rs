@@ -182,12 +182,14 @@ pub unsafe fn forget(alloc: usize) {
     let made: Vec<usize> = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
-        s.types.remove(&alloc);
         let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
         mine.extend(s.cur.remove(&alloc));
         mine.push(alloc);
         let mut made = Vec::new();
         for b in mine {
+            // (each one's: a segment made at a split records its type for the PC allocator it is
+            // made on, `created_on`)
+            s.types.remove(&b);
             let free = s.backings.get(&b).is_none_or(|x| x.free());
             if let Some(gone) = s.backings.remove(&b) {
                 for l in gone.users {
@@ -499,5 +501,24 @@ mod tests {
             assert_eq!(current(a as usize), a as usize, "a released allocator leaves nothing behind");
             assert!(!STATE.lock().unwrap().as_ref().unwrap().types.contains_key(&(a as usize)));
         }
+    }
+
+    /// A title allocator's release leaves no list type behind for the PC allocators that stood
+    /// for it: a later allocator of another list type at one of their addresses must not swap
+    /// in a PC allocator of the old type.
+    #[test]
+    fn a_released_allocator_leaves_no_type_of_its_pc_allocators() {
+        let mut ids = Box::new([0u8; 3]);
+        let alloc = ids.as_mut_ptr() as usize;
+        let (spare, list) = (alloc + 1, alloc + 2);
+        // a segment made at a split recording on a PC allocator put aside, which it still holds
+        // (so not released here)
+        created_on(list, spare, D3D12_COMMAND_LIST_TYPE_COMPUTE.0);
+        STATE.lock().unwrap().as_mut().unwrap().aside.insert(alloc, vec![spare]);
+        unsafe { forget(alloc) };
+        let g = STATE.lock().unwrap();
+        let s = g.as_ref().unwrap();
+        assert!(!s.types.contains_key(&spare), "the PC allocator's type went with the title's allocator");
+        assert!(!s.of_list.contains_key(&list) && !s.aside.contains_key(&alloc));
     }
 }

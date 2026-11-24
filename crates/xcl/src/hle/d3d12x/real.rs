@@ -3474,6 +3474,40 @@ fn big_compile_commit_free() -> bool {
     unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= 3 << 30 }
 }
 
+/// Big driver compiles in the background without a lane's slot (`slotless_goes`), now.
+static SLOTLESS_COMPILES: AtomicUsize = AtomicUsize::new(0);
+
+/// Of the big driver compiles without a slot, those of pipelines gone late (no bind waits for
+/// them any more) go only while there are fewer than this many (each ~1.5 GB of commit). With
+/// `XCL_PSO_WAIT_MS` every pipeline a bind waited for stays wanted after its bind went on: all
+/// 15 + 3 workers' big compiles could be in the driver at once.
+const LATE_SLOTLESS_MOST: usize = 4;
+
+/// Whether a build (`want`: who waits for it) goes to the driver without a slot now, counted in
+/// `slotless` if so (`Slotless` gives it back): one a bind waits for at once; one gone late only
+/// while fewer than `LATE_SLOTLESS_MOST` go without a slot and 3 GB of commit are free
+/// (`commit_free`, asked only then); else it takes its turn.
+fn slotless_goes(want: super::pso_async::Want, slotless: &AtomicUsize, commit_free: impl Fn() -> bool) -> bool {
+    use super::pso_async::Want;
+    match want {
+        Want::No => false,
+        Want::Waits => {
+            slotless.fetch_add(1, Ordering::AcqRel);
+            true
+        }
+        Want::Late => commit_free() && slotless.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < LATE_SLOTLESS_MOST).then_some(n + 1)).is_ok(),
+    }
+}
+
+/// A big driver compile without a slot (`SLOTLESS_COMPILES`), until dropped.
+struct Slotless;
+
+impl Drop for Slotless {
+    fn drop(&mut self) {
+        SLOTLESS_COMPILES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[cfg(test)]
 mod big_compile_tests {
     use super::*;
@@ -3536,6 +3570,25 @@ mod big_compile_tests {
         assert!(rx.recv_timeout(Duration::from_secs(10)).is_ok(), "the big one waits for the huge one");
         drop(held);
     }
+
+    /// A build a bind waits for goes without a slot at once; one gone late only while fewer
+    /// than `LATE_SLOTLESS_MOST` go without one and the commit is there; one nobody waited for
+    /// takes its turn.
+    #[test]
+    fn late_builds_go_without_a_slot_only_a_few_at_a_time() {
+        use super::super::pso_async::Want;
+        let n = AtomicUsize::new(0);
+        assert!(!slotless_goes(Want::No, &n, || true));
+        for k in 0..LATE_SLOTLESS_MOST {
+            assert!(!slotless_goes(Want::Late, &n, || false), "no commit free: it waits");
+            assert!(slotless_goes(Want::Late, &n, || true), "late build {k} goes");
+        }
+        assert!(!slotless_goes(Want::Late, &n, || true), "enough late ones in the driver: it waits");
+        assert!(slotless_goes(Want::Waits, &n, || false), "a bind waits: it goes anyway");
+        assert_eq!(n.load(Ordering::Relaxed), LATE_SLOTLESS_MOST + 1);
+        n.fetch_sub(2, Ordering::Relaxed);
+        assert!(slotless_goes(Want::Late, &n, || true), "one ended: the next late one goes");
+    }
 }
 
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
@@ -3589,9 +3642,14 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     // known before the driver's compile (and its turn): a bind may go on without a huge one now
     super::pso_async::dxil_known(dxil.len(), cs, cached.is_none());
     // in the background, one at a time (huge ones in a lane of their own) and within the commit
-    // left (each ~1.5 GB in the driver); one a bind waits for goes on at once
+    // left (each ~1.5 GB in the driver); one a bind waits for goes on at once, one gone late a
+    // few at a time (`slotless_goes`). (The thread of a bind's build, `xcl-bind-build`, too: a
+    // build whose binds go on without it for its size takes its lane.)
     let (lane, lane_name) = big_compile_lane(dxil.len());
-    let slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")))
+    let background = big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso") || n == "xcl-bind-build");
+    // (why it went without a slot, if it did)
+    let went = std::cell::Cell::new(super::pso_async::Want::No);
+    let slot = background
         .then(|| {
             // (for the logs of a bind that waits for it)
             super::pso_async::turn_wait(lane_name);
@@ -3599,9 +3657,26 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
                 super::pso_async::commit_wait();
                 big_compile_commit_free()
             };
-            big_compile_turn(lane, commit_free, super::pso_async::build_is_wanted)
+            let wanted = || {
+                let want = super::pso_async::build_want();
+                let go = slotless_goes(want, &SLOTLESS_COMPILES, big_compile_commit_free);
+                if go {
+                    went.set(want);
+                }
+                go
+            };
+            big_compile_turn(lane, commit_free, wanted)
         })
         .flatten();
+    let _slotless = (went.get() != super::pso_async::Want::No).then_some(Slotless);
+    if went.get() != super::pso_async::Want::No && *lane.n.lock().unwrap() >= lane.most {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            let whose = if went.get() == super::pso_async::Want::Waits { "a bind waits for" } else { "gone late (XCL_PSO_WAIT_MS)" };
+            crate::xlog_info!("D3D12.X: a big pipeline {whose} is compiled without waiting for the {lane_name} another build holds ({} so far)", n + 1);
+        }
+    }
     let started = std::time::Instant::now();
     // (for the logs of a bind that waits for it; a big compile is logged as it starts)
     super::pso_async::driver_start(dxil.len(), cs, slot.is_some().then_some(lane_name), big && cached.is_none());
