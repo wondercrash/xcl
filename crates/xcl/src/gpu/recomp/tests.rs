@@ -1491,6 +1491,32 @@ fn buffer_format_d16_packs_and_unpacks_halves() {
 }
 
 #[test]
+fn buffer_format_loads_decode_only_the_selected_components() {
+    // `fmt_comp` is inlined at every call: a retail CS of 3 281 format_x loads made 29 MB of DXIL
+    // when each load decoded all four components
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 4), ("SOFFSET", 128)], None),
+        ("TBUFFER_LOAD_FORMAT_XY", "ENC_MTBUF", &[("VDATA", 12), ("SRSRC", 4), ("SOFFSET", 128), ("FORMAT", 64)], None),
+        ("BUFFER_LOAD_FORMAT_D16_XYZ", "ENC_MUBUF", &[("VDATA", 14), ("SRSRC", 4), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", "ENC_MUBUF", &[("VDATA", 16), ("SRSRC", 4), ("SOFFSET", 128)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    for (k, n) in [(1, 1), (2, 2), (3, 3), (4, 1)] {
+        assert_eq!(t.hlsl.matches(&format!("fmt_sel(t{k}_r, ")).count(), n, "load {k}\n{}", t.hlsl);
+    }
+    assert!(!t.hlsl.contains("fmt_comp(t"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+    // a program without format loads keeps its HLSL as it was (no `fmt_sel`): its DXIL and
+    // driver cache keys do not change
+    let plain = prog(&[("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 4), ("SOFFSET", 128)], None)]);
+    let p = translate(&plain, &Options::default()).unwrap();
+    assert!(p.complete() && !p.hlsl.contains("fmt_sel") && p.hlsl.contains(super::emit::PRELUDE_MEM), "{}", p.hlsl);
+}
+
+#[test]
 fn gpu_typed_buffer_loads_and_stores() {
     if !gpu_ready() {
         return;

@@ -37,6 +37,8 @@ pub(super) struct Em {
     uses_lds: bool,
     /// scratch_* used: declare the per-lane private memory
     uses_scratch: bool,
+    /// buffer / tbuffer format loads: define `fmt_sel` (`PRELUDE_FMT_SEL`)
+    uses_fmt_sel: bool,
     /// split wave64 (`x64`): words one exchange carries (1: masks and lane reads, up to 16:
     /// coherent scalar loads, 32: `ds_bpermute`)
     x64_words: usize,
@@ -479,6 +481,7 @@ impl Em {
             ps_done: false,
             uses_lds: false,
             uses_scratch: false,
+            uses_fmt_sel: false,
             x64_words: 1,
             x64_whole_live: BTreeMap::new(),
             upper: None,
@@ -1781,14 +1784,17 @@ impl Em {
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
                 self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
-                self.line(&format!(
-                    "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
-                ));
+                self.uses_fmt_sel = true;
+                // only the components the destinations select are decoded: `fmt_comp` is
+                // inlined at every load, and a retail program of 3 281 format_x loads made
+                // 13 125 copies of it when all four were decoded each time
+                let sel = |component: u64| format!("fmt_sel({t}_r, {t}_info, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
                 if let Some((_, components, high)) = d16_format {
-                    let half = |component: u64| {
-                        let selected = format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
-                        format!("select({t}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
-                    };
+                    let used: Vec<u64> = if high { vec![0] } else { (0..2 * count).filter(|&c| c % 2 == 0 || c < components).collect() };
+                    for &c in &used {
+                        self.line(&format!("uint {t}_s{c} = {};", sel(c)));
+                    }
+                    let half = |component: u64| format!("select({t}_int, {t}_s{component} & 0xFFFFu, f32tof16(asfloat({t}_s{component})))");
                     let mut assigns = Vec::new();
                     if high {
                         let v = self.vreg(vdata);
@@ -1807,7 +1813,7 @@ impl Em {
                 let mut assigns = Vec::new();
                 for i in 0..count {
                     let v = self.vreg(vdata + i);
-                    assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
+                    assigns.push(format!("{v} = select({t}_ok, {}, 0u);", sel(i)));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
             }
@@ -4273,6 +4279,9 @@ impl Em {
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
         h.push_str(PRELUDE_MEM);
+        if self.uses_fmt_sel {
+            h.push_str(PRELUDE_FMT_SEL);
+        }
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }
@@ -5280,7 +5289,7 @@ void scr_st(uint a, uint v, uint n) {
 }
 "#;
 
-const PRELUDE_MEM: &str = r#"
+pub(super) const PRELUDE_MEM: &str = r#"
 uint4 ld_raw(uint a) {
     // one Load4 + one Load (with several memory windows each is a switch) and no branch
     uint b = a & ~3u; uint s = (a & 3u) * 8u;
@@ -5407,6 +5416,13 @@ void st_bytes(uint a, uint4 r, uint n) {
     if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
 }
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), c[(sel - 4u) & 3u])); }
+"#;
+
+/// DST_SEL of a V# (0: 0, 1: 1, 4 – 7: component 0 – 3) on raw format data: only the component
+/// it picks is decoded (`fmt_comp` is inlined at every call). Its own block, after
+/// `PRELUDE_MEM`, in programs with format loads only: the HLSL of the others, and so their
+/// DXIL and driver cache keys, stay as they were (`dst_sel` above is no longer emitted).
+const PRELUDE_FMT_SEL: &str = r#"uint fmt_sel(uint4 r, uint info, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), fmt_comp(r, info, (sel - 4u) & 3u))); }
 "#;
 
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
