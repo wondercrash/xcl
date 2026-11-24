@@ -73,11 +73,17 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
     Some(Fspx { threads, rsrc1: u32_at(head, 0x14)?, rsrc2: u32_at(head, 0x18)?, code: &code[..4 * (end + 1)] })
 }
 
-/// Memory windows of the title's unified memory (1 without it).
+/// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
+/// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
-    match MEM_WINDOWS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+    let n = match MEM_WINDOWS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32),
         n => n,
+    };
+    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
+        n | super::HEAP_WINDOWS
+    } else {
+        n
     }
 }
 
@@ -87,6 +93,36 @@ static MEM_WINDOWS_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::A
 /// title's unified memory: the HLSL, and so the cache keys, must be that run's). 0: unset.
 pub fn set_mem_windows(n: u32) {
     MEM_WINDOWS_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+thread_local! {
+    /// this thread translates in the switch form (`in_switch_form`)
+    static SWITCH_FORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with this thread's translations in the switch form over root UAVs (`mem_windows`
+/// without `HEAP_WINDOWS`, so other cache keys): for a pipeline the driver would not build with
+/// heap windows. The root signature and the binds are the same for both forms.
+pub fn in_switch_form<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SWITCH_FORM.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(SWITCH_FORM.with(|s| s.replace(true)));
+    f()
+}
+
+/// Whether translated shaders reach the memory windows through the shared descriptor heap
+/// (`Options::heap_windows`; descriptors `MEM_HEAP_BASE`.. made by `console_heap::set_window_views`)
+/// instead of a `switch` over root UAVs. Opt-in: on with `XCL_HEAP_WINDOWS=1`, unless the views
+/// could not be made (no shared heap: then the switch, as before). Off by default: two NVIDIA
+/// setups failed with it (the driver's compiler ending the process; a device removal when the
+/// views are made on an 8 GB card) that other machines do not show.
+pub fn heap_windows() -> bool {
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1")) && !crate::hle::d3d12x::console_heap::window_views_failed()
 }
 
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
