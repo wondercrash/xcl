@@ -486,6 +486,21 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
     }
 }
 
+/// A console compute shader's thread group size, whether its program is wave64 and the bytes
+/// of its RDNA2 code (`XCL_GPU_PROFILE` names a program by them). None: not a console compute
+/// shader.
+pub fn compute_shape(blob: &[u8]) -> Option<([u32; 3], bool, usize)> {
+    if let Some(f) = fspx(blob) {
+        return Some((f.threads, super::detect_wave64(f.code), f.code.len()));
+    }
+    let sh = xbox::parse(blob)?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
+    let Mode::Compute(cs) = interface(blob, &sh, f)? else { return None };
+    let p = f.programs.first()?;
+    let code = f.data.get(p.offset..p.offset + p.len)?;
+    Some((cs.threads, super::detect_wave64(code), code.len()))
+}
+
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
