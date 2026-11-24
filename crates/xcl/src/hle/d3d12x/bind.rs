@@ -259,9 +259,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(with(this, |s| s.pso)) || super::real::two_pass_of(pso).is_some() {
+        let pending = super::pso_async::is_pending(with(this, |s| s.pso));
+        if pending || super::real::two_pass_of(pso).is_some() {
             count(DRAWS_SKIPPED);
-            super::breadcrumbs::skipped(this, with(this, |s| s.pso), || format!("ExecuteIndirect max {max} skipped: pipeline still being built"));
+            let why = if pending { "pipeline still being built" } else { "a two-pass mesh / GS pipeline, which ExecuteIndirect cannot run" };
+            super::breadcrumbs::skipped(this, with(this, |s| s.pso), || format!("ExecuteIndirect max {max} skipped: {why}"));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pending or two-pass pipeline skipped");
