@@ -1656,7 +1656,9 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
     in chunked memory (IA vertex / index buffers, copies, clears) cannot span chunks: vertex fetch in the translated VS
     from memory, copies and clears as XCL compute passes over `mem`.
 - Diagnostics: `XCL_FRAME_DUMP=1` writes every 120th presented frame (a quarter of each side) as `frame_<n>.bmp` in
-  the logs folder; `XCL_TRACE_MEM=1` logs allocations ≥ 64 KiB outside unified memory.
+  the logs folder; `XCL_FRAME_DUMP_MS=t` (alone or with it) also writes the presented frame whenever t ms passed
+  since the last dump, the first one always, as `frame_<n>_<secs>s.bmp` (run time as in the log; for titles
+  presenting a frame a second or slower); `XCL_TRACE_MEM=1` logs allocations ≥ 64 KiB outside unified memory.
 - **Safety nets** (after a GPU hang that needed a PC restart – it came from a diagnostic run that skipped barriers):
   every loop of a translated shader has a per-lane budget (`LOOP_GUARD`, 4 M iterations); when the D3D12 device is
   removed (after ExecuteCommandLists, at PresentX) the title is stopped with the reason in the log and the report.

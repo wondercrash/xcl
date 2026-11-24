@@ -127,7 +127,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
-  `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
+  `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`)
+  or `XCL_FRAME_DUMP_MS=T` (the presented frame whenever T ms passed since the last dump, the
+  first one always; written as `frame_<n>_<secs>s.bmp` with the run time of the log),
   the existing optional frame dumps also set `d3d12.last_frame_dump`: the latest sampled frame's
   zero-based index, source dimensions, DXGI format, sample step, sample count and `non_dark_samples`
   (decoded 8-bit R+G+B > 30). The field is `null` until a frame is sampled; `non_dark_samples` is

@@ -561,6 +561,8 @@ struct FrameDump {
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     format: DXGI_FORMAT,
     tag: String,
+    /// `_<secs>s` (the run time) for a dump only `XCL_FRAME_DUMP_MS` asked for, else empty
+    suffix: String,
 }
 
 unsafe impl Send for Presenter {}
@@ -714,15 +716,16 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     p.list.ResourceBarrier(&b1);
     p.list.CopyResource(&bb, &src);
     let due = frame_dump_due();
+    let suffix = if due == DumpDue::Time { format!("_{:.1}s", crate::log::uptime()) } else { String::new() };
     let mut dumps = Vec::new();
-    if due {
+    if due != DumpDue::No {
         if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
-            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into(), suffix: suffix.clone() });
         }
     }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
-    if due && trace_frame() {
+    if due != DumpDue::No && trace_frame() {
         let busiest = busiest_rt();
         let followed = FOLLOWED.lock().unwrap();
         let targets = busiest
@@ -740,7 +743,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             });
         for (k, (res, buffer, footprint, format)) in targets.enumerate() {
             let tag = if k == 0 { "rt".into() } else { format!("rt{k}") };
-            dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
+            dumps.push(FrameDump { _source: res, buffer, footprint, format, tag, suffix: suffix.clone() });
         }
     }
     let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
@@ -773,7 +776,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
-                    write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
+                    write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag, &dump.suffix);
                 }
             }
             Err(e) => {
@@ -791,16 +794,51 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
 }
 
+/// Why a presented frame is dumped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpDue {
+    No,
+    /// `XCL_FRAME_DUMP`: `frame_<n>.bmp`
+    Count,
+    /// only `XCL_FRAME_DUMP_MS`: `frame_<n>_<secs>s.bmp` (the run time, as in the log)
+    Time,
+}
+
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
 /// n > 1: every n-th; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
-fn frame_dump_due() -> bool {
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
+/// `XCL_FRAME_DUMP_MS=t`: also the shown frame whenever t ms passed since the last dump (the
+/// first frame always) – a title presenting once a second or slower still lands frames.
+fn frame_dump_due() -> DumpDue {
+    static EVERY: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| match std::env::var("XCL_FRAME_DUMP") {
         Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
         Err(_) => 0,
     });
-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+    static INTERVAL: std::sync::LazyLock<Option<Duration>> = std::sync::LazyLock::new(|| std::env::var("XCL_FRAME_DUMP_MS").ok()?.parse().ok().map(Duration::from_millis));
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let (every, interval) = (*EVERY, *INTERVAL);
+    if every == 0 && interval.is_none() {
+        return DumpDue::No;
+    }
+    let now = Instant::now();
+    let mut last = LAST.lock().unwrap();
+    let due = dump_due(PRESENTS.load(Ordering::Relaxed), every, interval, last.map(|t| now - t));
+    if due != DumpDue::No {
+        *last = Some(now);
+    }
+    due
+}
+
+/// `presents` shown so far; dump every `every`-th (0: none) and whenever `interval` passed since the
+/// last dump (`since_last` None: none yet)
+fn dump_due(presents: u64, every: u64, interval: Option<Duration>, since_last: Option<Duration>) -> DumpDue {
+    if every > 0 && presents % every == 20.min(every - 1) {
+        DumpDue::Count
+    } else if interval.is_some_and(|t| since_last.is_none_or(|d| d >= t)) {
+        DumpDue::Time
+    } else {
+        DumpDue::No
+    }
 }
 
 /// Frames shown so far.
@@ -939,7 +977,7 @@ fn small_float(v: u32, mantissa_bits: u32) -> f32 {
     }
 }
 
-unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, format: DXGI_FORMAT, tag: &str) {
+unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, format: DXGI_FORMAT, tag: &str, suffix: &str) {
     let mut p: *mut c_void = std::ptr::null_mut();
     if rb.Map(0, None, Some(&mut p)).is_err() || p.is_null() {
         return;
@@ -995,7 +1033,7 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
         }
     }
     let Some(boot) = crate::state::boot() else { return };
-    let path = boot.logs_dir().join(format!("{tag}_{n}.bmp"));
+    let path = boot.logs_dir().join(format!("{tag}_{n}{suffix}.bmp"));
     let _ = std::fs::write(&path, &bmp);
     crate::xlog_info!(
         "present: {tag} {n} ({w}x{h}, format {}) written to {} – {lit} of {} samples not black{}",
@@ -1033,6 +1071,22 @@ mod tests {
             rate.sample(start + Duration::from_millis(2_750), 1_080),
             40.0
         );
+    }
+
+    #[test]
+    fn frame_dump_by_count_and_time() {
+        let ms = Duration::from_millis;
+        // count only: frame 20 of every 120
+        assert_eq!(dump_due(20, 120, None, None), DumpDue::Count);
+        assert_eq!(dump_due(21, 120, None, None), DumpDue::No);
+        // time only: the first present always, then once the interval passed
+        assert_eq!(dump_due(0, 0, Some(ms(5000)), None), DumpDue::Time);
+        assert_eq!(dump_due(1, 0, Some(ms(5000)), Some(ms(4999))), DumpDue::No);
+        assert_eq!(dump_due(2, 0, Some(ms(5000)), Some(ms(5000))), DumpDue::Time);
+        // both: the count dump keeps its name
+        assert_eq!(dump_due(20, 120, Some(ms(5000)), Some(ms(9000))), DumpDue::Count);
+        assert_eq!(dump_due(21, 120, Some(ms(5000)), Some(ms(9000))), DumpDue::Time);
+        assert_eq!(dump_due(0, 0, None, None), DumpDue::No);
     }
 
     #[test]
@@ -1154,19 +1208,19 @@ mod frame_dump_tests {
                 buffer.Unmap(0, None);
             };
             fill(30);
-            write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
+            write_frame(&buffer, &fp, fp.Footprint.Format, "frame", "");
             let dark = last_frame_dump().unwrap();
             assert_eq!((dark.width, dark.height, dark.format), (8, 8, 28));
             assert_eq!(dark.sampled_pixels, (8 / dark.sample_step).pow(2) as u64);
             assert_eq!(dark.non_dark_samples, Some(0));
 
             fill(31);
-            write_frame(&buffer, &fp, fp.Footprint.Format, "rt");
+            write_frame(&buffer, &fp, fp.Footprint.Format, "rt", "");
             assert_eq!(last_frame_dump(), Some(dark), "intermediate targets must not replace frame content");
-            write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
+            write_frame(&buffer, &fp, fp.Footprint.Format, "frame", "");
             let bright = last_frame_dump().unwrap();
             assert_eq!(bright.non_dark_samples, Some(bright.sampled_pixels));
-            write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
+            write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame", "");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
         }
