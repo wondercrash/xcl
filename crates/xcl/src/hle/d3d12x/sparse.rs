@@ -34,6 +34,9 @@ use windows_sys::Win32::System::Memory::{
 const TILE: usize = 0x1_0000;
 /// tiles of a video-memory pool heap (64 MiB)
 const POOL_TILES: u32 = 1024;
+/// tiles decommitted while no title work was submitted that stay mapped (`State::parked`) before
+/// they are unmapped together: 256 MB of video memory
+const PARKED_MAX: usize = 4096;
 /// bytes of the ring-buffered upload staging buffer
 const STAGING: usize = 64 << 20;
 /// alignment of sub-allocations inside the upload staging ring (write-combined cacheline)
@@ -216,6 +219,13 @@ struct State {
     mapped: FxHashMap<usize, TileEntry>,
     /// pool tiles also used by placed buffers (not freed while they are)
     pinned: FxHashMap<(u32, u32), u32>,
+    /// tile address → pool tile of tiles decommitted since the last title submit, still mapped
+    /// in their window: unmapped together (`flush_parked`) before the next submit, when the free
+    /// list runs out, or past `PARKED_MAX`; a commit there before that takes its tile back with
+    /// no new mapping. (A retail title moving physical pages one at a time while it loads
+    /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
+    /// took ~0.15 ms.)
+    parked: FxHashMap<usize, (u32, u32)>,
     /// placed buffers → the pool tiles they use
     buffers: FxHashMap<usize, Vec<(u32, u32)>>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
@@ -534,6 +544,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             retired: Vec::new(),
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
+            parked: FxHashMap::default(),
             buffers: FxHashMap::default(),
             to_zero: Vec::new(),
             staging: None,
@@ -581,8 +592,19 @@ impl State {
     }
 
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
+        if self.free.is_empty() {
+            self.flush_parked();
+        }
         if let Some(t) = self.free.pop() {
             return Some((t, true));
+        }
+        // a pool retired a moment ago (its last tile came free) is taken back before a new
+        // 64 MB heap is made: freeing and allocating a tile in turn made a new pool each time,
+        // up to 18 GB of retired heaps in 2 s (#913). Its tiles are reused as freed tiles are
+        // (zeroed), so this is no less safe than reusing a tile of a pool in use.
+        if let Some((heap, _, _)) = self.retired.pop() {
+            let h = self.add_pool(heap);
+            return Some(((h, 0), true));
         }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_TILES as u64 * TILE as u64,
@@ -596,6 +618,13 @@ impl State {
             return None;
         }
         let heap = heap?;
+        let h = self.add_pool(heap);
+        Some(((h, 0), false))
+    }
+
+    /// `heap` becomes a pool (in a given-back pool's index if there is one); its tiles but the
+    /// first, which the caller takes, go to the free list.
+    fn add_pool(&mut self, heap: ID3D12Heap) -> u32 {
         let h = match self.pools.iter().position(|p| p.is_none()) {
             Some(i) => {
                 self.pools[i] = Some(heap);
@@ -607,7 +636,7 @@ impl State {
             }
         };
         self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
-        Some(((h, 0), false))
+        h
     }
 
     /// Pools whose every tile is free again go (64 MB of video memory each – and as much of the
@@ -733,16 +762,25 @@ impl State {
         let first = a & !(TILE - 1);
         let end = a.saturating_add(n);
         let mut new: Vec<(usize, (u32, u32))> = Vec::new();
+        let mut unparked = false;
         let mut t = first;
         while t < end {
             if !self.mapped.contains_key(&t) && self.window_index(t).is_some() {
-                let Some((tile, reused)) = self.take_tile() else { break };
-                self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
-                self.runs = None;
-                if reused {
+                // still mapped there: no new mapping, what it held is cleared
+                if let Some(tile) = self.parked.remove(&t) {
+                    self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
+                    self.runs = None;
                     self.to_zero.push((t, TILE));
+                    unparked = true;
+                } else {
+                    let Some((tile, reused)) = self.take_tile() else { break };
+                    self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
+                    self.runs = None;
+                    if reused {
+                        self.to_zero.push((t, TILE));
+                    }
+                    new.push((t, tile));
                 }
-                new.push((t, tile));
             }
             match t.checked_add(TILE) {
                 Some(next) => t = next,
@@ -750,6 +788,9 @@ impl State {
             }
         }
         if new.is_empty() {
+            if unparked {
+                MAPPED_GEN.fetch_add(1, Ordering::Release);
+            }
             return;
         }
         MAPPED_GEN.fetch_add(1, Ordering::Release);
@@ -1460,24 +1501,7 @@ pub unsafe fn committed(a: usize, n: usize) {
         early_add(&mut EARLY.lock().unwrap(), start, end);
         return;
     };
-    s.ensure_mapped(a, n, |_| 0xFFFF);
-    let mut pg = a & !(PAGE - 1);
-    let end = a.saturating_add(n);
-    while pg < end {
-        let t = pg & !(TILE - 1);
-        let tile_end = t.saturating_add(TILE).min(end);
-        if let Some(entry) = s.mapped.get_mut(&t) {
-            let mut p = pg;
-            while p < tile_end {
-                entry.holes &= !(1u16 << ((p - t) / PAGE));
-                p += PAGE;
-            }
-        }
-        if tile_end <= pg {
-            break;
-        }
-        pg = tile_end;
-    }
+    s.commit_range(a, n);
 }
 
 /// The title decommitted `[a, a + n)`: tiles whose pages are all uncommitted (whether in one
@@ -1493,32 +1517,92 @@ pub unsafe fn decommitted(a: usize, n: usize) {
         early_remove(&mut EARLY.lock().unwrap(), start, end);
         return;
     };
-    let tiles = decommit_tiles(&mut s.mapped, &s.pinned, &mut s.free, &mut s.to_zero, a, n);
-    if tiles.is_empty() {
-        return;
-    }
-    s.runs = None;
-    let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-    for &t in &tiles {
-        if let Some(wi) = s.window_index(t) {
-            by_window.entry(wi).or_default().push(t);
-        }
-    }
-    for (wi, ts) in by_window {
-        let (b, r) = (s.windows[wi].0, s.windows[wi].1.clone());
-        s.unmap_tiles(&r, b, &ts);
-    }
-    MAPPED_GEN.fetch_add(1, Ordering::Release);
-    s.signal();
-    s.retire_free_pools();
+    s.decommit_range(a, n);
 }
 
 impl State {
-    /// a pool tile no window maps and no buffer uses goes back to the free list
+    /// `committed` with the state locked
+    unsafe fn commit_range(&mut self, a: usize, n: usize) {
+        self.ensure_mapped(a, n, |_| 0xFFFF);
+        let mut pg = a & !(PAGE - 1);
+        let end = a.saturating_add(n);
+        while pg < end {
+            let t = pg & !(TILE - 1);
+            let tile_end = t.saturating_add(TILE).min(end);
+            if let Some(entry) = self.mapped.get_mut(&t) {
+                let mut p = pg;
+                while p < tile_end {
+                    entry.holes &= !(1u16 << ((p - t) / PAGE));
+                    p += PAGE;
+                }
+            }
+            if tile_end <= pg {
+                break;
+            }
+            pg = tile_end;
+        }
+    }
+
+    /// `decommitted` with the state locked: the tiles that go are parked (`flush_parked` unmaps
+    /// them and frees their pool tiles)
+    unsafe fn decommit_range(&mut self, a: usize, n: usize) {
+        let mut pools: Vec<(usize, (u32, u32))> = Vec::new();
+        let mut t = a & !(TILE - 1);
+        let end = a.saturating_add(n);
+        while t < end {
+            if let Some(e) = self.mapped.get(&t) {
+                pools.push((t, e.pool));
+            }
+            match t.checked_add(TILE) {
+                Some(next) => t = next,
+                None => break,
+            }
+        }
+        let tiles = decommit_tiles(&mut self.mapped, &self.pinned, &mut Vec::new(), &mut self.to_zero, a, n);
+        if tiles.is_empty() {
+            return;
+        }
+        self.runs = None;
+        for &t in &tiles {
+            if let Ok(i) = pools.binary_search_by_key(&t, |p| p.0) {
+                self.parked.insert(t, pools[i].1);
+            }
+        }
+        MAPPED_GEN.fetch_add(1, Ordering::Release);
+        if self.parked.len() >= PARKED_MAX && self.flush_parked() {
+            self.retire_free_pools();
+        }
+    }
+
+    /// a pool tile no window maps, none is parked on and no buffer uses goes back to the free list
     fn release_if_unused(&mut self, tile: (u32, u32)) {
-        if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) {
+        if !self.pinned.contains_key(&tile) && !self.mapped.values().any(|e| e.pool == tile) && !self.parked.values().any(|&p| p == tile) {
             self.free.push(tile);
         }
+    }
+
+    /// The parked tiles unmapped from their windows (one call per window) and their pool tiles
+    /// free (but those of placed buffers). Pools left all free are not retired here: callers do
+    /// that (`retire_free_pools`) unless they take a tile right away.
+    unsafe fn flush_parked(&mut self) -> bool {
+        if self.parked.is_empty() {
+            return false;
+        }
+        let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+        for (t, tile) in std::mem::take(&mut self.parked) {
+            if let Some(wi) = self.window_index(t) {
+                by_window.entry(wi).or_default().push(t);
+            }
+            if !self.pinned.contains_key(&tile) {
+                self.free.push(tile);
+            }
+        }
+        for (wi, ts) in by_window {
+            let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
+            self.unmap_tiles(&r, b, &ts);
+        }
+        self.signal();
+        true
     }
 }
 
@@ -1559,6 +1643,10 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
+    // the title's work sees what was decommitted unmapped, as it was
+    if s.flush_parked() {
+        s.retire_free_pools();
+    }
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
     let zero_runs = std::mem::take(&mut s.to_zero);
@@ -1722,6 +1810,80 @@ mod tests {
             .collect();
         for t in threads {
             t.join().unwrap();
+        }
+    }
+
+    /// Freeing the last tile in use of a pool and taking a tile again takes the retired pool
+    /// back, not a new 64 MB heap each time (#913: 288 pools, 18 GB asked of a 12 GB card).
+    #[test]
+    fn a_pool_retired_a_moment_ago_is_taken_back() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+            rb_list.Close().expect("rb_list close");
+            let mut s = State {
+                dev,
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: Vec::new(),
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                parked: FxHashMap::default(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                queue_rb: FxHashMap::default(),
+                unlanded: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+
+            let (first, reused) = s.take_tile().expect("a tile from a new pool");
+            assert!(!reused, "a new pool's tile needs no clearing");
+            s.free.push(first);
+            s.retire_free_pools();
+            assert_eq!(s.retired.len(), 1, "an all-free pool is retired");
+            for round in 0..8 {
+                let (tile, reused) = s.take_tile().expect("a tile");
+                assert!(reused, "round {round}: a tile of a retired pool is cleared before use");
+                s.free.push(tile);
+                s.retire_free_pools();
+                assert_eq!(s.retired.len(), 1, "round {round}: the retired pool was taken back, not a new one made");
+                assert_eq!(s.pools.iter().filter(|p| p.is_some()).count(), 0, "round {round}");
+            }
         }
     }
 
@@ -1895,6 +2057,7 @@ mod tests {
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
+                parked: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -1938,6 +2101,123 @@ mod tests {
             let page0 = std::slice::from_raw_parts(base as *const u8, PAGE);
             scan_page(page0, base, &mut entry.sent[0], &mut dirty);
             assert_eq!(dirty, vec![(base, CHUNK)]);
+
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// A tile decommitted and committed again before the next submit gets its pool tile back
+    /// with no new tile mapping (cleared instead). One that is not is unmapped and freed by
+    /// `flush_parked` (before a submit), or when the free list runs out; a placed buffer's
+    /// release does not free it while it is parked.
+    #[test]
+    fn a_tile_decommitted_and_committed_again_keeps_its_video_memory() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let base = VirtualAlloc(std::ptr::null(), 2 * TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert!(base != 0 && base % TILE == 0);
+            let mut reserved: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&buffer_desc((2 * TILE) as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved)
+                .expect("CreateReservedResource");
+            let reserved = reserved.expect("reserved buffer");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+            rb_list.Close().expect("rb_list close");
+
+            let mut s = State {
+                dev,
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: vec![(base, reserved)],
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                parked: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                queue_rb: FxHashMap::default(),
+                unlanded: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+
+            s.commit_range(base, TILE);
+            let tile = s.mapped[&base].pool;
+            let v = s.value;
+            assert!(v > 0, "a new tile is mapped");
+
+            // decommitted: parked, still mapped, nothing sent to the GPU
+            s.decommit_range(base, TILE);
+            assert!(!s.mapped.contains_key(&base));
+            assert_eq!(s.parked.get(&base), Some(&tile));
+            assert!(!s.free.contains(&tile));
+            assert_eq!(s.value, v, "no tile mapping changed");
+            s.release_if_unused(tile);
+            assert!(!s.free.contains(&tile), "a parked tile is not free");
+
+            // committed again: the same tile, cleared, no new mapping
+            s.to_zero.clear();
+            let gen = mapped_gen();
+            s.commit_range(base, TILE);
+            assert_eq!(s.mapped[&base].pool, tile);
+            assert_eq!(s.mapped[&base].holes, 0);
+            assert!(s.parked.is_empty());
+            assert_eq!(s.to_zero, vec![(base, TILE)]);
+            assert_eq!(s.value, v, "no tile mapping changed");
+            assert!(mapped_gen() > gen, "readers of `mapped` see it changed");
+
+            // decommitted and flushed (as before a submit): unmapped and free
+            s.decommit_range(base, TILE);
+            assert!(s.flush_parked());
+            assert!(s.parked.is_empty());
+            assert!(s.free.contains(&tile));
+            assert!(s.value > v, "the unmapping is sent");
+            assert!(!s.flush_parked(), "nothing left to flush");
+
+            // no free tile left: the parked one is flushed and taken for the next commit
+            s.commit_range(base, TILE);
+            let tile = s.mapped[&base].pool;
+            s.decommit_range(base, TILE);
+            s.free.clear();
+            s.commit_range(base + TILE, TILE);
+            assert!(s.parked.is_empty());
+            assert_eq!(s.mapped[&(base + TILE)].pool, tile);
+            assert!(!s.mapped.contains_key(&base));
 
             s.wait_for(s.value);
             drop(s);
