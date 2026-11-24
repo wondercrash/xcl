@@ -65,9 +65,10 @@ thread_local! {
 }
 
 /// This thread is a worker and one of the title's threads waits for what it is building: the
-/// build must not stand back for the title's sake (`real::big_compile_turn`).
+/// build must not stand back for the title's sake (`real::big_compile_turn`). Not one the binds
+/// go on without (`XCL_PSO_SKIP_HUGE`): it takes its turn like those built ahead.
 pub(super) fn build_is_wanted() -> bool {
-    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.waited_for(skip_huge())))
 }
 
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and
@@ -463,6 +464,7 @@ mod used_tests {
         let p = entry(huge).unwrap();
         assert!(is_pending(huge) && !p.late.load(Ordering::Acquire), "still being built; no budget ran out");
         assert!(p.skip_logged.load(Ordering::Acquire));
+        assert!(p.demand.lock().unwrap().wanted && !p.waited_for(limit), "its driver compile takes its turn: no bind waits for it");
         go.send(()).unwrap();
         let start = std::time::Instant::now();
         while is_pending(huge) && start.elapsed() < std::time::Duration::from_secs(10) {
@@ -867,6 +869,11 @@ impl Pending {
     /// `skip_huge`).
     fn too_big(&self, huge: Option<usize>) -> bool {
         huge.is_some_and(|h| self.compiles.load(Ordering::Acquire) && self.dxil.load(Ordering::Relaxed) >= h)
+    }
+
+    /// A bind waits for it, unless binds go on without it for its size (`too_big`).
+    fn waited_for(&self, huge: Option<usize>) -> bool {
+        self.demand.lock().unwrap().wanted && !self.too_big(huge)
     }
 
     /// "compute pipeline 0x… (shader set …, console shader …, N B DXIL)": what is known of it.
