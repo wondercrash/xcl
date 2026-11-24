@@ -825,6 +825,11 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             super::breadcrumbs::skipped(list.as_raw(), (*p).pc, || format!("Dispatch {x}x{y}x{z} (console list) skipped: no translated console shader"));
                             continue;
                         }
+                        if super::real::skip_requested(real) {
+                            out.skipped_dispatches += 1;
+                            super::breadcrumbs::skipped(list.as_raw(), real, || format!("Dispatch {x}x{y}x{z} (console list) skipped: XCL_SKIP_SHADERS"));
+                            continue;
+                        }
                         let user_sgprs = super::real::pso_user_sgprs(real);
                         let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;

@@ -1699,6 +1699,78 @@ pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
     PSO_SHADERS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
 
+/// `XCL_SKIP_SHADERS=hash,…` (dump hashes, hex, as the breadcrumbs name a shader): console
+/// compute shaders whose dispatches and ExecuteIndirects are not run – to see whether the GPU
+/// standing still is one shader's doing, and what the title does without it.
+fn skip_shaders() -> &'static [u64] {
+    static S: std::sync::LazyLock<Vec<u64>> = std::sync::LazyLock::new(|| {
+        let (named, not) = parse_shader_hashes(&std::env::var("XCL_SKIP_SHADERS").unwrap_or_default());
+        if !not.is_empty() {
+            crate::xlog_warn!("D3D12.X: XCL_SKIP_SHADERS: not a shader's hash (16 hex digits at most): {}", not.join(", "));
+        }
+        if !named.is_empty() {
+            crate::xlog_warn!("D3D12.X: XCL_SKIP_SHADERS: dispatches and ExecuteIndirects of the console compute shader(s) {} are not run", named.iter().map(|h| format!("{h:016x}")).collect::<Vec<_>>().join(", "));
+        }
+        named
+    });
+    #[cfg(test)]
+    if let Some(named) = SKIP_SHADERS_FOR_TEST.with(|s| s.get()) {
+        return named;
+    }
+    &S
+}
+
+/// The hashes of a `hash,…` list, and its entries that are none.
+fn parse_shader_hashes(list: &str) -> (Vec<u64>, Vec<String>) {
+    let (mut named, mut not) = (Vec::new(), Vec::new());
+    for h in list.split(',').map(str::trim).filter(|h| !h.is_empty()) {
+        match u64::from_str_radix(h.trim_start_matches("0x"), 16) {
+            Ok(v) => named.push(v),
+            Err(_) => not.push(h.to_owned()),
+        }
+    }
+    (named, not)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `XCL_SKIP_SHADERS` for the current thread's test.
+    pub(super) static SKIP_SHADERS_FOR_TEST: std::cell::Cell<Option<&'static [u64]>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[test]
+fn a_list_of_shader_hashes_is_read_as_hex() {
+    assert_eq!(parse_shader_hashes(""), (vec![], vec![]));
+    assert_eq!(parse_shader_hashes("18567a5f0145bde9, 0xB0C0FED0CDF7FD9C,"), (vec![0x1856_7A5F_0145_BDE9, 0xB0C0_FED0_CDF7_FD9C], vec![]));
+    assert_eq!(parse_shader_hashes("1f,CS_Clear,123456789abcdef01"), (vec![0x1F], vec!["CS_Clear".to_owned(), "123456789abcdef01".to_owned()]));
+}
+
+/// Whether `pso` (a stand-in resolved) runs a console compute shader `XCL_SKIP_SHADERS` names:
+/// its dispatch or ExecuteIndirect is skipped. The first of each shader is logged.
+pub(super) fn skip_requested(pso: usize) -> bool {
+    let named = skip_shaders();
+    if named.is_empty() {
+        return false;
+    }
+    let Some((cs, 0)) = pso_shaders(pso) else { return false };
+    if !named.contains(&cs) {
+        return false;
+    }
+    static LOGGED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let mut g = LOGGED.lock().unwrap();
+    if !g.contains(&cs) {
+        g.push(cs);
+        crate::xlog_warn!("D3D12.X: XCL_SKIP_SHADERS: console shader {cs:016x} is skipped from here on (first with pipeline {pso:#x})");
+    }
+    true
+}
+
+#[cfg(test)]
+pub(super) fn note_pso_shaders_for_test(pso: usize, cs: u64) {
+    PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, (cs, 0));
+}
+
 pub fn is_translated_graphics(pso: usize) -> bool {
     pso != 0 && TRANSLATED_GRAPHICS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
@@ -3732,7 +3804,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
-    if super::breadcrumbs::on() {
+    if super::breadcrumbs::on() || !skip_shaders().is_empty() {
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(cs), 0));
     }
     crate::xlog_info!(

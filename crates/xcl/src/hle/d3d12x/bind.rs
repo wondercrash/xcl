@@ -287,6 +287,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         return;
     }
+    if compute && super::real::skip_requested(pso) {
+        count(DISPATCHES_SKIPPED);
+        super::breadcrumbs::skipped(this, pso, || format!("ExecuteIndirect max {max} skipped: XCL_SKIP_SHADERS"));
+        return;
+    }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
@@ -756,6 +761,11 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         super::breadcrumbs::skipped(this, with(this, |s| s.pso), || format!("Dispatch {x}x{y}x{z} skipped: no translated console shader"));
         return;
     }
+    if super::real::skip_requested(pso) {
+        count(DISPATCHES_SKIPPED);
+        super::breadcrumbs::skipped(this, pso, || format!("Dispatch {x}x{y}x{z} skipped: XCL_SKIP_SHADERS"));
+        return;
+    }
     match translated_dispatch(this, list, pso, x, y, z) {
         Ok(()) => {
             count(DISPATCHES);
@@ -1223,6 +1233,59 @@ mod tests {
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);
+    }
+
+    /// `XCL_SKIP_SHADERS`: a dispatch and an ExecuteIndirect of a pipeline that runs a named
+    /// console shader record nothing on the PC list and count as skipped; another shader's
+    /// pipeline goes on to its bind.
+    #[test]
+    fn dispatches_of_a_shader_named_to_skip_are_not_run() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[14] = fake_dispatch as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        orig_vt[29] = fake_set_compute_rs as usize;
+        orig_vt[41] = fake_set_compute_uav as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
+        let (named, other) = (0x7400_0001usize, 0x7400_0002usize);
+        for (pso, cs) in [(named, 0x1856_7A5F_0145_BDE9u64), (other, 0xB0C0_FED0_CDF7_FD9C)] {
+            real::register_translated_compute_for_test(pso);
+            real::note_pso_shaders_for_test(pso, cs);
+        }
+        assert!(!real::skip_requested(named), "no shader is named");
+        real::SKIP_SHADERS_FOR_TEST.with(|s| s.set(Some(&[0x1856_7A5F_0145_BDE9])));
+        assert!(real::skip_requested(named) && !real::skip_requested(other) && !real::skip_requested(0x7400_0003));
+
+        reset(list_ptr, 0x7400_0100, named);
+        let before = counts_snapshot();
+        unsafe {
+            dispatch(list_ptr, 3, 1, 1);
+            execute_indirect(list_ptr, 0x7400_00F0, 1, 0, 0, 0, 0);
+        }
+        let after = counts_snapshot();
+        real::SKIP_SHADERS_FOR_TEST.with(|s| s.set(None));
+        assert_eq!(after[DISPATCHES_SKIPPED], before[DISPATCHES_SKIPPED] + 2);
+        assert_eq!(after[DISPATCHES], before[DISPATCHES]);
+        assert_eq!(fake.dispatch_calls.load(Ordering::Relaxed) + fake.execute_indirect_calls.load(Ordering::Relaxed), 0, "nothing of the named shader runs");
+        assert_eq!(fake.set_compute_rs_calls.load(Ordering::Relaxed) + fake.set_pso_calls.load(Ordering::Relaxed), 0, "and nothing is bound for it");
+
+        forget(list_ptr);
+        real::forget_pso_for_test(named);
+        real::forget_pso_for_test(other);
     }
 
     /// A two-pass mesh/GS pipeline is built with XCL's mesh root signature and registered in
