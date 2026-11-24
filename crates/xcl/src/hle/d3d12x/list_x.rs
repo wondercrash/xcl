@@ -1970,7 +1970,12 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
 unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)], sparse_after: bool) {
     let (gated, other): (Vec<PendingWait>, Vec<PendingWait>) = waits.iter().copied().partition(|w| w.gate);
     wait_all_on(queue, &other, list_writes);
-    let gated: Vec<PendingWait> = gated.into_iter().filter(|w| !w.progress_reached()).collect();
+    // A value this very list writes later can only be reached after the list: skipped, as
+    // `try_gpu_wait` does for a same-batch self-wait, instead of gating the list on itself.
+    let gated: Vec<PendingWait> = gated
+        .into_iter()
+        .filter(|w| !w.progress_reached() && !list_writes.iter().any(|&(va, v)| va == w.va && v >= w.value))
+        .collect();
     if gated.is_empty() {
         return;
     }
