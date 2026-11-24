@@ -670,12 +670,21 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>, huge: Optio
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     p.want();
+    // only a call that waits is counted: not one for a pipeline built already, late
+    // (`XCL_PSO_WAIT_MS`) or known to be too big to wait for (`XCL_PSO_SKIP_HUGE`)
+    let waits = !*p.done.lock().unwrap() && !p.late.load(Ordering::Acquire) && !p.too_big(huge);
+    let started = Instant::now();
     if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget, huge);
+        let r = resolve_within(&p, pso, budget, huge);
+        if waits {
+            note_blocked(p.compute, false, started.elapsed());
+        }
+        return r;
     }
     // (with a size limit, built on a thread of its own: this one may go on without it)
     let aside = huge.is_some() && p.job.lock().unwrap().is_some() && build_aside(&p);
     let job = if aside { None } else { p.job.lock().unwrap().take() };
+    let built_here = job.is_some();
     if let Some(job) = job {
         // built on this thread: as long a wait
         let start = Instant::now();
@@ -693,6 +702,9 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>, huge: Optio
         }
     }
     wait_built(&p, None, huge);
+    if waits {
+        note_blocked(p.compute, built_here, started.elapsed());
+    }
     match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
@@ -768,6 +780,42 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration, hug
         crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
     }
     pso
+}
+
+/// What `resolve_wait` cost the threads that called it – a title's, as a rule: for graphics
+/// [0] and compute [1] pipelines, the waits, their total and longest µs, and those that built
+/// the pipeline themselves. A retail title's render thread spent most of its frames in the
+/// driver's compiler this way (on an NVIDIA GPU; its hang watchdog then ended it).
+static BLOCKED: [[AtomicU64; 4]; 2] = [const { [const { AtomicU64::new(0) }; 4] }; 2];
+const WAITS: usize = 0;
+const TOTAL_US: usize = 1;
+const LONGEST_US: usize = 2;
+const BUILT_HERE: usize = 3;
+
+/// (waits, total µs, longest µs, built by the caller) of `resolve_wait`, graphics then compute
+pub fn blocked() -> [[u64; 4]; 2] {
+    BLOCKED.each_ref().map(|k| k.each_ref().map(|c| c.load(Ordering::Relaxed)))
+}
+
+/// A `resolve_wait` that found its pipeline not built yet: counted, and logged at every power of
+/// two of them (a long wait itself is logged by `wait_built` and on the binding thread).
+fn note_blocked(compute: bool, built_here: bool, took: std::time::Duration) {
+    let us = took.as_micros() as u64;
+    let k = &BLOCKED[compute as usize];
+    let n = k[WAITS].fetch_add(1, Ordering::Relaxed) + 1;
+    k[TOTAL_US].fetch_add(us, Ordering::Relaxed);
+    k[LONGEST_US].fetch_max(us, Ordering::Relaxed);
+    if built_here {
+        k[BUILT_HERE].fetch_add(1, Ordering::Relaxed);
+    }
+    if n.is_power_of_two() {
+        let b = blocked();
+        crate::xlog_info!(
+            "D3D12.X: pipelines waited for at a bind so far: {} graphics ({} ms, longest {} ms, {} built in the call), {} compute ({} ms, longest {} ms, {} built in the call)",
+            b[0][WAITS], b[0][TOTAL_US] / 1000, b[0][LONGEST_US] / 1000, b[0][BUILT_HERE],
+            b[1][WAITS], b[1][TOTAL_US] / 1000, b[1][LONGEST_US] / 1000, b[1][BUILT_HERE],
+        );
+    }
 }
 
 /// For binding: compute pipelines are waited for, graphics ones are not.
@@ -1163,5 +1211,54 @@ mod queued_release_tests {
             assert_eq!(released(0xcafe_1000 + k), 0);
         }
         assert!(!called.load(Ordering::Acquire), "released job reached the compiler");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bind that waits for a lazy pipeline nobody has started builds it itself, and the time
+    /// it was held up is counted under its kind (other tests wait too: increases are checked).
+    #[test]
+    fn a_wait_that_builds_the_pipeline_is_counted_with_its_time() {
+        let standin = 0x7E57_C001usize;
+        let before = blocked();
+        submit_lazy(standin, false, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            0x4401
+        }), 0);
+        assert_eq!(resolve_wait(standin), 0x4401);
+        let after = blocked();
+        let (b, a) = (before[0], after[0]);
+        assert!(a[WAITS] > b[WAITS], "the graphics wait is counted");
+        assert!(a[BUILT_HERE] > b[BUILT_HERE], "built by the caller: nobody had started it");
+        assert!(a[TOTAL_US] - b[TOTAL_US] >= 50_000, "its 50 ms are in the total");
+        assert!(a[LONGEST_US] >= 50_000);
+        released(standin);
+    }
+
+    /// A bind with a wait budget (`XCL_PSO_WAIT_MS`) is counted with the time it waited, not
+    /// as built in the call: the build goes to the workers (other tests wait too: increases
+    /// are checked).
+    #[test]
+    fn a_bounded_wait_is_counted_with_the_time_it_waited() {
+        let standin = 0x7E57_C002usize;
+        submit(standin, true, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            0x4402
+        }));
+        let before = blocked();
+        let budget = Some(std::time::Duration::from_millis(30));
+        assert_eq!(resolve_wait_for(standin, budget, None), standin, "not built within the budget: the stand-in");
+        let after = blocked();
+        let (b, a) = (before[1], after[1]);
+        assert!(a[WAITS] > b[WAITS], "the compute wait is counted");
+        assert!(a[TOTAL_US] - b[TOTAL_US] >= 30_000, "with the budget it waited");
+        let start = std::time::Instant::now();
+        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = released(standin);
     }
 }
