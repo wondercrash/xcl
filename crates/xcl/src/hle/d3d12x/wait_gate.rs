@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of, transmute, ManuallyDrop};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, LazyLock};
+use std::sync::{mpsc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, GUID, HRESULT};
@@ -61,6 +61,38 @@ static TX: LazyLock<Result<mpsc::Sender<Gate>, String>> = LazyLock::new(|| {
 /// What a gate waits for, for its warnings: `true` once the queue stands at the gate.
 type Describe = Box<dyn Fn(bool) -> String + Send>;
 
+/// queue → gates armed on it that the CPU has not opened yet
+static CLOSED: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+/// Whether `queue` has a gate the CPU has not opened yet: work submitted to it now may only run
+/// after a submission the title makes later, so nothing in the title's call may wait for it.
+pub(super) fn closed_on(queue: usize) -> bool {
+    CLOSED.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&queue))
+}
+
+/// Counts its gate in `CLOSED` until it is dropped (the gate opened or given up).
+struct Closed(usize);
+
+impl Closed {
+    fn new(queue: usize) -> Self {
+        *CLOSED.lock().unwrap().get_or_insert_with(HashMap::new).entry(queue).or_insert(0) += 1;
+        Closed(queue)
+    }
+}
+
+impl Drop for Closed {
+    fn drop(&mut self) {
+        let mut g = CLOSED.lock().unwrap();
+        let Some(m) = g.as_mut() else { return };
+        if let Some(n) = m.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.0);
+            }
+        }
+    }
+}
+
 struct Gate {
     queue: usize,
     /// arm order, to count the gates queued earlier on the same queue
@@ -70,6 +102,8 @@ struct Gate {
     // Only release it on confirmed retirement/removal, even if the worker exits unexpectedly.
     fence: ManuallyDrop<ID3D12Fence>,
     ready: Option<Box<dyn Fn() -> bool + Send>>,
+    /// while the CPU has not opened the gate (`closed_on`)
+    closed: Option<Closed>,
     describe: Describe,
     warn_at: Option<Instant>,
     armed_at: Instant,
@@ -155,6 +189,7 @@ impl Gate {
             return self.failed(unsafe { fence::api_error(&self.device, "ID3D12Fence::Signal", e) });
         }
         self.ready = None;
+        self.closed = None;
         if self.retire_at.is_some() { Poll::Pending } else { Poll::KeepFence }
     }
 }
@@ -266,6 +301,7 @@ unsafe fn arm_with(
         device,
         fence: ManuallyDrop::new(fence),
         ready: armed.then(|| Box::new(ready) as Box<dyn Fn() -> bool + Send>),
+        closed: armed.then(|| Closed::new(queue as usize)),
         describe,
         warn_at: Some(Instant::now() + WARN_AFTER),
         armed_at: Instant::now(),
@@ -375,6 +411,26 @@ mod tests {
             let opened = until(Duration::from_millis(3200).saturating_sub(start.elapsed()), reached);
             assert!(held, "the first gate opened before its release time");
             assert!(opened, "gates armed before the first release each waited a full release time");
+        }
+    }
+
+    #[test]
+    fn gate_marks_its_queue_closed_until_the_cpu_opens_it() {
+        unsafe {
+            let Some((dev, queue)) = device_and_queue() else { return };
+            let tail = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let q = queue.as_raw() as usize;
+            let value = Arc::new(AtomicBool::new(false));
+            let seen = value.clone();
+            arm_with(queue.as_raw(), move || seen.load(Ordering::Acquire), Box::new(|_| "test gate".to_owned()), None).unwrap();
+            queue.Signal(&tail, 1).unwrap();
+            let closed = closed_on(q);
+            value.store(true, Ordering::Release);
+            let opened = until(Duration::from_secs(5), || fence::completed_value(&tail, &dev).is_ok_and(|v| v >= 1));
+            let reopened = until(Duration::from_secs(1), || !closed_on(q));
+            assert!(closed, "an armed gate the CPU has not opened must mark its queue");
+            assert!(opened, "the gate did not open once its value came");
+            assert!(reopened, "an opened gate still marks its queue");
         }
     }
 }

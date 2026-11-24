@@ -1929,7 +1929,14 @@ pub(super) fn take_cpu_writes_for_test(list: *mut c_void, progress_va: u64) -> V
 /// When `queue` is non-null, gated waits (`PendingWait::gate`) become queue-side gates and other
 /// monotonic 64-bit waits backed by a recorded `Write64BitValue*` are bridged to GPU-side
 /// `queue.Wait`, without blocking the submitter thread on the CPU.
-pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
+pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], submit: impl FnMut(&[*mut c_void])) {
+    execute_with_waits_before(queue, lists, false, submit);
+}
+
+/// `execute_with_waits_on` for `lists` that the caller follows on `queue` with one more list
+/// (KickoffX's active segment). `sparse_tail`: that list has sparse writes, so gated waits in
+/// `lists` keep the bounded CPU wait, as for a list with sparse writes later in `lists`.
+unsafe fn execute_with_waits_before(queue: *mut c_void, lists: &[*mut c_void], sparse_tail: bool, mut submit: impl FnMut(&[*mut c_void])) {
     if lists.is_empty() || PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
         submit(lists);
         return;
@@ -1955,7 +1962,7 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
         if i > start {
             submit(&lists[start..i]);
         }
-        wait_or_gate(queue, waits, list_writes, last_sparse.is_some_and(|last| last >= i));
+        wait_or_gate(queue, waits, list_writes, sparse_tail || last_sparse.is_some_and(|last| last >= i));
         start = i;
     }
     if start < lists.len() {
@@ -1966,9 +1973,11 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
 /// Wait for `waits` before the list that recorded them goes to `queue`. Gated waits arm a
 /// queue-side gate (`wait_gate`) that the CPU opens once it sees the progress value, so XCL adds
 /// no GPU-to-GPU wait that another queue's later submission could close into a cycle. With
-/// sparse writes at or after the gated list in the same submission, the synchronous sparse
-/// readback would block on this very queue and keep the submitting thread from submitting the
-/// producer on another queue: those waits keep the bounded CPU wait.
+/// sparse writes at or after the gated list in the same submission (or in KickoffX's active
+/// segment after its earlier ones), the synchronous sparse readback would block on this very
+/// queue and keep the submitting thread from submitting the producer on another queue: those
+/// waits keep the bounded CPU wait. A later submission to a queue whose gate is still closed has
+/// its readback recorded on that queue and landed by a worker (`sparse::readback_after_execute`).
 unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)], sparse_after: bool) {
     let (gated, other): (Vec<PendingWait>, Vec<PendingWait>) = waits.iter().copied().partition(|w| w.gate);
     wait_all_on(queue, &other, list_writes);
@@ -2925,7 +2934,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
-            execute_with_waits_on(q_raw, prior, |chunk| {
+            execute_with_waits_before(q_raw, prior, !sparse_writes.is_empty(), |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
                 super::breadcrumbs::executed(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
