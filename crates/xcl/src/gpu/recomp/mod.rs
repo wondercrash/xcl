@@ -1388,11 +1388,12 @@ pub struct MemoryUse {
     pub atomic: bool,
     /// GDS, ordered counts, GWS
     pub gds: bool,
-    /// a vector or scalar load with GLC or DLC: past the CU's / shader array's caches
+    /// a vector or scalar load with GLC or DLC (GLC: shader-array or device scope on the
+    /// console; DLC alone stays CU scope, counted to be safe)
     pub coherent_load: bool,
     /// BUFFER_GL0_INV, BUFFER_GL1_INV, S_DCACHE_INV, S_GL1_INV
     pub invalidate: bool,
-    /// a vector (buffer / global / flat) load
+    /// a vector (buffer / global / flat) load, or a BVH node read (`image_bvh*_intersect_ray`)
     pub vector_load: bool,
     /// a vector (buffer / global / flat) store
     pub vector_store: bool,
@@ -1427,6 +1428,11 @@ impl MemoryUse {
                         u.coherent_load |= flag("GLC") || flag("DLC");
                     }
                 }
+                // the ray-box / ray-triangle tests read BVH nodes from memory (`mem`)
+                "ENC_MIMG" if name.contains("BVH") => {
+                    u.vector_load = true;
+                    u.coherent_load |= flag("GLC") || flag("DLC");
+                }
                 "ENC_DS" => u.gds |= flag("GDS") || name == "DS_ORDERED_COUNT" || name.starts_with("DS_GWS_"),
                 _ => {}
             }
@@ -1459,10 +1465,27 @@ impl MemoryUse {
     }
 }
 
-/// `XCL_CS_COHERENT=1`: every compute program's memory windows are `globallycoherent` (the
-/// form before `MemoryUse::coherent_because`).
-fn all_compute_coherent() -> bool {
-    std::env::var("XCL_CS_COHERENT").is_ok_and(|v| v.trim() == "1")
+/// The switches over compute programs' memory views (`compute_coherent_because`); a translation
+/// cached without them does not hold while one is set (`pso::cache_allowed`).
+pub const COMPUTE_MEMORY_SWITCHES: [&str; 2] = ["XCL_CS_COHERENT", "XCL_CS_CACHED_ALL"];
+
+/// Why a compute program's memory windows are `globallycoherent` (None: the cached view):
+/// `MemoryUse::coherent_because`, unless `all_coherent` (`XCL_CS_COHERENT=1`: every program,
+/// the form before the rule) or else `all_cached` (`XCL_CS_CACHED_ALL=1`: none – atomics are
+/// still atomic; the console gives the loads of every retail program CU scope, which a title
+/// run with it can check).
+pub fn compute_coherent_because(u: &MemoryUse, all_coherent: bool, all_cached: bool) -> Option<&'static str> {
+    if all_coherent {
+        Some("XCL_CS_COHERENT")
+    } else if all_cached {
+        None
+    } else {
+        u.coherent_because()
+    }
+}
+
+fn switch_on(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v.trim() == "1")
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
@@ -1509,7 +1532,8 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     // wave-uniform loads from a heap over process memory: 75 ms for a 2560x1440 pass, cached
     // 2.3 ms)
     if matches!(opt.mode, Mode::Compute(_)) {
-        em.coherent_mem = if all_compute_coherent() { Some("XCL_CS_COHERENT") } else { MemoryUse::of(&insts).coherent_because() };
+        let [coherent, cached] = COMPUTE_MEMORY_SWITCHES.map(switch_on);
+        em.coherent_mem = compute_coherent_because(&MemoryUse::of(&insts), coherent, cached);
     }
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
