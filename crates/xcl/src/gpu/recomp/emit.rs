@@ -4223,21 +4223,28 @@ impl Em {
         self.x64() && (self.uses_lds || matches!(self.opt.mode, Mode::Geometry(_)))
     }
 
+    /// Split wave64 with console LDS: the first word of the exchange in `xcl_lds`. The D3D12
+    /// limit (32 KB) is the whole block already: the slots (console wave, half, parity), the
+    /// arrival counters (console wave, half), the wave counter of `xcl_x_thread` and the
+    /// optional safe-barrier words at 8189..8190 take its top, and the program's LDS accesses
+    /// stop below it (`XCL_X_LDS_TOP`, the word every access above is clamped onto).
+    pub(super) fn x64_lds_base(&self) -> Option<usize> {
+        if !self.x64_lds() {
+            return None;
+        }
+        let waves = self.x64_threads().div_ceil(64).max(1) as usize;
+        let bar_words = if self.safe_barrier { 2 } else { 0 };
+        Some(8192 - waves * 4 * self.x64_words - waves * 2 - 1 - bar_words)
+    }
+
     /// Storage and functions of the split wave64 form (`PRELUDE_X64`).
     fn x64_prelude(&self, h: &mut String) {
         let threads = self.x64_threads();
         let waves = threads.div_ceil(64).max(1) as usize;
         let slot = self.x64_words;
-        // slots (console wave, half, parity), the arrival counters (console wave, half), the
-        // wave counter of `xcl_x_thread`
         let (slots, counters) = (waves * 4 * slot, waves * 2);
         let _ = writeln!(h, "#define XCL_X_THREADS {threads}u\n#define XCL_X_WAVES {waves}u\n#define XCL_X_SLOT {slot}u\n#define XCL_X_SPIN {}", self.x64_spin() as u32);
-        if self.x64_lds() {
-            // the D3D12 limit (32 KB) is the whole block already: the exchange (and optional
-            // safe-barrier words at 8189..8190) takes its top, the program's LDS accesses stop
-            // below it (`XCL_X_LDS_TOP`)
-            let bar_words = if self.safe_barrier { 2 } else { 0 };
-            let base = 8192 - slots - counters - 1 - bar_words;
+        if let Some(base) = self.x64_lds_base() {
             h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB); the top holds the wave64 exchange\n");
             let _ = writeln!(h, "#define XCL_X_LDS_TOP {}u", base - 1);
             let _ = writeln!(h, "#define XCL_XS(i) xcl_lds[{base}u + (i)]\n#define XCL_XC(i) xcl_lds[{}u + (i)]\n#define XCL_XW xcl_lds[8191u]", base + slots);

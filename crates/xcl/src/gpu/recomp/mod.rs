@@ -519,6 +519,9 @@ pub struct Translation {
     /// console root signature's static samplers): (S#, comparison), register
     /// `static_sampler_base + i` in space 1
     pub static_samplers: Vec<([u32; 4], bool)>,
+    /// split wave64 with console LDS: the bytes of `xcl_lds` below the exchange; the program's
+    /// LDS accesses above them are clamped onto their last word
+    pub lds_below_exchange: Option<u32>,
 }
 
 impl Translation {
@@ -1479,7 +1482,8 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let static_samplers = em.static_used.clone();
-    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+    let lds_below_exchange = em.x64_lds_base().map(|base| 4 * base as u32);
+    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers, lds_below_exchange })
 }
 
 /// HLSL bytes from which a structured translation is compared with its dispatcher form.

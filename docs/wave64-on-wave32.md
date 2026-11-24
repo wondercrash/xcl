@@ -91,7 +91,12 @@ slot (1 word, 16 with wide scalar loads, 32 with `ds_bpermute`). Without console
 has arrays of its own; with LDS (`xcl_lds`, already the full 32 KB D3D12 limit) it lives in
 the top of the LDS block (as PR #33 did), and the program's LDS accesses are clamped below
 it. A program that really uses the whole 32 KB of LDS therefore loses its top dwords on a
-32-lane GPU (the console allows 64 KB; XCL already wraps at 32 KB).
+32-lane GPU (the console allows 64 KB; XCL already wraps at 32 KB). The translation of a
+compute program whose COMPUTE_PGM_RSRC2 allocates more LDS than that leaves logs a warning
+(`[SHADER] <hash>: allocates … B of LDS`). In the retail census no program of one console
+wave does (2 420 B to spare at least, with 8- and 16-word slots); four 1024-thread compute
+programs allocate the whole 32 KB, and the ES ring plus the GS output area of a geometry
+program take 7 KB at most.
 
 ## Hazards (and why they are handled)
 

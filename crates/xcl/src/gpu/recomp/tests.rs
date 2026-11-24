@@ -5953,6 +5953,24 @@ fn gpu_split_wave64_scalar_loads_and_the_barrier_form() {
     }
 }
 
+/// A split wave64 program with console LDS says what the exchange leaves of `xcl_lds` (`pso`
+/// warns when the console program allocates more): the words up to `XCL_X_LDS_TOP`, which
+/// every access above is clamped onto.
+#[test]
+fn split_wave64_lds_below_the_exchange() {
+    let code = prog(&[
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None),
+        ("S_LOAD_DWORDX16", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 4), ("OFFSET", 0), ("SOFFSET", 125)], None),
+    ]);
+    let t = translate(&code, &Options { split_wave64: true, ..Default::default() }).unwrap();
+    let top: u32 = t.hlsl.split("#define XCL_X_LDS_TOP ").nth(1).unwrap().split('u').next().unwrap().parse().unwrap();
+    assert_eq!(t.lds_below_exchange, Some(4 * (top + 1)));
+    // one console wave: 2 x 2 slots of 16 words (the exchanged s_load_dwordx16), 2 counters and
+    // the wave counter take the top
+    assert_eq!(t.lds_below_exchange, Some(4 * (8192 - 64 - 3)));
+    assert_eq!(translate(&code, &Options::default()).unwrap().lds_below_exchange, None);
+}
+
 /// Masks only read lane by lane (`x64_masks`): a v_cndmask selector and a 64-bit carry chain,
 /// both with bits in the two halves, need no exchange in the split form – and give the same
 /// lanes as a whole-wave mask.
