@@ -290,17 +290,31 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
     Ok(format!("ok, {} window(s), {} µs", probes.len(), t0.elapsed().as_micros()))
 }
 
-/// The 8 bytes at UMA address `p` as the GPU reads them: a copy from the window buffer on a copy
-/// queue of XCL's own (no title queue holds it), waited for up to 500 ms. For a stalled gate's
-/// line, beside the CPU's read: in the coherent windows the two share memory, so a difference
-/// says the GPU's write has not reached memory the CPU sees, and the same low value says the
-/// GPU never wrote the waited value (or wrote a lower one after it).
+/// The 8 bytes at UMA address `p` as the GPU reads them (`gpu_read` of the window buffer). For
+/// a stalled gate's line, beside the CPU's read: in the coherent windows the two share memory,
+/// so a difference says the GPU's write has not reached memory the CPU sees, and the same low
+/// value says the GPU never wrote the waited value (or wrote a lower one after it).
 pub(super) unsafe fn gpu_read_u64(p: usize) -> Result<u64, String> {
+    let (buf, off) = uma_window_buffer(p, 8).ok_or("not in an open window")?;
+    let b = gpu_read(&[(buf, off, 8)])?;
+    Ok(u64::from_le_bytes(b[..8].try_into().map_err(|_| "8 bytes")?))
+}
+
+/// What the GPU reads now at each of `parts` (a buffer, the offset in it, bytes: up to 256
+/// together), back to back: copies on a copy queue of XCL's own (no title queue holds it),
+/// waited for up to 500 ms. The list goes to the PC's ExecuteCommandLists, not the title's
+/// entry: there the queue first waited, as a title queue does, for the uploads of what the CPU
+/// wrote, and a read for the line of a GPU that stood still stood still behind them (run 14:
+/// five such queues never finished, and the thread that opens the gates slept in the uploads'
+/// 5 s waits).
+pub(super) unsafe fn gpu_read(parts: &[(usize, u64, usize)]) -> Result<Vec<u8>, String> {
+    const ROOM: usize = 256;
+    let total: usize = parts.iter().map(|p| p.2).sum();
+    if total > ROOM {
+        return Err(format!("{total} bytes asked, {ROOM} at most"));
+    }
     let raw = device_raw();
     let device = ID3D12Device::from_raw_borrowed(&raw).ok_or("no device")?;
-    let (buf, off) = uma_window_buffer(p, 8).ok_or("not in an open window")?;
-    let buf = buf as *mut c_void;
-    let src = ID3D12Resource::from_raw_borrowed(&buf).ok_or("no window buffer")?;
     let ty = D3D12_COMMAND_LIST_TYPE_COPY;
     let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).map_err(|e| format!("queue: {e}"))?;
     let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(ty).map_err(|e| format!("allocator: {e}"))?;
@@ -308,7 +322,7 @@ pub(super) unsafe fn gpu_read_u64(p: usize) -> Result<u64, String> {
     let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|e| format!("fence: {e}"))?;
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: 256,
+        Width: ROOM as u64,
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -321,9 +335,18 @@ pub(super) unsafe fn gpu_read_u64(p: usize) -> Result<u64, String> {
         .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback)
         .map_err(|e| format!("readback buffer: {e}"))?;
     let readback = readback.ok_or("readback buffer")?;
-    list.CopyBufferRegion(&readback, 0, src, off, 8);
+    let mut at = 0u64;
+    for &(buf, off, len) in parts {
+        let buf = buf as *mut c_void;
+        let src = ID3D12Resource::from_raw_borrowed(&buf).ok_or("no buffer")?;
+        list.CopyBufferRegion(&readback, at, src, off, len as u64);
+        at += len as u64;
+    }
     list.Close().map_err(|e| format!("Close: {e}"))?;
-    queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(|e| e.to_string())?)]);
+    type Execute = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+    let q = queue.as_raw();
+    let execute: Execute = if is_adopted(q) { std::mem::transmute(orig_fn(q, slot_of(q, "ExecuteCommandLists"))) } else { std::mem::transmute(queue.vtable().ExecuteCommandLists) };
+    execute(q, 1, &list.as_raw());
     queue.Signal(&fence, 1).map_err(|e| format!("Signal: {e}"))?;
     if let Err(e) = crate::gpu::fence::wait(&fence, 1, device, None, 500) {
         // still in use by the GPU: kept alive for good rather than released under it
@@ -332,7 +355,7 @@ pub(super) unsafe fn gpu_read_u64(p: usize) -> Result<u64, String> {
     }
     let mut m = std::ptr::null_mut();
     readback.Map(0, None, Some(&mut m)).map_err(|e| format!("Map: {e}"))?;
-    let v = (m as *const u64).read_unaligned();
+    let v = std::slice::from_raw_parts(m as *const u8, total).to_vec();
     readback.Unmap(0, None);
     Ok(v)
 }
@@ -5721,6 +5744,10 @@ fn a_gpu_copy_reads_a_coherent_window_word() {
     unsafe {
         std::ptr::write_volatile(p as *mut u64, 0x5843_4C00_0000_0506);
         assert_eq!(gpu_read_u64(p), Ok(0x5843_4C00_0000_0506));
+        // parts come back to back, in the order asked
+        let (buf, off) = uma_window_buffer(p, 8).expect("the window's buffer");
+        assert_eq!(gpu_read(&[(buf, off + 4, 4), (buf, off, 2)]), Ok(vec![0x00, 0x4C, 0x43, 0x58, 0x06, 0x05]));
+        assert!(gpu_read(&[(buf, off, 200), (buf, off, 100)]).is_err(), "more than the readback buffer holds");
     }
     u.free(p as _);
     assert!(unsafe { gpu_read_u64(0x10) }.is_err(), "outside the windows");
