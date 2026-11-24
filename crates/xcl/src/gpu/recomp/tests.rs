@@ -184,6 +184,93 @@ fn hlsl_is_generated_for_straight_line_and_branches() {
     let _ = Mode::Kernel;
 }
 
+// Synthetic programs from #701: each add records a visit in its destination SGPR.
+fn two_breaks_program() -> Vec<u8> {
+    prog(&[
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None), // 00: loop
+        ("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 0)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 9)], None),                       // 08: -> out
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None),
+        ("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 11), ("SSRC1", 0)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 6)], None),                       // 14: -> out
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 129)], None),
+        ("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 12), ("SSRC1", 0)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),                       // 20: -> latch
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)], None),
+        ("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 131)], None),           // 28: latch
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF4)], None),                  // 2c: -> loop
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 129)], None), // 30: out
+    ])
+}
+
+fn jump_into_else_program() -> Vec<u8> {
+    prog(&[
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+        ("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 0)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 5)], None),                       // 08: -> else
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None),
+        ("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 11), ("SSRC1", 0)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)], None),                       // 14: -> else
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 129)], None),
+        ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)], None),                             // 1c: -> join
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 129)], None), // 20: else
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)], None), // 24: join
+    ])
+}
+
+#[test]
+fn structured_repeated_loop_exit_rechecks_guard() {
+    let code = two_breaks_program();
+    for structured in [true, false] {
+        let t = translate(&code, &Options { structured, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let (_, after_exit) = t.hlsl.split_once("// 0014:").unwrap();
+        let (before_next, _) = after_exit.split_once("// 0018:").unwrap();
+        assert!(before_next.split_once("xcl_skip = 0x30u;").is_some_and(|(_, tail)| tail.contains("if (xcl_skip == 0xFFFFFFFFu) {")),
+            "structured={structured}: the second exit must guard the next block\n{}", t.hlsl);
+    }
+}
+
+#[test]
+fn structured_jump_into_else_preserves_target() {
+    let code = jump_into_else_program();
+    for structured in [true, false] {
+        let t = translate(&code, &Options { structured, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        // Only the explicit jump over the else block should guard it, not HLSL's `else`.
+        let (_, after_jump) = t.hlsl.split_once("// 001c:").unwrap();
+        let (before_else, _) = after_jump.split_once("// 0020:").unwrap();
+        assert!(before_else.split_once("xcl_skip = 0x24u;").is_some_and(|(_, tail)| tail.contains("if (xcl_skip == 0xFFFFFFFFu) {")),
+            "structured={structured}: the else block must run unless the jump over it was taken\n{}", t.hlsl);
+    }
+}
+
+#[test]
+fn gpu_structured_branch_targets_match_rdna2() {
+    if !gpu_ready() {
+        return;
+    }
+    // Take the second branch (the two regressions), the first branch, or neither.
+    let inputs = [(0, 2), (2, 0), (0, 0)];
+    for (name, code, expected) in [
+        ("two breaks", two_breaks_program(), [[1, 1, 0, 1, 0], [1, 0, 0, 1, 0], [3, 3, 3, 1, 3]]),
+        ("jump into else", jump_into_else_program(), [[1, 1, 0, 1, 1], [1, 0, 0, 1, 1], [1, 1, 1, 0, 1]]),
+    ] {
+        for structured in [true, false] {
+            let t = translate(&code, &Options { structured, ..runner::options(Mode::Kernel) }).unwrap();
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+            for ((s10, s11), want) in inputs.into_iter().zip(expected) {
+                let mut st = KernelState::default();
+                st.sgpr[10] = s10;
+                st.sgpr[11] = s11;
+                let r = runner::run(&dxil, &st, &[]).unwrap();
+                assert_eq!(&r.sgpr[..5], &want, "{name}, structured={structured}, s10={s10}, s11={s11}");
+            }
+        }
+    }
+}
+
 #[test]
 fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
     let code = prog(&[
