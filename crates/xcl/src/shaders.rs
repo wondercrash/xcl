@@ -716,7 +716,10 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
         let used = args.iter().any(|a| a == "--used");
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used, t0);
+        // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
+        let windows = opt("--windows").unwrap_or(4) as u32;
+        let windows = if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows };
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
@@ -1095,9 +1098,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
     println!(
-        "precompiling {n} shaders into {} ({} compile threads; {windows} memory windows{})",
+        "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
         recomp::dxc::compile_threads(),
+        windows & !recomp::HEAP_WINDOWS,
+        if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
     if let Some(p) = pipelines {

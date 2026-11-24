@@ -3372,6 +3372,17 @@ fn gpu_mesh_mode_reads_memory_windows() {
 /// accesses in window 0.
 #[test]
 fn gpu_memory_windows_above_4_gib() {
+    memory_windows_above_4_gib(false);
+}
+
+/// The same program with the windows taken from the descriptor heap (`Options::heap_windows`):
+/// same results, and no `switch` over windows in the HLSL.
+#[test]
+fn gpu_memory_windows_from_the_heap() {
+    memory_windows_above_4_gib(true);
+}
+
+fn memory_windows_above_4_gib(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3402,8 +3413,10 @@ fn gpu_memory_windows_above_4_gib() {
     let p = prog(&refs);
     let one = translate(&p, &Options::default()).unwrap();
     assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
+    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
+    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + xcl_w)]"), heap);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
@@ -3445,6 +3458,17 @@ fn gpu_memory_windows_above_4_gib() {
 ///   on `global_load`/`global_store` updates the target window accurately.
 #[test]
 fn gpu_memory_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(false);
+}
+
+/// The same with the windows taken from the descriptor heap (`Options::heap_windows`): an
+/// address outside them reads 0 and drops its stores and atomics there too.
+#[test]
+fn gpu_heap_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(true);
+}
+
+fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3498,12 +3522,15 @@ fn gpu_memory_windows_reject_out_of_uma_aliasing() {
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap);
     // the window switch of programs below `emit::FLAT_WINDOW_LOADS_FROM`, then the flat loads of
-    // bigger ones: the same values, and the stores / atomics still switch
-    let dxils: Vec<Vec<u8>> = [t.hlsl.clone(), flat_window_loads(&t.hlsl, 2)]
+    // bigger ones: the same values, and the stores / atomics still switch (heap form: one access)
+    let forms: Vec<(&str, String)> =
+        if heap { vec![("heap", t.hlsl.clone())] } else { vec![("switch", t.hlsl.clone()), ("flat", flat_window_loads(&t.hlsl, 2))] };
+    let dxils: Vec<(&str, Vec<u8>)> = forms
         .iter()
-        .map(|h| super::dxc::compile(h, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{h}")).unwrap())
+        .map(|(f, h)| (*f, super::dxc::compile(h, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{h}")).unwrap()))
         .collect();
 
     let mut st = KernelState::default();
@@ -3533,7 +3560,7 @@ fn gpu_memory_windows_reject_out_of_uma_aliasing() {
         r[18] = 0x7777_7777;
     }
 
-    for (form, dxil) in ["switch", "flat"].iter().zip(&dxils) {
+    for (form, dxil) in &dxils {
         let r = runner::run_in_arena(dxil, &st, &arena).unwrap();
         assert_eq!(r.sgpr[30], 0, "{form}: out-of-UMA s_load must return 0");
         assert_eq!(r.sgpr[31], 0xABCD_0123, "{form}: hi == 0 s_load must still read window 0 (32-bit descriptor tables)");
@@ -3557,9 +3584,9 @@ fn gpu_memory_windows_reject_out_of_uma_aliasing() {
 /// HLSL of a program below `emit::FLAT_WINDOW_LOADS_FROM` with the window loads of a bigger one
 /// (`emit::mem_accessors`' `flat`).
 fn flat_window_loads(hlsl: &str, windows: u32) -> String {
-    let switched = super::emit::mem_accessors(windows, false);
+    let switched = super::emit::mem_accessors(windows, None, false);
     assert!(hlsl.contains(&switched), "a small program keeps the window switch");
-    hlsl.replacen(&switched, &super::emit::mem_accessors(windows, true), 1)
+    hlsl.replacen(&switched, &super::emit::mem_accessors(windows, None, true), 1)
 }
 
 /// Compute programs from `emit::FLAT_WINDOW_LOADS_FROM` on read their windows without a switch;
@@ -3567,9 +3594,9 @@ fn flat_window_loads(hlsl: &str, windows: u32) -> String {
 #[test]
 fn big_programs_read_their_windows_without_a_switch() {
     let small = format!("{}{}", super::emit::MEM_ACCESSORS_HERE, "uint x = mem.Load(4u);\n");
-    let (s, b) = (super::emit::windowed(&small, 4, false), super::emit::windowed(&small, 4, true));
+    let (s, b) = (super::emit::windowed(&small, 4, None, false), super::emit::windowed(&small, 4, None, true));
     let line = |h: &str, f: &str| h.lines().find(|l| l.contains(f)).unwrap_or_else(|| panic!("{f}")).to_string();
-    assert_eq!(s, small.replacen(super::emit::MEM_ACCESSORS_HERE, &super::emit::mem_accessors(4, false), 1).replace("mem.Load(4u)", "xcl_mLoad(4u)"));
+    assert_eq!(s, small.replacen(super::emit::MEM_ACCESSORS_HERE, &super::emit::mem_accessors(4, None, false), 1).replace("mem.Load(4u)", "xcl_mLoad(4u)"));
     for f in ["uint4 xcl_loadx4(", "uint xcl_mLoad(", "uint2 xcl_mLoad2(", "uint3 xcl_mLoad3(", "uint4 xcl_mLoad4("] {
         assert!(line(&s, f).contains("switch (xcl_w)"), "{f}");
         let l = line(&b, f);
@@ -3592,6 +3619,11 @@ fn big_programs_read_their_windows_without_a_switch() {
         assert_eq!(line(&b, f), line(&s, f), "{f}");
         assert!(line(&b, f).contains("switch (xcl_w)"), "{f}");
     }
+    // heap windows (`Options::heap_windows`): one descriptor-heap access per load, big or not
+    let heap = translate(&prog(&vec![load; 4000]), &Options { heap_windows: true, ..opt() }).unwrap().hlsl;
+    assert!(heap.len() >= super::emit::FLAT_WINDOW_LOADS_FROM);
+    let l = line(&heap, "uint4 xcl_loadx4(");
+    assert!(l.contains("XCL_MW;") && !l.contains("select(") && !l.contains("switch"), "{l}");
 }
 
 /// The start-up check of the coherent UMA windows (`real::check_uma_import`): the GPU sees what

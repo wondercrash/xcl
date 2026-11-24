@@ -4757,10 +4757,13 @@ impl Em {
             h = h.replacen("\n#define XCL_X_SPIN 0\n", "\n#define XCL_X_SPIN 1\n", 1);
         }
         if windows > 1 {
+            let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+            let heap = self.opt.heap_windows.then_some(coherent);
             // compute passes (CS, and the MS / GS compute passes) only: the driver times were
-            // measured on compute pipelines, and VS / PS keep their HLSL and cache keys
-            let flat = !matches!(self.opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) && h.len() >= FLAT_WINDOW_LOADS_FROM;
-            h = windowed(&h, windows, flat);
+            // measured on compute pipelines, and VS / PS keep their HLSL and cache keys. The heap
+            // form has no switch to drop.
+            let flat = heap.is_none() && !matches!(self.opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) && h.len() >= FLAT_WINDOW_LOADS_FROM;
+            h = windowed(&h, windows, heap, flat);
         }
         h
     }
@@ -5155,7 +5158,9 @@ pub(super) const FLAT_WINDOW_LOADS_FROM: usize = 1 << 20;
 /// Several memory windows: every `mem.Method(` of the program (and of the preludes) becomes
 /// an accessor `xcl_mMethod(` that switches on `xcl_w` between `mem` and `mem1`.., whose
 /// definitions replace the placeholder (`flat`: loads without the switch).
-pub(super) fn windowed(h: &str, windows: u32, flat: bool) -> String {
+/// `heap`: Some(storage class) – the accessors take window k from the descriptor heap
+/// (`Options::heap_windows`) instead of switching over the root UAVs.
+pub(super) fn windowed(h: &str, windows: u32, heap: Option<&str>, flat: bool) -> String {
     let mut out = String::with_capacity(h.len() + 8192);
     let mut rest = h;
     while let Some(i) = rest.find("mem.") {
@@ -5173,7 +5178,7 @@ pub(super) fn windowed(h: &str, windows: u32, flat: bool) -> String {
         }
     }
     out.push_str(rest);
-    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, flat), 1)
+    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap, flat), 1)
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits.
@@ -5186,7 +5191,10 @@ pub(super) fn windowed(h: &str, windows: u32, flat: bool) -> String {
 /// several times slower. Same values, including 0 for an out-of-range `xcl_w`. Stores and
 /// atomics always switch (one window). This needs every window bound to its buffer, which
 /// `real::open_uma` gives whenever the GPU has unified memory at all.
-pub(super) fn mem_accessors(windows: u32, flat: bool) -> String {
+/// `heap`: Some(storage class) – window k is taken from the descriptor heap
+/// (`Options::heap_windows`) and the same rule is one comparison before the access (`flat`
+/// does not apply: there is no switch).
+pub(super) fn mem_accessors(windows: u32, heap: Option<&str>, flat: bool) -> String {
     let mut sigs: Vec<(&str, String, &str, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a", "return 0u;"),
         ("uint2", "Load2".into(), "uint a", "a", "return uint2(0u, 0u);"),
@@ -5211,6 +5219,19 @@ pub(super) fn mem_accessors(windows: u32, flat: bool) -> String {
         }
     }
     let mut s = String::new();
+    if let Some(coherent) = heap {
+        // one access: window k is descriptor MEM_HEAP_BASE + k; an `xcl_w` outside the windows
+        // does what the switch's `default` does
+        let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
+        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] if (xcl_w >= {windows}u) {{ return uint4(0u, 0u, 0u, 0u); }} XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
+        for (ret, name, params, args, def) in sigs {
+            let r = if ret == "void" { "" } else { "return " };
+            // (the switch's `break` leaves the accessor)
+            let outside = def.replace("break;", "return;");
+            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ [branch] if (xcl_w >= {windows}u) {{ {outside} }} XCL_MW; {r}m.{name}({args}); }}");
+        }
+        return s;
+    }
     let buf = |k: u32| if k == 0 { "mem".to_string() } else { format!("mem{k}") };
     // the selected window's value, else the next one's .., else `zero` (out-of-range `xcl_w`)
     let pick = |zero: &str| (0..windows).rev().fold(zero.to_string(), |rest, k| format!("select(xcl_w == {k}u, r{k}, {rest})"));
