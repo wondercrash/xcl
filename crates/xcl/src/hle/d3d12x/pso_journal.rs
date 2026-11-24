@@ -12,7 +12,7 @@
 //! that uses it. Duplicates of earlier runs are not written again.
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -86,10 +86,17 @@ fn open() -> Option<Journal> {
     Some(Journal { file, seen })
 }
 
-fn with(f: impl FnOnce(&mut Journal)) {
+/// Runs `f` on the journal; a write error turns it off for the rest of the run (0).
+fn with(f: impl FnOnce(&mut Journal) -> std::io::Result<u64>) -> u64 {
     let mut g = J.lock().unwrap();
-    if let Some(j) = g.get_or_insert_with(open).as_mut() {
-        f(j);
+    let Some(j) = g.get_or_insert_with(open).as_mut() else { return 0 };
+    match f(j) {
+        Ok(h) => h,
+        Err(e) => {
+            crate::xlog_warn!("pipeline journal: {e}: off for this run");
+            *g = Some(None);
+            0
+        }
     }
 }
 
@@ -182,12 +189,25 @@ unsafe fn bytes_of<'a>(b: &D3D12_SHADER_BYTECODE) -> Option<&'a [u8]> {
     (!b.pShaderBytecode.is_null() && b.BytecodeLength != 0).then(|| std::slice::from_raw_parts(b.pShaderBytecode as *const u8, b.BytecodeLength))
 }
 
+/// Writes a frame once: all of it, or (an error) none of it, so later frames stay readable.
+fn put(j: &mut Journal, tag: u8, windows: u8, hash: u64, payload: &[u8]) -> std::io::Result<()> {
+    if j.seen.contains(&(tag, hash)) {
+        return Ok(());
+    }
+    let at = j.file.stream_position()?;
+    if let Err(e) = j.file.write_all(&frame(tag, windows, hash, payload)) {
+        let _ = j.file.set_len(at);
+        let _ = j.file.seek(SeekFrom::Start(at));
+        return Err(e);
+    }
+    j.seen.insert((tag, hash));
+    Ok(())
+}
+
 fn put_shader(j: &mut Journal, out: &mut Vec<u8>, sh: Option<&[u8]>) -> std::io::Result<()> {
     let h = sh.map_or(0, crate::gpu::shader::fnv64);
     if let Some(sh) = sh {
-        if j.seen.insert((b'S', h)) {
-            j.file.write_all(&frame(b'S', 0, h, sh))?;
-        }
+        put(j, b'S', 0, h, sh)?;
     }
     out.extend_from_slice(&h.to_le_bytes());
     Ok(())
@@ -199,17 +219,13 @@ fn finish(j: &mut Journal, tag: u8, mut payload: Vec<u8>) -> std::io::Result<u64
     payload.push(windows);
     let hash = crate::gpu::shader::fnv64(&payload);
     payload.pop();
-    if j.seen.insert((tag, hash)) {
-        j.file.write_all(&frame(tag, windows, hash, &payload))?;
-    }
+    put(j, tag, windows, hash, &payload)?;
     Ok(hash)
 }
 
 /// Note a graphics pipeline; its hash for `used`, 0 = not written.
 pub unsafe fn graphics(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> u64 {
-    let mut hash = 0;
-    with(|j| hash = graphics_in(j, d).unwrap_or(0));
-    hash
+    with(|j| graphics_in(j, d))
 }
 
 unsafe fn graphics_in(j: &mut Journal, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> std::io::Result<u64> {
@@ -239,19 +255,14 @@ unsafe fn graphics_in(j: &mut Journal, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -
 
 /// Note a compute pipeline; its hash for `used`, 0 = not written.
 pub unsafe fn compute(d: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> u64 {
-    let mut hash = 0;
     with(|j| {
-        let r = (|| {
-            let mut p = Vec::new();
-            put_shader(j, &mut p, bytes_of(&d.CS))?;
-            let desc = compute_bytes(d);
-            p.extend_from_slice(&(desc.len() as u32).to_le_bytes());
-            p.extend_from_slice(&desc);
-            finish(j, b'C', p)
-        })();
-        hash = r.unwrap_or(0);
-    });
-    hash
+        let mut p = Vec::new();
+        put_shader(j, &mut p, bytes_of(&d.CS))?;
+        let desc = compute_bytes(d);
+        p.extend_from_slice(&(desc.len() as u32).to_le_bytes());
+        p.extend_from_slice(&desc);
+        finish(j, b'C', p)
+    })
 }
 
 /// Pipeline `hash` was built (the title used it): `xcl pipelines` makes these first.
@@ -259,11 +270,7 @@ pub fn used(hash: u64) {
     if hash == 0 {
         return;
     }
-    with(|j| {
-        if j.seen.insert((b'U', hash)) {
-            let _ = j.file.write_all(&frame(b'U', 0, hash, &[]));
-        }
-    });
+    with(|j| put(j, b'U', 0, hash, &[]).map(|_| 0));
 }
 
 /// A journal's pipeline, read back with everything it points to owned.
@@ -342,6 +349,9 @@ pub fn replay(f: &Frame, shader: impl Fn(u64) -> Option<Vec<u8>>) -> Option<Repl
                 }
             }
             let n = u32_at(p, &mut at)? as usize;
+            if n > (p.len() - at) / 28 {
+                return None; // each element: a name length and six words at least
+            }
             let mut names = Vec::with_capacity(n);
             let mut raw = Vec::with_capacity(n);
             for _ in 0..n {
