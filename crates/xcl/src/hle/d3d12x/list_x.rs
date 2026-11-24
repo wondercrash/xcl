@@ -17,7 +17,7 @@
 //! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
 //! An index buffer at such an address is given to the PC as the window buffer's GPU address.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -3237,8 +3237,9 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
     if t != va || va == 0 || bytes == 0 {
         return t;
     }
-    // in a window by number: a PC resource's GPU address
-    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, bytes) {
+    // in a window by number, or a PC buffer's GPU address the driver gave (#631 puts the
+    // process's memory in the same number range): as it is
+    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || is_driver_va(va) || !crate::gpu::shader::readable(va as usize, bytes) {
         return t;
     }
     if mirror {
@@ -3260,6 +3261,69 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
         crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – bound as a copy made now (#{n})");
     }
     pc_va(p as u64)
+}
+
+/// The driver GPU addresses `res_gpu_va_x` gave console code for PC buffers: `[start, end)` by
+/// start, with the buffer, and each buffer's start. Kept apart from each other.
+#[derive(Default)]
+struct DriverVas {
+    ranges: BTreeMap<u64, (u64, usize)>,
+    by_res: HashMap<usize, u64>,
+}
+
+static DRIVER_VAS: Mutex<Option<DriverVas>> = Mutex::new(None);
+
+impl DriverVas {
+    fn remove(&mut self, start: u64) {
+        if let Some((_, res)) = self.ranges.remove(&start) {
+            self.by_res.remove(&res);
+        }
+    }
+
+    fn insert(&mut self, res: usize, start: u64, end: u64) {
+        if self.ranges.get(&start) == Some(&(end, res)) {
+            return;
+        }
+        if let Some(old) = self.by_res.get(&res).copied() {
+            self.remove(old);
+        }
+        // a range this one overlaps belongs to a buffer the driver no longer has
+        let stale: Vec<u64> = self.ranges.range(..end).rev().take_while(|(_, &(e, _))| e > start).map(|(&s, _)| s).collect();
+        for s in stale {
+            self.remove(s);
+        }
+        self.ranges.insert(start, (end, res));
+        self.by_res.insert(res, start);
+    }
+
+    fn contains(&self, va: u64) -> bool {
+        self.ranges.range(..=va).next_back().is_some_and(|(_, &(end, _))| va < end)
+    }
+}
+
+/// Console code was given `va` as the GPU address of `res`, a PC resource: a buffer's range
+/// is noted so `gpu_va` passes addresses in it on as they are.
+pub(super) unsafe fn note_driver_va(res: *mut c_void, va: u64) {
+    let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else { return };
+    let d = r.GetDesc();
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || d.Width == 0 {
+        return;
+    }
+    DRIVER_VAS.lock().unwrap().get_or_insert_with(DriverVas::default).insert(res as usize, va, va.saturating_add(d.Width));
+}
+
+/// The PC resource `res` was released for good: its driver address may go to another buffer.
+pub(super) fn forget_driver_va(res: usize) {
+    let mut g = DRIVER_VAS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return };
+    if let Some(start) = m.by_res.get(&res).copied() {
+        m.remove(start);
+    }
+}
+
+/// Whether `va` lies in a PC buffer's driver GPU address range (`note_driver_va`).
+fn is_driver_va(va: u64) -> bool {
+    DRIVER_VAS.lock().unwrap().as_ref().is_some_and(|m| m.contains(va))
 }
 
 /// Ranges of the title's memory with a mirror in unified memory: (start, bytes, mirror). A
@@ -4233,6 +4297,25 @@ mod tests {
         let skipped = waits_on_itself(&w, &list_writes);
         SYNC_GRAPH.lock().unwrap().as_mut().unwrap().cells.remove(&va);
         assert!(!skipped, "another queue's producer is already submitted: the wait must be gated");
+    }
+
+    #[test]
+    fn driver_va_ranges_follow_the_buffers_the_driver_has() {
+        let mut m = DriverVas::default();
+        m.insert(1, 0x1_0000, 0x2_0000);
+        m.insert(2, 0x3_0000, 0x3_1000);
+        assert!(m.contains(0x1_0000) && m.contains(0x1_ffff), "inside a buffer's range");
+        assert!(!m.contains(0x2_0000) && !m.contains(0xffff), "past the end or before the start");
+        // a new buffer over part of an old one's range: the old buffer is gone
+        m.insert(3, 0x1_8000, 0x1_9000);
+        assert!(!m.contains(0x1_0000), "a range overlapped by a newer buffer stays noted");
+        assert!(m.contains(0x1_8000));
+        // a buffer asked again at another address keeps only the new range
+        m.insert(2, 0x5_0000, 0x5_1000);
+        assert!(!m.contains(0x3_0000) && m.contains(0x5_0000));
+        m.remove(m.by_res[&3]);
+        assert!(!m.contains(0x1_8000), "a released buffer's range stays noted");
+        assert_eq!((m.ranges.len(), m.by_res.len()), (1, 1));
     }
 
     #[test]
