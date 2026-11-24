@@ -1522,7 +1522,7 @@ mod tests {
         let mem = Request::parse(&request(SOURCE_MEMORY_BIT | 1, 0x1000, 64, 0x2000, 0x99, 20));
         assert_eq!((mem.offset, mem.check(true)), (0, Ok(())), "a memory source has no offset");
         assert_eq!(Request::parse(&request(1, 0x1000, 20, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request(13, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack BC6H");
+        assert_eq!(Request::parse(&request(5, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack BC2");
         assert_eq!(Request::parse(&request(0, 0, 64, 0x2000, 0, 64)).check(false), Err(E_ACCESS_VIOLATION));
     }
 
@@ -1738,7 +1738,7 @@ mod tests {
     fn multi_stage_intermediate_size_validation_and_zlib() {
         // Validation matrix for Request::check
         let bc1 = 1u64 << BCPACK_SHIFT;
-        let bc6h = 6u64 << BCPACK_SHIFT;
+        let bc2 = 2u64 << BCPACK_SHIFT;
         let swiz = 1u64 << SWIZZLE_SHIFT;
 
         // Zlib only with valid intermediate_size (== dst and < dst)
@@ -1748,13 +1748,13 @@ mod tests {
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 128, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 64, 0x2000, 0, 20, 96, 0)).check(false), Err(E_DESTINATION_SIZE));
         // Two-stage zlib + BCPack: valid sizes -> E_DECOMPRESSION without a decoder for the mode, invalid intermediate -> E_DESTINATION_SIZE
-        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc6h, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc2, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Ok(()));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc6h, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc6h, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc2, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc2, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
         // Single-stage BCPack: intermediate must be 0, then E_DECOMPRESSION without a decoder for the mode
-        assert_eq!(Request::parse(&request_ex(bc6h, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
+        assert_eq!(Request::parse(&request_ex(bc2, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
         assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Ok(()));
         assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
         // Hardware swizzle mode unsupported
