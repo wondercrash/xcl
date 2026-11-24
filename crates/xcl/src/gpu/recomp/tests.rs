@@ -7630,11 +7630,13 @@ fn jumps_to_outer_loop_heads_are_structured() {
         }
         work(&mut code, 5);
         code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
-        let t = |s: bool| translate(&code, &Options { structured: s, ..Options::default() }).unwrap();
+        // a wave32 program where the GPU has no 64-lane waves (the control flow is scalar either way)
+        let wave64 = runner::wave64_supported() == Ok(true);
+        let t = |s: bool| translate(&code, &Options { structured: s, wave64, ..Options::default() }).unwrap();
         let (a, b) = (t(true), t(false));
         assert!(a.complete() && b.complete(), "{:?}", a.unsupported_why);
         structured += !a.hlsl.contains("if (pc ==") as usize;
-        if !gpu_waves().contains(&true) {
+        if gpu_waves().is_empty() {
             continue;
         }
         ran += 1;
@@ -7651,4 +7653,61 @@ fn jumps_to_outer_loop_heads_are_structured() {
     }
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}
+
+/// Forward jumps that cross each other – each one past the targets of the ones before it, as the
+/// console compiler lays out 95cc13288a27a96e (ScreenProbes_ActivateRays, 11 408 forward jumps
+/// over 29 KB on the median) – are skip flags pending all at once. Every guard tests the one skip
+/// variable, not each pending target: with a flag per target the guards grew with the square of
+/// the jumps (104 of that program's 154 MB of HLSL). Structured and dispatcher forms agree on
+/// the GPU.
+#[test]
+fn crossing_forward_jumps_keep_the_guards_short() {
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    // k tests of bits of s10, jump j to the j-th of the k blocks behind them: s0 counts the tests
+    // that ran, s1 the blocks
+    let program = |k: u64| {
+        let mut code = Vec::new();
+        let mut jumps = Vec::new();
+        for j in 0..k {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+            code.extend(i("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128 + j % 32)]));
+            jumps.push(code.len());
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        }
+        for at in jumps {
+            let d = ((code.len() - at) / 4 - 1) as u16;
+            code[at..at + 2].copy_from_slice(&d.to_le_bytes());
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        code
+    };
+    let wave64 = runner::wave64_supported() == Ok(true);
+    let t = |code: &[u8], structured: bool| {
+        let t = translate(code, &Options { structured, wave64, ..Options::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t
+    };
+    let big = t(&program(64), true);
+    assert!(!big.hlsl.contains("if (pc =="), "not structured");
+    let longest = big.hlsl.lines().filter(|l| l.contains("xcl_skip")).map(|l| l.trim().len()).max().unwrap_or(0);
+    assert!(longest < 80, "a line of {longest} B tests the skip flag:\n{}", big.hlsl);
+    if gpu_waves().is_empty() {
+        return;
+    }
+    let code = program(12);
+    let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    for structured in [true, false] {
+        let h = t(&code, structured).hlsl;
+        let dxil = super::dxc::compile(&h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}"));
+        // (s10, first jump taken)
+        for (s10, first) in [(0u32, 12u32), (1, 0), (0x20, 5), (0x800, 11), (0xA0, 5), (0xC00, 10)] {
+            let mut st = KernelState::default();
+            st.sgpr[10] = s10;
+            let r = runner::run(&dxil, &st, &mem).unwrap();
+            let want = if first == 12 { [12, 12] } else { [first + 1, 12 - first] };
+            assert_eq!(r.sgpr[..2], want, "structured={structured}, s10={s10:#x}\n{h}");
+        }
+    }
 }
