@@ -70,6 +70,8 @@ struct Queue {
 impl Queue {
     /// Read what was added to the journal; the new work.
     fn ingest(&mut self, file: &mut std::fs::File) -> usize {
+        // a torn last frame may be cut and written over by the next run: read it again
+        self.buf.truncate(self.parsed);
         // a journal made again (shorter than what was read): from its start
         if file.metadata().is_ok_and(|m| m.len() < self.buf.len() as u64) {
             self.buf.clear();
@@ -90,15 +92,16 @@ impl Queue {
         let mut new = 0;
         let mut frames = Vec::new();
         self.parsed = pso_journal::for_each_frame_from(&self.buf, self.parsed, |f| frames.push((f.tag, f.windows, f.hash, f.payload.to_vec())));
+        if self.windows == 0 {
+            // the last run's (a run writes all its pipelines again when its windows differ)
+            self.windows = frames.iter().rev().find(|f| matches!(f.0, b'G' | b'C')).map_or(0, |f| f.1.max(1));
+        }
         for (tag, windows, hash, payload) in frames {
             match tag {
                 b'S' => {
                     self.shaders.insert(hash, Arc::new(payload));
                 }
                 b'G' | b'C' => {
-                    if self.windows == 0 {
-                        self.windows = windows.max(1);
-                    }
                     if windows.max(1) != self.windows {
                         self.other_windows += 1;
                         continue;
@@ -361,7 +364,9 @@ fn device(adapter: &str) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12D
 /// Opens `pipelines.done` for `key` (this binary): the hashes it holds, and the file positioned
 /// after them. A file of another binary starts over; a torn last record is cut off.
 fn open_done(path: &Path, key: u64) -> std::io::Result<(std::fs::File, Vec<u64>)> {
-    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ: a second `xcl pipelines` on this journal is refused, not interleaved
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).share_mode(1).open(path)?;
     let mut old = Vec::new();
     f.read_to_end(&mut old)?;
     let done: Vec<u64> = if old.len() >= 8 && old[..8] == key.to_le_bytes() {
@@ -384,6 +389,27 @@ fn open_done(path: &Path, key: u64) -> std::io::Result<(std::fs::File, Vec<u64>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_torn_frame_written_over_is_read_again() {
+        let path = std::env::temp_dir().join(format!("xcl_pipelines_torn_{}.bin", std::process::id()));
+        let mut j = pso_journal::MAGIC.to_vec();
+        j.extend(frame(b'C', 1, &[0; 8]));
+        let good = j.len();
+        j.extend(&frame(b'C', 2, &[0; 8])[..9]); // a run killed mid-frame
+        std::fs::write(&path, &j).unwrap();
+        let mut f = std::fs::File::open(&path).unwrap();
+        let mut q = Queue::default();
+        assert_eq!(q.ingest(&mut f), 1);
+        // the next run cuts the torn frame and writes on from there
+        j.truncate(good);
+        j.extend(frame(b'C', 3, &[0; 8]));
+        j.extend(frame(b'C', 4, &[0; 8]));
+        std::fs::write(&path, &j).unwrap();
+        assert_eq!(q.ingest(&mut f), 2, "3 and 4, read from where the torn frame began");
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn done_file_of_another_binary_is_replaced_and_a_torn_record_cut() {
