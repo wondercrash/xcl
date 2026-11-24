@@ -128,6 +128,9 @@ xcl pipelines D:\Games\SomeTitle [--watch]  # compile the pipelines a run queued
 - **The game folder is never modified** – writes go to the overlay.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- `XCL_PSO_WAIT_MS=<ms>` / `XCL_PSO_WAIT_MS_GRAPHICS=<ms>`: how long a bind waits for a pipeline still being built
+  in the background (default: until it is built); after that its draws / dispatches are skipped until it is. The
+  second one is for graphics pipelines only (compute binds keep the first; `0`: until built).
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.

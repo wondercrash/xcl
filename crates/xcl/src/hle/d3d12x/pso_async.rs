@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 struct Pending {
@@ -72,7 +72,7 @@ pub(super) enum Want {
     /// no: built ahead of its first use, or binds go on without it for its size
     /// (`XCL_PSO_SKIP_HUGE`: it takes its turn like those built ahead)
     No,
-    /// a bind waited for it longer than `XCL_PSO_WAIT_MS` (`late`): binds go on without it now
+    /// a bind waited for it longer than its wait budget (`XCL_PSO_WAIT_MS`, `_GRAPHICS`; `late`): binds go on without it now
     Late,
     /// a bind waits for it: the build must not stand back for the title's sake
     Waits,
@@ -742,35 +742,43 @@ pub fn resolve(pso: usize) -> usize {
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget(), skip_huge())
+    let Some(p) = entry(pso) else { return pso };
+    resolve_wait_in(&p, pso, wait_budget(p.compute), skip_huge())
 }
 
-/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built), and not once its
-/// DXIL is known to go to the driver's compiler with `huge` bytes or more (None: no limit).
+/// `resolve_wait_in` for the pipeline of `pso` (tests).
+#[cfg(test)]
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>, huge: Option<usize>) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    resolve_wait_in(&p, pso, budget, huge)
+}
+
+/// `resolve_wait` for `p` (the pipeline of `pso`), waiting at most `budget` (None: until the
+/// pipeline is built), and not once its DXIL is known to go to the driver's compiler with `huge`
+/// bytes or more (None: no limit).
+fn resolve_wait_in(p: &Arc<Pending>, pso: usize, budget: Option<std::time::Duration>, huge: Option<usize>) -> usize {
     p.note_use();
     p.want();
     // only a call that waits is counted: not one for a pipeline built already, late
-    // (`XCL_PSO_WAIT_MS`) or known to be too big to wait for (`XCL_PSO_SKIP_HUGE`)
+    // (`XCL_PSO_WAIT_MS`, `XCL_PSO_WAIT_MS_GRAPHICS`) or known to be too big to wait for (`XCL_PSO_SKIP_HUGE`)
     let waits = !*p.done.lock().unwrap() && !p.late.load(Ordering::Acquire) && !p.too_big(huge);
     let started = Instant::now();
     if let Some(budget) = budget {
-        let r = resolve_within(&p, pso, budget, huge);
+        let r = resolve_within(p, pso, budget, huge);
         if waits {
             note_blocked(p.compute, false, started.elapsed());
         }
         return r;
     }
     // (with a size limit, built on a thread of its own: this one may go on without it)
-    let aside = huge.is_some() && p.job.lock().unwrap().is_some() && build_aside(&p);
+    let aside = huge.is_some() && p.job.lock().unwrap().is_some() && build_aside(p);
     let job = if aside { None } else { p.job.lock().unwrap().take() };
     let built_here = job.is_some();
     if let Some(job) = job {
         // built on this thread: as long a wait
         let start = Instant::now();
         WAITING.fetch_add(1, Ordering::Relaxed);
-        let real = build(&p, job, false);
+        let real = build(p, job, false);
         WAITING.fetch_sub(1, Ordering::Relaxed);
         if start.elapsed() >= LONG_WAIT {
             crate::xlog_info!(
@@ -782,7 +790,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>, huge: Optio
             );
         }
     }
-    wait_built(&p, None, huge);
+    wait_built(p, None, huge);
     if waits {
         note_blocked(p.compute, built_here, started.elapsed());
     }
@@ -810,13 +818,25 @@ fn build_aside(p: &Arc<Pending>) -> bool {
         .is_ok()
 }
 
-/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
-/// it is built). A retail game builds compute programs on its own threads: the driver takes up to
-/// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
-/// has been held 30 s.
-fn wait_budget() -> Option<std::time::Duration> {
-    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
+/// How long a bind waits for a pipeline still being built, for a compute (`compute`) or a graphics
+/// one: `XCL_PSO_WAIT_MS` (unset or 0: until it is built), and `XCL_PSO_WAIT_MS_GRAPHICS` for
+/// graphics ones when it is set (0: until built, whatever `XCL_PSO_WAIT_MS` says). A retail game
+/// builds compute programs on its own threads: the driver takes up to 30 s for the biggest
+/// translated ones, and the title's watchdog ends it when its main thread has been held 30 s. A
+/// cutscene's graphics pipelines (0.2 – 0.65 MB of DXIL each) are bound one after another and each
+/// bind waited 2 – 17.5 s for its pipeline: with a short graphics budget a bind goes on at once,
+/// its draws are skipped until a worker has built the pipeline, and the pipelines are built in
+/// parallel (a discovery run: `used-pipelines.txt` gets them all).
+fn wait_budget(compute: bool) -> Option<std::time::Duration> {
+    static B: LazyLock<[Option<std::time::Duration>; 2]> = LazyLock::new(|| budgets(std::env::var("XCL_PSO_WAIT_MS").ok().as_deref(), std::env::var("XCL_PSO_WAIT_MS_GRAPHICS").ok().as_deref()));
+    B[compute as usize]
+}
+
+/// `wait_budget`'s values from the two variables' texts: [graphics, compute].
+fn budgets(all: Option<&str>, graphics: Option<&str>) -> [Option<std::time::Duration>; 2] {
+    let ms = |v: &str| v.trim().parse::<u64>().ok().map(|ms| (ms > 0).then(|| std::time::Duration::from_millis(ms)));
+    let all = all.and_then(ms).flatten();
+    [graphics.and_then(ms).unwrap_or(all), all]
 }
 
 /// A bring-up switch (`XCL_PSO_SKIP_HUGE=<bytes>`, e.g. `8M`; `shaders::parse_bytes`; unset: off):
@@ -1141,7 +1161,7 @@ fn wait_built(p: &Arc<Pending>, budget: Option<Duration>, huge: Option<usize>) -
     if logged {
         let end = match (built, p.real.load(Ordering::Acquire)) {
             (false, _) if skipped => "its DXIL (or the HLSL DXC compiles) is at least XCL_PSO_SKIP_HUGE: its binds go on without it",
-            (false, _) => "not built within XCL_PSO_WAIT_MS: its binds go on without it",
+            (false, _) => "not built within its wait budget (XCL_PSO_WAIT_MS, XCL_PSO_WAIT_MS_GRAPHICS): its binds go on without it",
             (true, 0) => "its build failed",
             (true, _) => "built",
         };
@@ -1212,7 +1232,7 @@ pub fn driver_start(dxil: usize, console: &[u8], slot: Option<&'static str>, big
             p.describe(),
             match p.want_now(skip_huge()) {
                 Want::Waits => "yes",
-                Want::Late => "no, it is late (XCL_PSO_WAIT_MS): binds go on without it",
+                Want::Late => "no, it is late (XCL_PSO_WAIT_MS, XCL_PSO_WAIT_MS_GRAPHICS): binds go on without it",
                 Want::No if p.demand.lock().unwrap().wanted => "no, XCL_PSO_SKIP_HUGE: binds go on without it",
                 Want::No => "no",
             },
@@ -1377,5 +1397,20 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let _ = released(standin);
+    }
+
+    /// `XCL_PSO_WAIT_MS_GRAPHICS` bounds graphics binds only; set (even to 0, until built) it wins
+    /// over `XCL_PSO_WAIT_MS` for them; unset or not a number, graphics binds follow
+    /// `XCL_PSO_WAIT_MS`, which is the compute binds' budget either way.
+    #[test]
+    fn the_graphics_budget_overrides_the_general_one_for_graphics_only() {
+        let ms = |n| Some(std::time::Duration::from_millis(n));
+        assert_eq!(budgets(None, None), [None, None]);
+        assert_eq!(budgets(None, Some(" 250 ")), [ms(250), None]);
+        assert_eq!(budgets(Some("9000"), Some("250")), [ms(250), ms(9000)]);
+        assert_eq!(budgets(Some("9000"), None), [ms(9000), ms(9000)]);
+        assert_eq!(budgets(Some("9000"), Some("0")), [None, ms(9000)], "0: until built");
+        assert_eq!(budgets(Some("9000"), Some("soon")), [ms(9000), ms(9000)], "not a number: ignored");
+        assert_eq!(budgets(Some("0"), None), [None, None]);
     }
 }

@@ -1051,6 +1051,13 @@ the FSR4 GPU probe, Unicorn Overlord and XDefiant:
   `pso_root_signature` go through `pso_async::resolve` – the real pipeline once built. Graphics draws nothing until then;
   compute is waited for at its first bind / replay (`resolve_wait`; a skipped dispatch would corrupt results).
   `report.json → d3d12.background_pipelines` = (built, failed, still building). `XCL_ASYNC_PSO=0` turns it off.
+- **Bind waits:** a bind waits until a pipeline it needs is built (`XCL_PSO_WAIT_MS=<ms>`: at most that long; then its
+  binds go on with the stand-in – draws / dispatches skipped – until a worker has built it). `XCL_PSO_WAIT_MS_GRAPHICS=<ms>`
+  sets that budget for graphics pipelines alone (compute keeps `XCL_PSO_WAIT_MS`; `0`: until built, also when
+  `XCL_PSO_WAIT_MS` is set). Retail run 19b: a cutscene's graphics pipelines (0.2 – 0.65 MB DXIL each) are bound one
+  after another, and 47 binds waited 2 – 17.5 s each (median ~5.5 s, 75 – 353 s into the run); with a short graphics
+  budget the title reaches all of them at once and the workers build them in parallel – a discovery run for
+  `used-pipelines.txt`, which a bind adds its pipeline's shaders to however long it waited.
 - Tests: `retail_pipelines_built_in_the_background_behind_a_stand_in` (empty DXIL cache: the game's VS/PS pipeline built
   in the background renders the same triangle pixel for pixel; a mesh pipeline returns after ~0.1 s, real after ~1 s,
   two-pass parts found through the stand-in, title's description freed before the worker ran); the game's BVH builder
