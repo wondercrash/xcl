@@ -1774,8 +1774,10 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
   the CPU; compute pipelines of 256 KB of DXIL or more are built in the background (the driver takes ~30 s for
   its 1 MB ray-tracing resolve programs; 2 at a time, within `wait_for_memory`), and a bind of one not started
   builds it itself (`pso_async`); DXC -O1 from 1 MB of HLSL; `xcl shaders --precompile --pipelines` makes the
-  compute pipelines on the GPU too (the driver's cache: 41.6 s then 0.2 s; 4 at a time, `XCL_PIPELINE_THREADS`);
-  `XCL_TRACE_FRAME_EVENTS`; the end of a timed run logs the PresentX calls.
+  compute pipelines on the GPU too (the driver's cache: 41.6 s then 0.2 s; 4 at a time, `XCL_PIPELINE_THREADS`;
+  `XCL_PRECOMPILE_MAX_DXIL=<bytes, e.g. 8M>` leaves the driver compile of programs with more DXIL to the runtime –
+  their DXIL is still cached – and the summary counts them); `XCL_TRACE_FRAME_EVENTS`; the end of a timed run logs
+  the PresentX calls.
 - Measured: the memory-window `switch` of every memory access doubles DXC + driver time (one 21 000-instruction CS:
   41.6 s with 4 windows, 22.5 s with 1); heap-indexed windows would remove it but a raw buffer view cannot cover a
   4 GiB window – a redesign of how shaders reach title memory.
@@ -1836,6 +1838,13 @@ SHA-NI is not emulated (also missing on those CPUs): add it if a title's code by
 - Open (from a user report): a write-watch scan of textures in the 4 GiB coherent window costs in proportion to their
   size at every submit; a page guard (read-only until the first CPU write, `kernelx::lazy`) was tried and reverted
   pending measurement past the menus.
+- **`XCL_TITLE_WATCHDOG=0`** (bring-up only, temporary): the title's own hang watchdog no longer ends the process. Its
+  thread checks every second; 30 checks without a new frame heartbeat (or a "long operation" scope open for 300 s
+  while a tunable enables that check) call a callback that writes to address 0 – the 0xC0000005 at exe+0x23cf683
+  that ended runs stalled in the driver's pipeline compiles. The loader makes those three branches no-ops
+  (`title_watchdog.rs`), only for this executable (PE timestamp 0x6af783d4, image size 0xb06d000 and the code at
+  each site; anything else logs a warning and is left alone). With it a real hang no longer ends the run: the fix is
+  removing the stalls. `XCL_SAMPLE_EXE=<the exe>` checks the file in a unit test.
 
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
