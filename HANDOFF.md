@@ -444,8 +444,14 @@ unknown records), the result read with `bvh::Bvh::trace` = brute force on 500 ra
   is remembered at CreateRootSignature (`note_root_signature`, RTS0 parser).
 - Dispatch: root argument array (layout from RTS0) in UMA, `io[0..1]` = its address, XCL ABI root signature, u0 io / u1 res /
   u2 `mem` = the whole UMA buffer, translated PSO.
-- **Important: `mem` in Compute mode is `globallycoherent`** – without it the bottom-up tree build (atomics + reading what
-  other groups wrote) produced wrong child pointers (on the console the code uses GLC / cache invalidation). Graphics gets an ordinary view.
+- **Important: `mem` in Compute mode is `globallycoherent` where the program can read other groups' writes** – without it
+  the bottom-up tree build (atomics + reading what other groups wrote) produced wrong child pointers (on the console the
+  code uses GLC / cache invalidation). `MemoryUse::coherent_because` keeps it for programs with memory atomics, GDS / GWS,
+  GLC / DLC loads, cache invalidations, or vector loads together with vector stores; the others (1 274 of the retail
+  game's 2 682 compute programs) and graphics get the ordinary view. A coherent view of the coherent window (process
+  memory) loads past the GPU's caches: on an RTX 5090 a 2560x1440 pass with 24 dependent wave-uniform loads took 75 ms
+  instead of 2.3 ms, and the retail cutscene's scalar-load-heavy passes 150–580 ms each. `XCL_CS_COHERENT=1` makes
+  every compute program coherent again.
 - **Hooked up automatically** (when `XCL_CONSOLE_LISTS=1`): device #12 CreateCommandList – split thunk: console code
   gets a console list (the initial PSO unwrapped to the PC one), XCL code gets a PC list; list: #9 Close (interpretation),
   #10 Reset, #3–8 → PC list; the queue's ExecuteCommandLists replaces console lists with PC ones; the recording's UMA memory is freed

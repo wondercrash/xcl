@@ -1395,6 +1395,91 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
     out
 }
 
+/// What a program does with memory, for whether a compute program's memory windows must be
+/// `globallycoherent` (`MemoryUse::coherent_because`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryUse {
+    /// a buffer / global / flat atomic
+    pub atomic: bool,
+    /// GDS, ordered counts, GWS
+    pub gds: bool,
+    /// a vector or scalar load with GLC or DLC: past the CU's / shader array's caches
+    pub coherent_load: bool,
+    /// BUFFER_GL0_INV, BUFFER_GL1_INV, S_DCACHE_INV, S_GL1_INV
+    pub invalidate: bool,
+    /// a vector (buffer / global / flat) load
+    pub vector_load: bool,
+    /// a vector (buffer / global / flat) store
+    pub vector_store: bool,
+}
+
+impl MemoryUse {
+    pub fn of(insts: &[Decoded]) -> MemoryUse {
+        let mut u = MemoryUse::default();
+        for d in insts {
+            let name = d.inst.name;
+            let flag = |f: &str| rdna2::field_value(d.enc, &d.words, f) == Some(1);
+            match d.enc.name {
+                // (scratch: the lane's own memory)
+                "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" => {
+                    if name.ends_with("_INV") {
+                        u.invalidate = true;
+                    } else if name.contains("ATOMIC") {
+                        u.atomic = true;
+                    } else if name.contains("_LOAD") {
+                        u.vector_load = true;
+                        u.coherent_load |= flag("GLC") || flag("DLC");
+                    } else if name.contains("_STORE") {
+                        u.vector_store = true;
+                    }
+                }
+                "ENC_SMEM" => {
+                    if name.ends_with("_INV") {
+                        u.invalidate = true;
+                    } else if name.contains("ATOMIC") {
+                        u.atomic = true;
+                    } else if name.contains("_LOAD") {
+                        u.coherent_load |= flag("GLC") || flag("DLC");
+                    }
+                }
+                "ENC_DS" => u.gds |= flag("GDS") || name == "DS_ORDERED_COUNT" || name.starts_with("DS_GWS_"),
+                _ => {}
+            }
+        }
+        u
+    }
+
+    /// Why the program's memory windows stay `globallycoherent` (None: a cached view does).
+    /// On the console a load that hits the CU's or the shader array's cache (GL0 / GL1, the
+    /// scalar cache) does not see what other CUs wrote during the dispatch: a program that reads
+    /// other groups' results marks those loads GLC / DLC or invalidates the caches, or meets
+    /// them through atomics / GDS. Those keep the coherent view, and so – conservatively, the
+    /// window of an access is not known here – does a program with both vector loads and
+    /// vector stores. Scalar loads without GLC go through the console's scalar cache, which is
+    /// not coherent either.
+    pub fn coherent_because(&self) -> Option<&'static str> {
+        if self.atomic {
+            Some("memory atomics")
+        } else if self.gds {
+            Some("GDS / ordered count / GWS")
+        } else if self.coherent_load {
+            Some("GLC / DLC loads")
+        } else if self.invalidate {
+            Some("cache invalidations")
+        } else if self.vector_load && self.vector_store {
+            Some("vector loads and stores")
+        } else {
+            None
+        }
+    }
+}
+
+/// `XCL_CS_COHERENT=1`: every compute program's memory windows are `globallycoherent` (the
+/// form before `MemoryUse::coherent_because`).
+fn all_compute_coherent() -> bool {
+    std::env::var("XCL_CS_COHERENT").is_ok_and(|v| v.trim() == "1")
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
@@ -1441,6 +1526,13 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    // compute: the memory windows are globallycoherent only where the program needs it – a
+    // coherent view loads past the caches every time (on an RTX 5090, 24 dependent
+    // wave-uniform loads from a heap over process memory: 75 ms for a 2560x1440 pass, cached
+    // 2.3 ms)
+    if matches!(opt.mode, Mode::Compute(_)) {
+        em.coherent_mem = if all_compute_coherent() { Some("XCL_CS_COHERENT") } else { MemoryUse::of(&insts).coherent_because() };
+    }
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode

@@ -8062,3 +8062,114 @@ fn crossing_forward_jumps_keep_the_guards_short() {
         }
     }
 }
+
+/// The decoded instructions of `code`.
+fn decoded(code: &[u8]) -> Vec<crate::gpu::rdna2::Decoded> {
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off + 4 <= code.len() {
+        let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+        off += d.len;
+        out.push(d);
+    }
+    out
+}
+
+/// Compute programs keep `globallycoherent` memory windows only for what can read other
+/// groups' writes during the dispatch (`MemoryUse::coherent_because`): atomics, GDS / GWS,
+/// GLC / DLC loads, cache invalidations, vector loads with vector stores. Scalar loads, image
+/// work, loads alone and stores alone get the cached view; graphics never was coherent.
+#[test]
+fn compute_memory_is_coherent_only_where_other_groups_are_read() {
+    type I<'a> = (&'a str, &'a str, &'a [(&'a str, u64)], Option<u32>);
+    const S_LOAD: I = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0x20)], None);
+    const S_LOAD_GLC: I = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0x20), ("GLC", 1)], None);
+    const LOAD: I = ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None);
+    const LOAD_DLC: I = ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 2), ("SADDR", 2), ("DLC", 1)], None);
+    const STORE: I = ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None);
+    const ATOMIC: I = ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None);
+    const INV: I = ("BUFFER_GL0_INV", "ENC_MUBUF", &[], None);
+    const GDS: I = ("DS_ADD_U32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1), ("GDS", 1)], None);
+    const LDS: I = ("DS_ADD_U32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None);
+    let cases: [(&[I], Option<&str>); 11] = [
+        (&[S_LOAD], None),
+        (&[S_LOAD, LOAD], None),
+        (&[S_LOAD, STORE], None),
+        (&[S_LOAD, LDS, STORE], None),
+        (&[LOAD, STORE], Some("vector loads and stores")),
+        (&[S_LOAD_GLC], Some("GLC / DLC loads")),
+        (&[LOAD_DLC], Some("GLC / DLC loads")),
+        (&[ATOMIC], Some("memory atomics")),
+        (&[S_LOAD, INV, STORE], Some("cache invalidations")),
+        (&[GDS], Some("GDS / ordered count / GWS")),
+        (&[ATOMIC, LOAD, STORE], Some("memory atomics")),
+    ];
+    for (list, want) in cases {
+        let code = prog(list);
+        let names: Vec<&str> = list.iter().map(|i| i.0).collect();
+        assert_eq!(super::MemoryUse::of(&decoded(&code)).coherent_because(), want, "{names:?}");
+        if list.iter().any(|i| i.1 == "ENC_DS" || i.0.ends_with("_INV")) {
+            continue;
+        }
+        let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, ..Default::default() };
+        let h = translate(&code, &Options { mode: Mode::Compute(cs), mem_windows: 4, ..Default::default() }).unwrap().hlsl;
+        assert_eq!(h.contains("globallycoherent RWByteAddressBuffer mem :"), want.is_some(), "{names:?}\n{h}");
+        assert_eq!(h.matches("globallycoherent RWByteAddressBuffer mem").count(), if want.is_some() { 4 } else { 0 }, "{names:?}");
+        // graphics and kernels: the cached view whatever the program does
+        let k = translate(&code, &Options { mem_windows: 4, ..Default::default() }).unwrap().hlsl;
+        assert!(!k.contains("globallycoherent"), "{names:?}");
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}"));
+        }
+    }
+}
+
+/// `XCL_SAMPLE_RPF=…\shaders.rpf`: how many of the pack's compute programs keep coherent memory
+/// windows, and why (`MemoryUse::coherent_because`); `XCL_COHERENCE_HASHES=a,b,…` also prints
+/// the verdict for those programs.
+#[test]
+#[ignore]
+fn retail_compute_coherence_census() {
+    use std::collections::{BTreeMap, BTreeSet};
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    let data = std::fs::read(path).unwrap();
+    let named: Vec<u64> = std::env::var("XCL_COHERENCE_HASHES").map_or_else(|_| Vec::new(), |v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect());
+    let mut seen = BTreeSet::new();
+    let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut flags: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut verdicts = BTreeMap::new();
+    for r in crate::gpu::pack::scan(&data, 0x40).iter() {
+        let Some(blob) = crate::gpu::pack::inflate(&data, r) else { continue };
+        let h = crate::gpu::shader::fnv64(&blob);
+        let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+        let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)) else { continue };
+        if !matches!(super::interface(&blob, &sh, f), Some(Mode::Compute(_))) || !seen.insert(h) {
+            continue;
+        }
+        let Some(code) = f.programs.first().and_then(|p| f.data.get(p.offset..p.offset + p.len)) else { continue };
+        let mut insts = Vec::new();
+        let mut off = 0;
+        while off + 4 <= code.len() {
+            let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { break };
+            off += d.len;
+            insts.push(d);
+        }
+        let u = super::MemoryUse::of(&insts);
+        for (on, name) in [(u.atomic, "atomic"), (u.gds, "gds"), (u.coherent_load, "GLC/DLC load"), (u.invalidate, "invalidate"), (u.vector_load, "vector load"), (u.vector_store, "vector store")] {
+            if on {
+                *flags.entry(name).or_default() += 1;
+            }
+        }
+        let why = u.coherent_because();
+        *reasons.entry(why.unwrap_or("cached")).or_default() += 1;
+        if named.contains(&h) {
+            verdicts.insert(h, (r.name.clone(), why, u));
+        }
+    }
+    println!("compute programs: {}", seen.len());
+    println!("verdicts: {reasons:?}");
+    println!("programs with: {flags:?}");
+    for (h, (name, why, u)) in &verdicts {
+        println!("{h:016x} {name}: {} ({u:?})", why.unwrap_or("cached"));
+    }
+}
