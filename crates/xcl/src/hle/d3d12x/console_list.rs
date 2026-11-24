@@ -829,6 +829,11 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // a pipeline still being built in the background is waited for; if
                         // the background translation failed, skip instead of binding XCL's
                         // ABI root signature onto the stand-in
+                        if super::real::skip_requested((*p).pc) {
+                            out.skipped_dispatches += 1;
+                            super::breadcrumbs::skipped(list.as_raw(), (*p).pc, || format!("Dispatch {x}x{y}x{z} (console list) skipped: XCL_SKIP_SHADERS"));
+                            continue;
+                        }
                         let real = super::pso_async::resolve_wait((*p).pc);
                         if !super::real::is_translated_compute(real) {
                             out.skipped_dispatches += 1;

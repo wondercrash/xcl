@@ -991,10 +991,27 @@ pub fn resolve_for_bind(pso: usize) -> usize {
     }
 }
 
+/// Stand-ins of pipelines `XCL_SKIP_SHADERS` names (by their console shader's hash): no build was
+/// queued for them, and their dispatches are skipped before any wait (`skipped_shader`).
+static SKIPPED: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// `standin` runs the console compute shader `cs`, which `XCL_SKIP_SHADERS` names.
+pub fn note_skipped(standin: usize, cs: u64) {
+    SKIPPED.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, cs);
+}
+
+/// The hash of the skipped console shader `pso` (a stand-in, not resolved) was made from.
+pub fn skipped_shader(pso: usize) -> Option<u64> {
+    SKIPPED.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
 /// The title released stand-in `pso` for good: forget it (its address may come back for
 /// another object) and return its real pipeline to release (0: none, or still being built –
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
+    if let Some(m) = SKIPPED.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
     let done = p.done.lock().unwrap();
     if *done {

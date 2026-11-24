@@ -266,7 +266,14 @@ fn signature_dispatches(sig: usize) -> bool {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    // a pipeline XCL_SKIP_SHADERS names is skipped as the title has it: not waited for
+    let titles = with(this, |s| s.pso);
+    if super::real::skip_requested(titles) {
+        count(DISPATCHES_SKIPPED);
+        super::breadcrumbs::skipped(this, titles, || format!("ExecuteIndirect max {max} skipped: XCL_SKIP_SHADERS"));
+        return;
+    }
+    let pso = super::pso_async::resolve_wait(titles);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     // (where the arguments are in unified memory: a stalled op's breadcrumb reads them)
     let args_at = super::real::title_address(args).map_or(0, |p| p + args_off as usize);
@@ -846,7 +853,14 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    // a pipeline XCL_SKIP_SHADERS names is skipped as the title has it: not waited for
+    let titles = with(this, |s| s.pso);
+    if super::real::skip_requested(titles) {
+        count(DISPATCHES_SKIPPED);
+        super::breadcrumbs::skipped(this, titles, || format!("Dispatch {x}x{y}x{z} skipped: XCL_SKIP_SHADERS"));
+        return;
+    }
+    let pso = super::pso_async::resolve_wait(titles);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
@@ -1418,6 +1432,69 @@ mod tests {
         forget(list_ptr);
         real::forget_pso_for_test(named);
         real::forget_pso_for_test(other);
+    }
+
+    /// A pipeline of a shader `XCL_SKIP_SHADERS` names is skipped as the title has it: its
+    /// Dispatch and ExecuteIndirect do not wait for a build that is still going (here one that
+    /// never finishes until the test lets it).
+    #[test]
+    fn dispatches_of_a_shader_named_to_skip_do_not_wait_for_its_build() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[14] = fake_dispatch as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as usize;
+        let (standin, cs) = (0x7500_0001usize, 0x1856_7A5F_0145_BDE9u64);
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = std::sync::Mutex::new(hold);
+        pso_async::submit(
+            standin,
+            true,
+            Box::new(move || {
+                let _ = hold.lock().unwrap().recv();
+                0
+            }),
+        );
+        pso_async::note_skipped(standin, cs);
+        reset(list_ptr as *mut c_void, 0x7500_0100, standin);
+        assert!(pso_async::is_pending(standin), "its build has not finished");
+
+        let before = counts_snapshot();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let runner = std::thread::spawn(move || {
+            real::SKIP_SHADERS_FOR_TEST.with(|s| s.set(Some(&[0x1856_7A5F_0145_BDE9])));
+            let list = list_ptr as *mut c_void;
+            unsafe {
+                dispatch(list, 3, 1, 1);
+                execute_indirect(list, 0x7500_00F0, 1, 0, 0, 0, 0);
+            }
+            let _ = done.send(());
+        });
+        let returned = finished.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        // (lets the build end, whether or not the dispatches waited for it)
+        let _ = release.send(());
+        runner.join().unwrap();
+        assert!(returned, "a skipped pipeline's dispatches must not wait for its build");
+        let after = counts_snapshot();
+        assert!(after[DISPATCHES_SKIPPED] >= before[DISPATCHES_SKIPPED] + 2);
+        assert_eq!(fake.dispatch_calls.load(Ordering::Relaxed) + fake.execute_indirect_calls.load(Ordering::Relaxed), 0);
+
+        forget(list_ptr as *mut c_void);
+        pso_async::released(standin);
     }
 
     /// A two-pass mesh/GS pipeline is built with XCL's mesh root signature and registered in

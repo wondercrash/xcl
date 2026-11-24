@@ -1978,14 +1978,22 @@ fn a_list_of_shader_hashes_is_read_as_hex() {
     assert_eq!(parse_shader_hashes("1f,CS_Clear,123456789abcdef01"), (vec![0x1F], vec!["CS_Clear".to_owned(), "123456789abcdef01".to_owned()]));
 }
 
-/// Whether `pso` (a stand-in resolved) runs a console compute shader `XCL_SKIP_SHADERS` names:
-/// its dispatch or ExecuteIndirect is skipped. The first of each shader is logged.
+/// Whether `pso` runs a console compute shader `XCL_SKIP_SHADERS` names: its dispatch or
+/// ExecuteIndirect is skipped. Takes a stand-in as the title has it (a pipeline made from such a
+/// shader is never built, `skipped_console_compute`, so nothing is waited for) or a resolved one.
+/// The first of each shader is logged.
 pub(super) fn skip_requested(pso: usize) -> bool {
     let named = skip_shaders();
     if named.is_empty() {
         return false;
     }
-    let Some((cs, 0)) = pso_shaders(pso) else { return false };
+    let cs = match super::pso_async::skipped_shader(pso) {
+        Some(cs) => cs,
+        None => match pso_shaders(pso) {
+            Some((cs, 0)) => cs,
+            _ => return false,
+        },
+    };
     if !named.contains(&cs) {
         return false;
     }
@@ -5133,6 +5141,9 @@ pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay,
         }
         super::pso_journal::Replay::Compute(d, _) => {
             let cs = shader_bytes(&d.CS).filter(|c| is_console(c)).ok_or("no console CS")?;
+            if skip_shaders().contains(&crate::gpu::shader::fnv64(cs)) {
+                return Err("named by XCL_SKIP_SHADERS – left to the title".into());
+            }
             let compiled = console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this))?;
             let rs = abi_rs_for(this, &compiled.samplers).ok_or("no root signature")?;
             let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(&**d);
@@ -5236,9 +5247,36 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
     }
 }
 
+/// The hash of the console compute shader of `desc` (a `D3D12_COMPUTE_PIPELINE_STATE_DESC`) when
+/// `XCL_SKIP_SHADERS` names it: such a pipeline is not built at all (no translation, DXC or
+/// driver time) and only gets a stand-in, which its dispatches never run (`skip_requested`).
+unsafe fn skipped_console_compute(desc: *const c_void) -> Option<u64> {
+    if skip_shaders().is_empty() || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let cs = shader_bytes(&(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS)?;
+    if !crate::gpu::recomp::pso::is_console(cs) {
+        return None;
+    }
+    let hash = crate::gpu::shader::fnv64(cs);
+    skip_shaders().contains(&hash).then_some(hash)
+}
+
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    if let Some(hash) = skipped_console_compute(desc) {
+        let hr = standin_compute(this, f, desc, riid, ppv);
+        if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+            let standin = *ppv as usize;
+            super::pso_async::note_skipped(standin, hash);
+            LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
+            LAST_COMPUTE_RS.with(|c| c.set(0));
+            note_console_compute(hr, ppv);
+            crate::xlog_info!("D3D12.X: XCL_SKIP_SHADERS: compute pipeline {standin:#x} of console shader {hash:016x} is not built");
+            return hr;
+        }
+    }
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, build_compute)) {
