@@ -325,6 +325,10 @@ mod used {
         text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).filter(|&k| k != 0).collect()
     }
 
+    pub fn path() -> std::path::PathBuf {
+        crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt")
+    }
+
     fn get() -> &'static Used {
         static U: OnceLock<Used> = OnceLock::new();
         U.get_or_init(|| {
@@ -332,7 +336,7 @@ mod used {
             if cfg!(test) {
                 return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)) };
             }
-            let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
+            let path = path();
             let earlier = parse(&std::fs::read_to_string(&path).unwrap_or_default());
             if !earlier.is_empty() {
                 crate::xlog_info!("D3D12.X: the pipelines of {} shader sets an earlier run used are built ahead of their first use", earlier.len());
@@ -373,6 +377,12 @@ mod used {
     pub fn earlier_run_used(key: u64) {
         get().earlier.write().unwrap().insert(key);
     }
+}
+
+/// The shader sets (`real::shaders_key`) the earlier runs used, as kept on disk: what `xcl shaders
+/// --precompile --used` builds between runs.
+pub(crate) fn used_on_disk() -> std::collections::HashSet<u64> {
+    used::parse(&std::fs::read_to_string(used::path()).unwrap_or_default())
 }
 
 /// The workers that build the pipelines of an earlier run ahead of their first use

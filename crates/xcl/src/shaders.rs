@@ -715,7 +715,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
+        let used = args.iter().any(|a| a == "--used");
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
@@ -747,6 +748,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// at most `huge_most` programs over `HUGE` at once, so those never hold every thread.
 /// `XCL_PRECOMPILE_MAX_DXIL` (bytes, `parse_bytes`): a program with more DXIL is translated
 /// (its DXIL cached) but its driver compile is left to the runtime (`over_cap`).
+/// `--used`: only the compute programs whose pipeline an earlier run of the title used
+/// (`used_compute`): the ones its next run binds and would wait for, built between runs.
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
@@ -1053,7 +1056,20 @@ impl Pipelines {
     }
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
+/// `--used`: an earlier run made a compute pipeline of this program. The runtime keeps the
+/// pipelines it used by `real::shaders_key` of their shaders (`used-pipelines.txt`), and a compute
+/// pipeline has this one shader.
+fn used_compute(used: &std::collections::HashSet<u64>, blob: &Vec<u8>) -> bool {
+    used.contains(&crate::hle::d3d12x::real::shaders_key(std::slice::from_ref(blob)))
+}
+
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: bool, t0: std::time::Instant) -> i32 {
+    let used = used.then(crate::hle::d3d12x::pso_async::used_on_disk);
+    if used.as_ref().is_some_and(|u| u.is_empty()) {
+        eprintln!("xcl shaders --used: no pipelines in {} (a title run writes them)", recomp::dxc::cache_dir().join("used-pipelines.txt").display());
+        return 2;
+    }
+    let used = used.as_ref();
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -1097,6 +1113,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             println!("pipelines: programs over {most} bytes of DXIL left for the runtime (XCL_PRECOMPILE_MAX_DXIL)");
         }
     }
+    if let Some(u) = used {
+        println!("only the compute programs of the {} shader sets earlier runs used (used-pipelines.txt)", u.len());
+    }
     // translated compute programs waiting for the driver's compiles
     let queue: BiggestFirst<recomp::pso::Compiled> = BiggestFirst::new();
     let drivers_done = std::sync::atomic::AtomicBool::new(false);
@@ -1131,7 +1150,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else { continue };
                 let Some(sh) = xbox::parse(&blob) else { continue };
-                if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
+                if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) || used.is_some_and(|u| !used_compute(u, &blob)) {
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -1546,6 +1565,20 @@ mod tests {
         let order: Vec<_> = std::iter::from_fn(|| q.pop()).collect();
         assert_eq!(order, ["b", "d", "c", "a", "e"]);
         assert_eq!(q.len(), 0);
+    }
+
+    /// `--used`: a program is picked when an earlier run used a compute pipeline of it (the key
+    /// the runtime writes, `real::shaders_key` of its one shader), not when it only shares a
+    /// graphics pipeline with another shader.
+    #[test]
+    fn used_picks_the_compute_programs_an_earlier_run_used() {
+        use crate::hle::d3d12x::real::shaders_key;
+        let (cs, vs, ps, other) = (vec![1u8, 2, 3], vec![4u8, 5], vec![6u8, 7, 8], vec![9u8; 5]);
+        let used: std::collections::HashSet<u64> = [shaders_key(&[cs.clone()]), shaders_key(&[vs.clone(), ps.clone()])].into();
+        assert!(used_compute(&used, &cs));
+        assert!(!used_compute(&used, &vs));
+        assert!(!used_compute(&used, &ps));
+        assert!(!used_compute(&used, &other));
     }
 
     /// A pop waits for a push while the queue is open, and the drivers stop once it is closed.
