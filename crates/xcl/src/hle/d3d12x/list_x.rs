@@ -1646,7 +1646,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
         match action {
             SignalAction::Skip => {}
             SignalAction::GpuSignal => {
-                if let Err(e) = q.Signal(&fence, val) {
+                if let Err(e) = super::breadcrumbs::labelled(|| format!("Write64 signal {va:#x}={val:#x}"), || q.Signal(&fence, val)) {
                     crate::xlog_warn!("D3D12.X: Write64 fence Signal({va:#x}, {val:#x}) failed ({e}) – signalling on CPU");
                     let _ = fence.Signal(val);
                 }
@@ -1801,7 +1801,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         (pre_ok.0, pre_ok.1, pre_ok.2, wait_seq)
     };
 
-    if let Err(e) = q.Wait(&fence, w.value) {
+    if let Err(e) = super::breadcrumbs::labelled(|| format!("bridged Wait64 {:#x} >= {:#x}", w.va, w.value), || q.Wait(&fence, w.value)) {
         let mut g = SYNC_GRAPH.lock().unwrap();
         if let Some(cell) = g.as_mut().and_then(|gr| gr.cells.get_mut(&w.va)) {
             if let Some(pos) = cell.armed_waits.iter().rposition(|aw| aw.val == w.value && aw.waiting_queue == q_raw && aw.wait_seq == wait_seq) {
@@ -1987,9 +1987,11 @@ unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &
     // the gate's place among this queue's tracked waits and signals, for its warnings
     let seq = SYNC_GRAPH.lock().unwrap().get_or_insert_with(SyncGraph::default).next_seq(q);
     let described = gated.clone();
+    let label = super::breadcrumbs::on().then(|| gated.iter().map(|w| format!("{:#x} >= {:#x}", w.va, w.value)).collect::<Vec<_>>().join(", "));
     let ready = move || gated.iter().all(|w| w.progress_reached());
-    if let Err(reason) = super::wait_gate::arm(queue, ready, move |reached| describe_gate(q, seq, &described, reached)) {
-        fail_submission(reason);
+    match super::wait_gate::arm(queue, ready, move |reached| describe_gate(q, seq, &described, reached)) {
+        Ok(()) => super::breadcrumbs::waited(queue, || format!("Wait64BitValueX gate on {}", label.unwrap_or_default())),
+        Err(reason) => fail_submission(reason),
     }
 }
 
@@ -2917,9 +2919,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
-            super::breadcrumbs::executed(q_raw, prior);
             execute_with_waits_on(q_raw, prior, |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                super::breadcrumbs::executed(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
                 readback_sparse_writes(q_raw, chunk);
@@ -2937,8 +2939,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
-    super::breadcrumbs::executed(q_raw, &one);
     exec(q_raw, 1, one.as_ptr());
+    super::breadcrumbs::executed(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below

@@ -1217,7 +1217,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     }
     s.rb_value += 1;
     let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
+    if super::breadcrumbs::labelled(|| "sparse readback signal".to_owned(), || queue.Signal(&s.rb_fence, v)).is_ok() {
         let _ = s.queue.Wait(&s.rb_fence, v);
     }
     s.readback_ranges(&merged);
@@ -1453,7 +1453,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     s.scratch_runs = dirty_runs;
     let q = queue.as_raw() as usize;
     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
-        let _ = queue.Wait(&s.fence, s.value);
+        let _ = super::breadcrumbs::labelled(|| "sparse uploads and tile mappings".to_owned(), || queue.Wait(&s.fence, s.value));
         s.waited.insert(q, s.value);
     }
 }

@@ -1,19 +1,27 @@
-//! `XCL_GPU_BREADCRUMBS=1`: which draw or dispatch a queue that stopped is in.
+//! `XCL_GPU_BREADCRUMBS=1`: where a queue that stopped is.
 //!
-//! After each draw, dispatch and ExecuteIndirect of console code the PC list writes the op's id
-//! twice into a readback buffer (`WriteBufferImmediate`): when the GPU has started it
-//! (MARKER_IN) and when it has finished it (MARKER_OUT). Ops console code skipped are noted
-//! too, without a GPU write. A reporter thread looks every second for ops started and not
-//! finished. One still running after 2 s is logged with its arguments, its shaders (the
-//! `XCL_DUMP_SHADERS` dump names), its queue, and the ops before it on its list.
+//! Two kinds of marks, both read back by a reporter thread every second:
+//! * ops: after each draw, dispatch and ExecuteIndirect of console code the PC list writes the
+//!   op's id twice into a readback buffer (`WriteBufferImmediate`): MARKER_IN (the GPU has
+//!   started it) and MARKER_OUT (it has finished). Ops console code skipped are noted too,
+//!   without a GPU write.
+//! * queue events: each title queue gets a fence of XCL's own, signalled after every chunk of
+//!   lists it executes and after every wait it is given (the title's queue Wait / Signal, the
+//!   Wait64 gates and bridged GPU waits, the sparse and VRAM page fences). Its completed value
+//!   is the last event the queue has passed, whatever ran in between.
+//!
+//! A queue whose fence has not moved for 2 s with events still queued is logged once: the
+//! event it is in, the one it passed before, what is queued after it and, for executed lists,
+//! the first op that has not finished (its shaders are the `XCL_DUMP_SHADERS` dump names).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+use std::mem::{offset_of, size_of, transmute};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use windows::core::Interface;
+use windows::core::{Interface, HRESULT};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
@@ -22,21 +30,51 @@ use super::real;
 /// ring of ops; two words (started, finished) each in the readback buffer
 const SLOTS: usize = 1 << 18;
 const PC_WRITE_BUFFER_IMMEDIATE: usize = 66;
-/// a report names at most this many ops before the stuck one on its list
-const BEFORE: usize = 8;
+/// events kept per queue (older ones are dropped once the queue has passed them)
+const EVENTS: usize = 1 << 14;
+/// a report names at most this many events queued after the stuck one, and ops around it
+const SHOWN: usize = 6;
+/// reports in a row (1 s apart) a queue's fence has to stand still before it is logged
+const STUCK_REPORTS: u32 = 3;
+/// ops before the stuck one searched for skipped ones, on any list
+const SKIP_WINDOW: u32 = 4096;
+
+#[cfg(test)]
+static FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(super) fn on() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("XCL_GPU_BREADCRUMBS").is_ok_and(|v| v.trim() == "1"));
+    #[cfg(test)]
+    if FORCE.load(Ordering::Relaxed) {
+        return true;
+    }
     *ON
 }
 
 struct Entry {
     id: u32,
-    list: usize,
     pso: usize,
     what: String,
     /// written by the GPU (false: skipped by console code)
     gpu: bool,
+}
+
+struct Event {
+    n: u64,
+    what: String,
+    /// ops of the lists this event executed, in recording order
+    ops: Vec<u32>,
+}
+
+type QueueOp = unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT;
+
+struct QueueLine {
+    fence: ID3D12Fence,
+    signal: QueueOp,
+    next: u64,
+    events: VecDeque<Event>,
+    /// (completed value, reports it has stood there, logged)
+    watch: (u64, u32, bool),
 }
 
 struct Crumbs {
@@ -45,21 +83,18 @@ struct Crumbs {
     words: usize,
     next: u32,
     entries: Vec<Option<Entry>>,
-    /// PC list → the queue it last went to
-    queues: HashMap<usize, usize>,
-    /// id → reports that saw it running
-    seen: HashMap<u32, u32>,
+    /// PC list → ops recorded on it since it last went to a queue
+    pending: HashMap<usize, Vec<u32>>,
+    queues: HashMap<usize, QueueLine>,
 }
 
-// SAFETY: the readback mapping lives as long as `_buf`; D3D12 resources are free-threaded.
+// SAFETY: the readback mapping lives as long as `_buf`; D3D12 objects are free-threaded and
+// the queue Signal entries are plain function pointers.
 unsafe impl Send for Crumbs {}
 
 static STATE: Mutex<Option<Crumbs>> = Mutex::new(None);
 
-unsafe fn init(list: *mut c_void) -> Option<Crumbs> {
-    let mut dev: Option<ID3D12Device> = None;
-    ID3D12GraphicsCommandList::from_raw_borrowed(&list)?.GetDevice(&mut dev).ok()?;
-    let dev = dev?;
+unsafe fn init(dev: &ID3D12Device) -> Option<Crumbs> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: (SLOTS * 8) as u64,
@@ -84,13 +119,39 @@ unsafe fn init(list: *mut c_void) -> Option<Crumbs> {
         std::thread::sleep(Duration::from_secs(1));
         report();
     });
-    crate::xlog_info!("D3D12.X: XCL_GPU_BREADCRUMBS: each draw and dispatch of console code marks its start and end; one running for 2 s is logged");
-    Some(Crumbs { gpu_va: buf.GetGPUVirtualAddress(), _buf: buf, words: p as usize, next: 0, entries: (0..SLOTS).map(|_| None).collect(), queues: HashMap::new(), seen: HashMap::new() })
+    crate::xlog_info!("D3D12.X: XCL_GPU_BREADCRUMBS: draws and dispatches of console code mark their start and end, title queues mark each submission and wait; a queue standing still for 2 s is logged");
+    Some(Crumbs {
+        gpu_va: buf.GetGPUVirtualAddress(),
+        _buf: buf,
+        words: p as usize,
+        next: 0,
+        entries: (0..SLOTS).map(|_| None).collect(),
+        pending: HashMap::new(),
+        queues: HashMap::new(),
+    })
+}
+
+/// The breadcrumb state, made on first use with `dev` (outside the lock: the device calls go
+/// through XCL's hooks).
+fn with_state<R>(dev: impl FnOnce() -> Option<ID3D12Device>, f: impl FnOnce(&mut Crumbs) -> R) -> Option<R> {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    if !INIT.is_completed() {
+        let dev = dev()?;
+        INIT.call_once(|| {
+            let s = unsafe { init(&dev) };
+            *STATE.lock().unwrap() = s;
+        });
+    }
+    STATE.lock().unwrap().as_mut().map(f)
 }
 
 impl Crumbs {
     fn word(&self, slot: usize, k: usize) -> u32 {
         unsafe { (*(self.words as *const AtomicU32).add(2 * slot + k)).load(Ordering::Acquire) }
+    }
+
+    fn entry(&self, id: u32) -> Option<&Entry> {
+        self.entries[id as usize % SLOTS].as_ref().filter(|e| e.id == id)
     }
 
     fn state(&self, e: &Entry) -> &'static str {
@@ -123,23 +184,36 @@ unsafe fn record(list: *mut c_void, pso: usize, what: impl FnOnce() -> String, g
     push(list, real_pso, format!("{}{stand_in}", what()), gpu);
 }
 
+unsafe fn device_of_list(list: *mut c_void) -> Option<ID3D12Device> {
+    let mut dev: Option<ID3D12Device> = None;
+    ID3D12GraphicsCommandList::from_raw_borrowed(&list)?.GetDevice(&mut dev).ok()?;
+    dev
+}
+
+unsafe fn device_of_queue(queue: *mut c_void) -> Option<ID3D12Device> {
+    let mut dev: Option<ID3D12Device> = None;
+    ID3D12CommandQueue::from_raw_borrowed(&queue)?.GetDevice(&mut dev).ok()?;
+    dev
+}
+
 /// Note an op on `list` and, for one that went to the GPU, record its two marker writes there.
 unsafe fn push(list: *mut c_void, pso: usize, what: String, gpu: bool) -> Option<u32> {
-    let (id, va) = {
-        let mut g = STATE.lock().unwrap();
-        if g.is_none() {
-            *g = init(list);
-        }
-        let s = g.as_mut()?;
+    let (id, va) = with_state(|| device_of_list(list), |s| {
         s.next = s.next.wrapping_add(1).max(1);
         let id = s.next;
         let slot = id as usize % SLOTS;
         for k in 0..2 {
             (*(s.words as *const AtomicU32).add(2 * slot + k)).store(0, Ordering::Release);
         }
-        s.entries[slot] = Some(Entry { id, list: list as usize, pso, what, gpu });
+        s.entries[slot] = Some(Entry { id, pso, what, gpu });
+        let ops = s.pending.entry(list as usize).or_default();
+        if ops.len() >= SLOTS {
+            // a list recorded and reset without ever being executed
+            ops.clear();
+        }
+        ops.push(id);
         (id, s.gpu_va + 8 * slot as u64)
-    };
+    })?;
     if !gpu {
         return Some(id);
     }
@@ -150,70 +224,221 @@ unsafe fn push(list: *mut c_void, pso: usize, what: String, gpu: bool) -> Option
     let modes = [D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
     let f: F = if real::is_adopted(list) {
-        std::mem::transmute(real::orig_fn(list, PC_WRITE_BUFFER_IMMEDIATE))
+        transmute(real::orig_fn(list, PC_WRITE_BUFFER_IMMEDIATE))
     } else {
-        std::mem::transmute(*(*(list as *const *const usize)).add(PC_WRITE_BUFFER_IMMEDIATE))
+        transmute(*(*(list as *const *const usize)).add(PC_WRITE_BUFFER_IMMEDIATE))
     };
     f(list, 2, params.as_ptr(), modes.as_ptr());
     Some(id)
 }
 
-/// `lists` (PC lists) went to `queue`.
-pub(super) fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
+unsafe fn queue_line(queue: *mut c_void, dev: &ID3D12Device) -> Option<QueueLine> {
+    const SIGNAL_SLOT: usize = offset_of!(ID3D12CommandQueue_Vtbl, Signal) / size_of::<usize>();
+    let q = ID3D12CommandQueue::from_raw_borrowed(&queue)?;
+    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+    // the PC Signal: the console layout dispatch would take XCL's fence for a title fence
+    let signal: QueueOp = if real::is_adopted(queue) { transmute(real::orig_fn(queue, SIGNAL_SLOT)) } else { q.vtable().Signal };
+    Some(QueueLine { fence, signal, next: 0, events: VecDeque::new(), watch: (0, 0, false) })
+}
+
+/// Mark on `queue` that the work submitted to it so far is done: `what` was the last of it.
+/// `lists`: the PC lists it executed, if it was an ExecuteCommandLists.
+unsafe fn mark(queue: *mut c_void, what: impl FnOnce() -> String, lists: &[*mut c_void]) {
+    if !on() || queue.is_null() {
+        return;
+    }
+    let Some(dev) = device_of_queue(queue) else { return };
+    let what = what();
+    // a new queue's fence is made outside the lock (CreateFence goes through XCL's hooks)
+    let known = with_state(|| Some(dev.clone()), |s| s.queues.contains_key(&(queue as usize)));
+    let new_line = match known {
+        None => return,
+        Some(true) => None,
+        Some(false) => match queue_line(queue, &dev) {
+            Some(l) => Some(l),
+            None => return,
+        },
+    };
+    let _ = with_state(|| None, |s| {
+        let mut ops = Vec::new();
+        for l in lists {
+            if let Some(v) = s.pending.remove(&(*l as usize)) {
+                ops.extend(v);
+            }
+        }
+        let line = s.queues.entry(queue as usize).or_insert_with(|| new_line.expect("queue line made above"));
+        line.next += 1;
+        if (line.signal)(queue, line.fence.as_raw(), line.next).is_err() {
+            line.next -= 1;
+            return;
+        }
+        if line.events.len() >= EVENTS {
+            line.events.pop_front();
+        }
+        line.events.push_back(Event { n: line.next, what, ops });
+    });
+}
+
+/// `lists` (PC lists) went to `queue` (call after the queue's ExecuteCommandLists).
+pub(super) unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
+    mark(queue, || format!("ExecuteCommandLists of {} list(s) [{}]", lists.len(), lists.iter().map(|l| format!("{l:p}")).collect::<Vec<_>>().join(", ")), lists);
+}
+
+/// `queue` was given a wait (call after the queue's Wait / Signal): the mark after it passes
+/// once the wait is satisfied.
+pub(super) unsafe fn waited(queue: *mut c_void, what: impl FnOnce() -> String) {
+    mark(queue, what, &[]);
+}
+
+thread_local! {
+    static LABEL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f`, a queue Wait / Signal of XCL's own that goes through the title's queue entry
+/// (`real::queue_dispatch`), which then marks it named `label` instead of as the title's.
+pub(super) fn labelled<R>(label: impl FnOnce() -> String, f: impl FnOnce() -> R) -> R {
+    if !on() {
+        return f();
+    }
+    let old = LABEL.with(|l| l.replace(Some(label())));
+    let r = f();
+    LABEL.with(|l| *l.borrow_mut() = old);
+    r
+}
+
+/// A queue Signal / Wait from the title's queue entry went to the GPU: the title's, or one of
+/// XCL's own (named when it ran under `labelled`).
+pub(super) unsafe fn queue_call(queue: *mut c_void, what: &str, fence: *mut c_void, value: u64) {
     if !on() {
         return;
     }
-    if let Some(s) = STATE.lock().unwrap().as_mut() {
-        for &l in lists {
-            s.queues.insert(l as usize, queue as usize);
-        }
-    }
+    let label = LABEL.with(|l| l.borrow_mut().take());
+    mark(queue, || match label {
+        Some(l) => format!("{what} of fence {fence:p} at {value:#x} ({l})"),
+        None => format!("{what} of fence {fence:p} at {value:#x} (the title's, or XCL's own unnamed)"),
+    }, &[]);
 }
 
 fn shaders(pso: usize) -> String {
     match real::pso_shaders(pso) {
         Some((cs, 0)) => format!("shader {cs:016x}"),
         Some((vs, ps)) => format!("VS {vs:016x} PS {ps:016x}"),
-        None => format!("pipeline {pso:#x} (no console shader known)"),
+        None if pso == 0 => "no pipeline".to_owned(),
+        None => format!("pipeline {pso:#x}, no console shader known"),
     }
 }
 
-/// Log the ops that have been running for 2 s (three reports in a row).
+/// What a report says about one queue, taken under the lock and formatted after it.
+struct Stuck {
+    queue: usize,
+    done: u64,
+    passed: Option<String>,
+    current: String,
+    later: Vec<String>,
+    later_n: usize,
+    /// (id, what, pso, state) of the ops of the current event
+    ops: Vec<(u32, String, usize, &'static str)>,
+    /// (id, what, pso) of ops skipped on any list in the `SKIP_WINDOW` ops before the stuck one
+    skips: Vec<(u32, String, usize)>,
+}
+
+fn op_text(o: &(u32, String, usize, &'static str)) -> String {
+    format!("#{} {} ({}, {})", o.0, o.1, shaders(o.2), o.3)
+}
+
+/// Log each queue whose fence has stood still for 2 s with events still queued.
 fn report() {
     static LOGGED: AtomicUsize = AtomicUsize::new(0);
-    let lines: Vec<String> = {
+    let stuck: Vec<Stuck> = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
-        let mut seen = HashMap::new();
-        let mut stuck = Vec::new();
-        for e in s.entries.iter().flatten() {
-            if e.gpu && s.state(e) == "running" {
-                let n = s.seen.get(&e.id).copied().unwrap_or(0) + 1;
-                seen.insert(e.id, n);
-                if n == 3 {
-                    stuck.push(e.id);
-                }
+        let mut out = Vec::new();
+        let queues: Vec<usize> = s.queues.keys().copied().collect();
+        for q in queues {
+            let line = s.queues.get_mut(&q).unwrap();
+            let done = unsafe { line.fence.GetCompletedValue() };
+            if done == u64::MAX {
+                continue; // device removed
             }
+            while line.events.front().is_some_and(|e| e.n + 1 < done) {
+                line.events.pop_front();
+            }
+            if done >= line.next {
+                line.watch = (done, 0, false);
+                continue;
+            }
+            if line.watch.0 == done {
+                line.watch.1 += 1;
+            } else {
+                line.watch = (done, 1, false);
+            }
+            if line.watch.1 < STUCK_REPORTS || line.watch.2 {
+                continue;
+            }
+            line.watch.2 = true;
+            let line = &s.queues[&q];
+            let passed = line.events.iter().find(|e| e.n == done).map(|e| format!("#{} {}", e.n, e.what));
+            let Some(cur) = line.events.iter().find(|e| e.n == done + 1) else { continue };
+            let later: Vec<&Event> = line.events.iter().filter(|e| e.n > done + 1).collect();
+            let ops: Vec<(u32, String, usize, &'static str)> = cur.ops.iter().map(|&id| match s.entry(id) {
+                Some(e) => (id, e.what.clone(), e.pso, s.state(e)),
+                None => (id, "(overwritten)".to_owned(), 0, "unknown"),
+            }).collect();
+            // ops console code skipped on any list just before the stuck one: a stand-in that
+            // never wrote what the stuck op reads would be among them
+            let anchor = ops.iter().find(|o| o.3 != "done" && o.3 != "skipped").map_or(s.next, |o| o.0);
+            let skips: Vec<(u32, String, usize)> = (anchor.saturating_sub(SKIP_WINDOW)..anchor)
+                .filter_map(|id| s.entry(id).filter(|e| !e.gpu).map(|e| (id, e.what.clone(), e.pso)))
+                .collect();
+            out.push(Stuck {
+                queue: q,
+                done,
+                passed,
+                current: format!("#{} {}", cur.n, cur.what),
+                later: later.iter().take(SHOWN).map(|e| format!("#{} {}", e.n, e.what)).collect(),
+                later_n: later.len(),
+                ops,
+                skips,
+            });
         }
-        s.seen = seen;
-        let s = &*s;
-        stuck.iter().take(16).map(|&id| {
-            let e = s.entries[id as usize % SLOTS].as_ref().unwrap();
-            let queue = s.queues.get(&e.list).map_or_else(|| "a queue not seen".to_owned(), |&q| super::list_x::queue_label(q));
-            let mut before: Vec<&Entry> = s.entries.iter().flatten().filter(|o| o.list == e.list && o.id < e.id).collect();
-            before.sort_unstable_by_key(|o| o.id);
-            let skipped = before.iter().filter(|o| !o.gpu).count();
-            let before: Vec<String> = before.iter().rev().take(BEFORE).rev().map(|o| format!("#{} {} ({}, {})", o.id, o.what, shaders(o.pso), s.state(o))).collect();
-            let after = s.entries.iter().flatten().filter(|o| o.list == e.list && o.id > e.id).count();
-            format!(
-                "D3D12.X: breadcrumb #{} on {queue} has been running for 2 s: {} ({}) on list {:#x}; {after} later op(s) on the list, {skipped} skipped before it; before it: [{}]",
-                e.id, e.what, shaders(e.pso), e.list, before.join("; ")
-            )
-        }).collect()
+        out
     };
-    for l in lines {
+    for st in stuck {
+        let queue = super::list_x::queue_label(st.queue);
+        let ops = if st.ops.is_empty() {
+            String::new()
+        } else {
+            let first = st.ops.iter().position(|o| o.3 != "done" && o.3 != "skipped");
+            let done_n = st.ops.iter().filter(|o| o.3 == "done").count();
+            let skipped_n = st.ops.iter().filter(|o| o.3 == "skipped").count();
+            match first {
+                Some(i) => {
+                    let before: Vec<String> = st.ops[..i].iter().rev().take(SHOWN).rev().map(op_text).collect();
+                    let after: Vec<String> = st.ops[i + 1..].iter().take(SHOWN).map(op_text).collect();
+                    format!(
+                        "; its lists hold {} op(s) ({done_n} done, {skipped_n} skipped); the first not finished is {}; before it: [{}]; after it: [{}]",
+                        st.ops.len(), op_text(&st.ops[i]), before.join("; "), after.join("; ")
+                    )
+                }
+                None => format!(
+                    "; all {} op(s) of its lists finished ({skipped_n} skipped), so the queue is in work after the last of them (copies, barriers, clears, XCL's own commands): last op {}",
+                    st.ops.len(), st.ops.last().map(op_text).unwrap_or_default()
+                ),
+            }
+        };
+        let skips: Vec<String> = st.skips.iter().rev().take(SHOWN).map(|(id, what, pso)| format!("#{id} {what} ({})", shaders(*pso))).collect();
+        let line = format!(
+            "D3D12.X: breadcrumbs: {queue} has stood for 2 s at its mark {}: it is in {}{ops}; passed before it: {}; queued after it: {} more [{}]; skipped on any list in the {SKIP_WINDOW} ops before it: {} [latest: {}]",
+            st.done,
+            st.current,
+            st.passed.as_deref().unwrap_or("(nothing kept)"),
+            st.later_n,
+            st.later.join("; "),
+            st.skips.len(),
+            skips.join("; "),
+        );
         if LOGGED.fetch_add(1, Ordering::Relaxed) < 256 {
-            crate::xlog_warn!("{l}");
+            crate::xlog_warn!("{line}");
         }
     }
 }
@@ -228,12 +453,22 @@ mod tests {
     fn state_of(id: u32) -> &'static str {
         let g = STATE.lock().unwrap();
         let s = g.as_ref().unwrap();
-        let e = s.entries[id as usize % SLOTS].as_ref().filter(|e| e.id == id).expect("entry overwritten");
-        s.state(e)
+        s.state(s.entry(id).expect("entry overwritten"))
+    }
+
+    fn until(mut done: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while !done() {
+            if start.elapsed() > Duration::from_secs(5) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
     }
 
     #[test]
-    fn breadcrumbs_mark_start_and_end_of_the_ops_a_list_ran() {
+    fn breadcrumbs_mark_ops_and_the_queue_events_after_them() {
         unsafe {
             let mut dev: Option<ID3D12Device> = None;
             if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
@@ -241,6 +476,7 @@ mod tests {
                 return;
             }
             let dev = dev.unwrap();
+            FORCE.store(true, Ordering::Relaxed);
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
@@ -250,16 +486,28 @@ mod tests {
             list.Close().unwrap();
             assert_eq!(state_of(ran), "not started");
             assert_eq!(state_of(skip), "skipped");
-            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            // a wait nothing has satisfied yet holds the list and both marks behind it
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            waited(queue.as_raw(), || "test wait".into());
             queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
             executed(queue.as_raw(), &[list.as_raw()]);
-            queue.Signal(&fence, 1).unwrap();
-            let start = Instant::now();
-            while fence.GetCompletedValue() < 1 && start.elapsed() < Duration::from_secs(5) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(fence.GetCompletedValue(), 1, "queue did not finish");
+            let (fence, next, ops) = {
+                let g = STATE.lock().unwrap();
+                let line = &g.as_ref().unwrap().queues[&(queue.as_raw() as usize)];
+                (line.fence.clone(), line.next, line.events.back().unwrap().ops.clone())
+            };
+            assert_eq!(next, 2);
+            assert_eq!(ops, vec![ran, skip], "the executed event did not take the list's ops");
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(fence.GetCompletedValue(), 0, "a mark passed a wait that was not satisfied");
+            assert_eq!(state_of(ran), "not started");
+
+            gate.Signal(1).unwrap();
+            assert!(until(|| fence.GetCompletedValue() >= 2), "the queue did not pass its marks");
             assert_eq!(state_of(ran), "done");
+            FORCE.store(false, Ordering::Relaxed);
         }
     }
 }
