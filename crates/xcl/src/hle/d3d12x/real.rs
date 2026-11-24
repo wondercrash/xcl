@@ -3669,6 +3669,14 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         })
         .flatten();
     let _slotless = (went.get() != super::pso_async::Want::No).then_some(Slotless);
+    if went.get() != super::pso_async::Want::No && *lane.n.lock().unwrap() >= lane.most {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            let whose = if went.get() == super::pso_async::Want::Waits { "a bind waits for" } else { "gone late (XCL_PSO_WAIT_MS)" };
+            crate::xlog_info!("D3D12.X: a big pipeline {whose} is compiled without waiting for the {lane_name} another build holds ({} so far)", n + 1);
+        }
+    }
     let started = std::time::Instant::now();
     // (for the logs of a bind that waits for it; a big compile is logged as it starts)
     super::pso_async::driver_start(dxil.len(), cs, slot.is_some().then_some(lane_name), big && cached.is_none());

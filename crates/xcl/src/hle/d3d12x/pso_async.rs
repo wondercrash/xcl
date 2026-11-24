@@ -1134,7 +1134,15 @@ pub fn driver_start(dxil: usize, console: &[u8], slot: Option<&'static str>, big
         return;
     }
     let (what, waits) = match &mine {
-        Some(p) => (p.describe(), if p.demand.lock().unwrap().wanted { "yes" } else { "no" }),
+        Some(p) => (
+            p.describe(),
+            match p.want_now(skip_huge()) {
+                Want::Waits => "yes",
+                Want::Late => "no, it is late (XCL_PSO_WAIT_MS): binds go on without it",
+                Want::No if p.demand.lock().unwrap().wanted => "no, XCL_PSO_SKIP_HUGE: binds go on without it",
+                Want::No => "no",
+            },
+        ),
         None => (format!("a compute program in the title's call (console shader {:016x}, {dxil} B DXIL)", crate::gpu::shader::fnv64(console)), "the title's call does"),
     };
     crate::xlog_info!("D3D12.X: driver compile of {what} starts on {who}, {}; a bind waits for it: {waits}", slot_text(slot));
