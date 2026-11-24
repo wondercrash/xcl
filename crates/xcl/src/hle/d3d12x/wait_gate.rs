@@ -4,7 +4,11 @@
 //! held behind this queue) is opened on the CPU once the queue has stood at it for
 //! `XCL_WAIT_GATE_RELEASE_MS` (default 5000; `0` keeps the queue blocked for good). The work
 //! after it then runs before its producer, as with the GPU wait watchdog of bridged waits.
+//! Gates armed on that queue before such a release are opened `GRACE` after the queue reaches
+//! them: they wait behind the same stalled producers, and k of them must not cost k release
+//! times.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of, transmute, ManuallyDrop};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +28,8 @@ const RETIRED: u64 = 3;
 const POLL: Duration = Duration::from_millis(1);
 const WARN_AFTER: Duration = Duration::from_secs(2);
 const DEFAULT_RELEASE: Duration = Duration::from_secs(5);
+/// How long a queue stands at a gate armed before the last release on that queue.
+const GRACE: Duration = Duration::from_millis(250);
 
 /// How long a queue stands at a gate whose value the CPU does not see before the CPU opens it
 /// (`XCL_WAIT_GATE_RELEASE_MS`; `0`: never).
@@ -36,6 +42,13 @@ fn release_after() -> Option<Duration> {
         }
     });
     *R
+}
+
+/// How long the queue stands at a gate armed at `armed_at` before the CPU opens it: the full
+/// `release_after`, or `GRACE` when a gate on that queue was opened on the CPU since then
+/// (`last_release`).
+fn release_time(release_after: Duration, armed_at: Instant, last_release: Option<Instant>) -> Duration {
+    if last_release.is_some_and(|at| armed_at < at) { release_after.min(GRACE) } else { release_after }
 }
 
 static TX: LazyLock<Result<mpsc::Sender<Gate>, String>> = LazyLock::new(|| {
@@ -59,6 +72,7 @@ struct Gate {
     ready: Option<Box<dyn Fn() -> bool + Send>>,
     describe: Describe,
     warn_at: Option<Instant>,
+    armed_at: Instant,
     /// when the monitor first saw the queue at the gate
     reached_at: Option<Instant>,
     release_after: Option<Duration>,
@@ -88,8 +102,8 @@ impl Gate {
     }
 
     /// `earlier`: gates armed before this one on the same queue and not opened yet (counted
-    /// only when a warning is due).
-    fn poll(&mut self, earlier: usize) -> Poll {
+    /// only when a warning is due). `released`: queue → when the CPU last opened a gate on it.
+    fn poll(&mut self, earlier: usize, released: &mut HashMap<usize, Instant>) -> Poll {
         let value = match unsafe { fence::completed_value(&self.fence, &self.device) } {
             Ok(value) => value,
             Err(e) => return self.failed(e),
@@ -104,13 +118,16 @@ impl Gate {
         }
         if !reached || !ready() {
             let held = self.reached_at.map(|at| at.elapsed());
-            if let (Some(held), Some(after)) = (held, self.release_after) {
+            let release = self.release_after.map(|after| release_time(after, self.armed_at, released.get(&self.queue).copied()));
+            if let (Some(held), Some(after)) = (held, release) {
                 if held >= after {
                     static RELEASED: AtomicU64 = AtomicU64::new(0);
                     let n = RELEASED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n <= 32 || n.is_power_of_two() {
-                        crate::xlog_warn!("D3D12.X: Wait64BitValueX gate on queue {:#x} opened on the CPU after {} ms at the gate without its value ({}) – the work after it runs before its producer ({n} so far)", self.queue, held.as_millis(), (self.describe)(true));
+                        let behind = if Some(after) == self.release_after { "" } else { "; armed before a gate on this queue was opened on the CPU" };
+                        crate::xlog_warn!("D3D12.X: Wait64BitValueX gate on queue {:#x} opened on the CPU after {} ms at the gate without its value ({}{behind}) – the work after it runs before its producer ({n} so far)", self.queue, held.as_millis(), (self.describe)(true));
                     }
+                    released.insert(self.queue, Instant::now());
                     return self.open();
                 }
             }
@@ -121,7 +138,7 @@ impl Gate {
                 if n <= 64 || n.is_power_of_two() {
                     let waiting_on = if reached { "the memory condition" } else { "preceding queue work" };
                     let earlier = if earlier > 0 { format!("; {earlier} earlier gate(s) on this queue still closed") } else { String::new() };
-                    let action = match self.release_after {
+                    let action = match release {
                         None => "leaving the queue blocked".to_owned(),
                         Some(after) => format!("the CPU opens it {} ms after the queue reaches it", after.as_millis()),
                     };
@@ -144,6 +161,8 @@ impl Gate {
 
 fn monitor(rx: mpsc::Receiver<Gate>) {
     let mut pending: Vec<Gate> = Vec::new();
+    // queue → when the CPU last opened a gate on it without its value
+    let mut released: HashMap<usize, Instant> = HashMap::new();
     loop {
         if pending.is_empty() {
             let Ok(gate) = rx.recv() else { return };
@@ -158,7 +177,7 @@ fn monitor(rx: mpsc::Receiver<Gate>) {
             } else {
                 0
             };
-            match pending[i].poll(earlier) {
+            match pending[i].poll(earlier, &mut released) {
                 Poll::Pending => i += 1,
                 Poll::Retired => drop(ManuallyDrop::into_inner(pending.swap_remove(i).fence)),
                 Poll::KeepFence => { pending.swap_remove(i); }
@@ -249,6 +268,7 @@ unsafe fn arm_with(
         ready: armed.then(|| Box::new(ready) as Box<dyn Fn() -> bool + Send>),
         describe,
         warn_at: Some(Instant::now() + WARN_AFTER),
+        armed_at: Instant::now(),
         reached_at: None,
         release_after,
         retire_at,
@@ -323,6 +343,38 @@ mod tests {
             let opened = until(Duration::from_secs(5), reached);
             assert!(opened, "the gate did not open once its value came");
             assert!(held, "a gate without a release time opened without its value");
+        }
+    }
+
+    #[test]
+    fn gate_armed_before_the_last_release_on_its_queue_gets_the_grace() {
+        let full = Duration::from_millis(5000);
+        let armed = Instant::now();
+        let later = armed + Duration::from_millis(10);
+        assert_eq!(release_time(full, armed, None), full, "the first gate of a queue gets the full release time");
+        assert_eq!(release_time(full, armed, Some(later)), GRACE, "a gate queued behind a released one gets the grace");
+        assert_eq!(release_time(full, later, Some(armed)), full, "a gate armed after the release gets the full time");
+        let short = Duration::from_millis(100);
+        assert_eq!(release_time(short, armed, Some(later)), short, "the grace never lengthens a shorter release time");
+    }
+
+    #[test]
+    fn gates_queued_behind_a_gate_opened_on_the_cpu_open_after_the_grace() {
+        const RELEASE: Duration = Duration::from_millis(1500);
+        unsafe {
+            let Some((dev, queue)) = device_and_queue() else { return };
+            let tail = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let reached = || fence::completed_value(&tail, &dev).is_ok_and(|v| v >= 1);
+            for _ in 0..3 {
+                arm_with(queue.as_raw(), || false, Box::new(|_| "test gate".to_owned()), Some(RELEASE)).unwrap();
+            }
+            queue.Signal(&tail, 1).unwrap();
+            let start = Instant::now();
+            let held = !until(RELEASE - Duration::from_millis(300), reached);
+            // one release time and two graces (2 s), not three release times (4.5 s)
+            let opened = until(Duration::from_millis(3200).saturating_sub(start.elapsed()), reached);
+            assert!(held, "the first gate opened before its release time");
+            assert!(opened, "gates armed before the first release each waited a full release time");
         }
     }
 }
