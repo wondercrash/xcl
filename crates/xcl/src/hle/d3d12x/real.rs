@@ -6000,7 +6000,8 @@ unsafe fn dred_lines(dev: &ID3D12Device) -> Vec<String> {
         }
         Err(e) => out.push(format!("DRED page fault: none given ({e})")),
     }
-    // (DRED 1.1 names the lists and queues; the 1.0 output has the same nodes without names)
+    // (DRED 1.1 names the lists and queues; the 1.0 output has the same nodes without names;
+    // `true` beside the nodes: the walk stopped at `DRED_SCAN_LIMIT` with nodes left)
     macro_rules! walk {
         ($head:expr) => {{
             let mut v = Vec::new();
@@ -6010,10 +6011,10 @@ unsafe fn dred_lines(dev: &ID3D12Device) -> Vec<String> {
                 v.push(BreadcrumbNode::read(node.pCommandList.as_ref().map(|l| l.as_raw()), node.pCommandQueue.as_ref().map(|q| q.as_raw()), node.BreadcrumbCount, node.pLastBreadcrumbValue, node.pCommandHistory, node.pCommandListDebugNameA, node.pCommandQueueDebugNameA));
                 n = node.pNext;
             }
-            v
+            (v, !n.is_null())
         }};
     }
-    let nodes: Vec<BreadcrumbNode> = match dred.cast::<ID3D12DeviceRemovedExtendedData1>().map(|d| d.GetAutoBreadcrumbsOutput1()) {
+    let (nodes, cut): (Vec<BreadcrumbNode>, bool) = match dred.cast::<ID3D12DeviceRemovedExtendedData1>().map(|d| d.GetAutoBreadcrumbsOutput1()) {
         Ok(Ok(bc)) => walk!(bc.pHeadAutoBreadcrumbNode),
         _ => match dred.GetAutoBreadcrumbsOutput() {
             Ok(bc) => walk!(bc.pHeadAutoBreadcrumbNode),
@@ -6031,7 +6032,8 @@ unsafe fn dred_lines(dev: &ID3D12Device) -> Vec<String> {
         out.push(n.line());
     }
     let unfinished = nodes.iter().filter(|n| n.done < n.ops.len()).count();
-    out.push(format!("DRED: {} command list(s) in flight at the removal, {} of them not finished", nodes.len(), unfinished));
+    let (count, of) = if cut { (format!("{} or more", nodes.len()), format!("the first {}", nodes.len())) } else { (nodes.len().to_string(), "them".to_owned()) };
+    out.push(format!("DRED: {count} command list(s) in flight at the removal, {unfinished} of {of} not finished"));
     out
 }
 
