@@ -701,6 +701,7 @@ pub(super) fn on_queue_release(queue: usize) {
         }
     }
     super::cpu_writes::forget_queue(queue);
+    super::sparse::forget_queue(queue);
 }
 
 #[cfg(test)]

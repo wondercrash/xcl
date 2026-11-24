@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use windows::core::Interface;
@@ -1358,11 +1358,11 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             drop(g);
             match READBACK_WORKER.as_ref() {
                 Some(tx) => {
-                    if let Err(e) = tx.send(job) {
-                        e.0.land();
+                    if let Err(std::sync::mpsc::SendError(ToLand::Job(job))) = tx.send(ToLand::Job(job)) {
+                        job.land_here();
                     }
                 }
-                None => job.land(),
+                None => job.land_here(),
             }
             return;
         }
@@ -1413,24 +1413,14 @@ struct Readback {
 unsafe impl Send for Readback {}
 
 impl Readback {
-    /// Once the queue is past the copy, into the CPU view (nothing when the device is gone).
-    /// Returns only then: the buffer and list are in use until it.
-    unsafe fn land(self) {
-        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-        if self.fence.GetCompletedValue() < self.value {
-            let event = CreateEventW(None, false, false, None).ok();
-            while self.fence.GetCompletedValue() < self.value {
-                match event {
-                    Some(e) if self.fence.SetEventOnCompletion(self.value, e).is_ok() => {
-                        WaitForSingleObject(e, 10_000);
-                    }
-                    _ => std::thread::sleep(std::time::Duration::from_millis(1)),
-                }
-            }
-            if let Some(e) = event {
-                let _ = CloseHandle(e);
-            }
-        }
+    /// The queue is past the copy (or the device is gone: `u64::MAX`).
+    fn done(&self) -> bool {
+        unsafe { self.fence.GetCompletedValue() >= self.value }
+    }
+
+    /// Into the CPU view once `done` (nothing when the device is gone). `counted`: lowers the
+    /// queue's count of copies to land (not for a queue released since: `forget_queue`).
+    unsafe fn land(self, counted: bool) {
         let mut p = std::ptr::null_mut();
         let mapped = self.fence.GetCompletedValue() != u64::MAX && self.buf.Map(0, None, Some(&mut p)).is_ok();
         if let Some(s) = STATE.lock().unwrap().as_mut() {
@@ -1443,20 +1433,55 @@ impl Readback {
                     .collect();
                 s.copy_back(p as *const u8, &parts);
             }
-            if let Some(n) = s.unlanded.get_mut(&self.queue) {
-                *n = n.saturating_sub(1);
+            if counted {
+                if let Some(n) = s.unlanded.get_mut(&self.queue) {
+                    *n = n.saturating_sub(1);
+                }
             }
         }
         if mapped {
             self.buf.Unmap(0, None);
         }
     }
+
+    /// With no landing worker: waited for on this thread, as the synchronous readback, up to
+    /// 5 s. A copy still not done then is given up (its buffer and list stay alive for good).
+    unsafe fn land_here(self) {
+        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+        if !self.done() {
+            if let Ok(e) = CreateEventW(None, false, false, None) {
+                if self.fence.SetEventOnCompletion(self.value, e).is_ok() {
+                    WaitForSingleObject(e, 5000);
+                }
+                let _ = CloseHandle(e);
+            }
+        }
+        if self.done() {
+            return self.land(true);
+        }
+        crate::xlog_warn!("sparse windows: a copy back on queue {:#x} was not done after 5 s and is given up", self.queue);
+        if let Some(n) = STATE.lock().unwrap().as_mut().and_then(|s| s.unlanded.get_mut(&self.queue)) {
+            *n = n.saturating_sub(1);
+        }
+        std::mem::forget(self);
+    }
 }
 
-/// The thread that lands copies back of gated queues in the CPU view, in submission order.
-static READBACK_WORKER: std::sync::LazyLock<Option<std::sync::mpsc::Sender<Readback>>> = std::sync::LazyLock::new(|| {
-    let (tx, rx) = std::sync::mpsc::channel::<Readback>();
-    match std::thread::Builder::new().name("xcl-sparse-readback".into()).spawn(move || rx.into_iter().for_each(|job| unsafe { job.land() })) {
+/// For the landing worker: a copy back, or a title queue released (`forget_queue`).
+enum ToLand {
+    Job(Readback),
+    Forget(usize),
+}
+
+/// Set once a copy back went to the worker: `forget_queue` has nothing to tell it before.
+static WORKER_USED: AtomicBool = AtomicBool::new(false);
+
+/// The thread that lands copies back of gated queues in the CPU view: in order per queue, each
+/// as soon as its queue is past it (one queue held by its gate holds no other queue's copies).
+static READBACK_WORKER: std::sync::LazyLock<Option<std::sync::mpsc::Sender<ToLand>>> = std::sync::LazyLock::new(|| {
+    WORKER_USED.store(true, Ordering::Release);
+    let (tx, rx) = std::sync::mpsc::channel::<ToLand>();
+    match std::thread::Builder::new().name("xcl-sparse-readback".into()).spawn(move || land_loop(rx)) {
         Ok(_) => Some(tx),
         Err(e) => {
             crate::xlog_error!("sparse windows: no thread for copies back from video memory: {e}");
@@ -1464,6 +1489,56 @@ static READBACK_WORKER: std::sync::LazyLock<Option<std::sync::mpsc::Sender<Readb
         }
     }
 });
+
+fn land_loop(rx: std::sync::mpsc::Receiver<ToLand>) {
+    // title queue → its copies in submission order; copies of released queues, in order each
+    let mut fifos: HashMap<usize, VecDeque<Readback>> = HashMap::new();
+    let mut orphans: Vec<VecDeque<Readback>> = Vec::new();
+    let take = |m: ToLand, fifos: &mut HashMap<usize, VecDeque<Readback>>, orphans: &mut Vec<VecDeque<Readback>>| match m {
+        ToLand::Job(job) => fifos.entry(job.queue).or_default().push_back(job),
+        ToLand::Forget(q) => orphans.extend(fifos.remove(&q)),
+    };
+    loop {
+        if fifos.is_empty() && orphans.is_empty() {
+            let Ok(m) = rx.recv() else { return };
+            take(m, &mut fifos, &mut orphans);
+        }
+        for m in rx.try_iter() {
+            take(m, &mut fifos, &mut orphans);
+        }
+        for fifo in fifos.values_mut() {
+            while fifo.front().is_some_and(Readback::done) {
+                unsafe { fifo.pop_front().unwrap().land(true) };
+            }
+        }
+        fifos.retain(|_, f| !f.is_empty());
+        for fifo in orphans.iter_mut() {
+            while fifo.front().is_some_and(Readback::done) {
+                unsafe { fifo.pop_front().unwrap().land(false) };
+            }
+        }
+        orphans.retain(|f| !f.is_empty());
+        if !fifos.is_empty() || !orphans.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+/// The title released `queue`: its copy-back fence and count go, and its copies still on the
+/// worker no longer count for a queue that gets its address.
+pub(super) fn forget_queue(queue: usize) {
+    let mut g = STATE.lock().unwrap();
+    if let Some(s) = g.as_mut() {
+        s.queue_rb.remove(&queue);
+        s.unlanded.remove(&queue);
+    }
+    // under the lock: no landing of this queue's copies runs in between
+    if WORKER_USED.load(Ordering::Acquire) {
+        if let Some(tx) = READBACK_WORKER.as_ref() {
+            let _ = tx.send(ToLand::Forget(queue));
+        }
+    }
+}
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
 /// a non-empty read range, or `Map(0, NULL)` on a sparse readback resource): flushes pending
