@@ -1502,8 +1502,11 @@ fn buffer_format_loads_decode_only_the_selected_components() {
     ]);
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
-    for (k, n) in [(1, 1), (2, 2), (3, 3), (4, 1)] {
+    // one component: `fmt_x` reads only its dwords (no `ld_raw`); several share one `ld_raw`
+    for (k, n) in [(1, 0), (2, 2), (3, 3), (4, 0)] {
         assert_eq!(t.hlsl.matches(&format!("fmt_sel(t{k}_r, ")).count(), n, "load {k}\n{}", t.hlsl);
+        assert_eq!(t.hlsl.matches(&format!("fmt_x(t{k}_a, ")).count(), (n == 0) as usize, "load {k}\n{}", t.hlsl);
+        assert_eq!(t.hlsl.contains(&format!("uint4 t{k}_r = ld_raw(")), n != 0, "load {k}\n{}", t.hlsl);
     }
     assert!(!t.hlsl.contains("fmt_comp(t"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
@@ -1600,6 +1603,79 @@ fn gpu_typed_buffer_loads_and_stores() {
     }
     assert_eq!(r.mem[0x130 / 4], 0xB800_4000, "d16 store 16_16_float");
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
+}
+
+/// Format loads give the values of the full decoder they replace (`dst_sel` of all four
+/// `fmt_comp`s on `ld_raw`, still in `PRELUDE_MEM`) for every format, DST_SEL (including
+/// 0 / 1 and the reserved 2 / 3), byte alignment and out-of-range lane: one-component loads
+/// (`fmt_x`, which reads only the component's dwords: format_x, d16_x, d16_hi_x) and
+/// several-component ones (`fmt_sel`), bit for bit on the GPU.
+#[test]
+fn gpu_format_loads_match_the_full_decoder() {
+    if !gpu_ready() {
+        return;
+    }
+    // V# k at s[12 + 4k] (SRSRC 3 + k); per-lane byte offset v1
+    let ld = |name: &'static str, vdata: u64, k: u64| (name, "ENC_MUBUF", vec![("VDATA", vdata), ("VADDR", 1), ("SRSRC", 3 + k), ("SOFFSET", 128), ("OFFEN", 1)], None);
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = (0..8).map(|k| ld("BUFFER_LOAD_FORMAT_X", 10 + k, k)).collect();
+    list.push(ld("BUFFER_LOAD_FORMAT_XYZW", 20, 8));
+    list.push(ld("BUFFER_LOAD_FORMAT_XYZW", 24, 9));
+    list.push(ld("BUFFER_LOAD_FORMAT_D16_X", 28, 10));
+    list.push(ld("BUFFER_LOAD_FORMAT_D16_HI_X", 29, 11));
+    list.push(ld("BUFFER_LOAD_FORMAT_XY", 30, 2));
+    let code = prog(&list.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect::<Vec<_>>());
+    let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(t.hlsl.matches("= fmt_x(t").count(), 10, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches(" fmt_sel(t").count(), 10, "{}", t.hlsl);
+    // the reference: the same program with the decoder the format loads used before
+    let reference = t
+        .hlsl
+        .replacen(
+            "uint fmt_x(",
+            "uint xcl_ref_sel(uint4 r, uint info, uint sel, bool isint) { return dst_sel(uint4(fmt_comp(r, info, 0u), fmt_comp(r, info, 1u), fmt_comp(r, info, 2u), fmt_comp(r, info, 3u)), sel, isint); }\n\
+             uint xcl_ref_x(uint a, uint info, uint sel, bool isint) { return xcl_ref_sel(ld_raw(a), info, sel, isint); }\nuint fmt_x(",
+            1,
+        )
+        .replace("= fmt_x(t", "= xcl_ref_x(t")
+        .replace(" fmt_sel(t", " xcl_ref_sel(t");
+    assert!(!reference.contains("= fmt_x(t") && !reference.contains(" fmt_sel(t"));
+    let new = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let old = super::dxc::compile(&reference, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{reference}"));
+    // varied bytes: every float format sees normals, denormals, infinities and NaNs
+    let mut x = 0x2545_F491u32;
+    let mem: Vec<u32> = (0..512)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        })
+        .collect();
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = 5 * l as u32 + (l as u32 & 3); // every byte alignment; the last lanes run past num_records
+    }
+    let sels = [4, 5, 6, 7, 0, 1, 2, 3];
+    let mut nonzero = 0;
+    for fmt in 0..78u32 {
+        for k in 0..12 {
+            let sel = match k {
+                0..=7 => sels[k],
+                8 => 4 | 5 << 3 | 6 << 6 | 7 << 9,
+                9 => 7 | 1 << 3 | 6 << 9, // w, 1, 0, z
+                10 => 5,
+                _ => 6 | 4 << 3,
+            };
+            st.sgpr[12 + 4 * k..16 + 4 * k].copy_from_slice(&[0x100, 0, 0x150, sel | fmt << 12]);
+        }
+        let (a, b) = (runner::run(&new, &st, &mem).unwrap(), runner::run(&old, &st, &mem).unwrap());
+        for l in 0..64 {
+            assert_eq!(a.vgpr[l][10..32], b.vgpr[l][10..32], "format {fmt} lane {l} (v10..v31)");
+            nonzero += a.vgpr[l][10..32].iter().filter(|&&v| v != 0).count();
+        }
+    }
+    assert!(nonzero > 78 * 64 * 8, "{nonzero} non-zero results");
 }
 
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {

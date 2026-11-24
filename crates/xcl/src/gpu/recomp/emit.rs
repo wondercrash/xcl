@@ -1783,14 +1783,29 @@ impl Em {
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
-                self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
                 self.uses_fmt_sel = true;
-                // only the components the destinations select are decoded: `fmt_comp` is
+                // only the components the destinations select are decoded: the decoder is
                 // inlined at every load, and a retail program of 3 281 format_x loads made
-                // 13 125 copies of it when all four were decoded each time
-                let sel = |component: u64| format!("fmt_sel({t}_r, {t}_info, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
+                // 13 125 copies of it when all four were decoded each time. One component
+                // (format_x, d16_x, d16_hi_x) reads just its own dwords (`fmt_x`), several
+                // share one `ld_raw`
+                let used: Vec<u64> = match d16_format {
+                    Some((_, _, true)) => vec![0],
+                    Some((_, components, false)) => (0..2 * count).filter(|&c| c % 2 == 0 || c < components).collect(),
+                    None => (0..count).collect(),
+                };
+                let single = used.len() == 1;
+                if !single {
+                    self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
+                }
+                let sel = |component: u64| {
+                    if single {
+                        format!("fmt_x({t}_a, {t}_info, ({d3} >> {}u) & 7u, {t}_int)", 3 * component)
+                    } else {
+                        format!("fmt_sel({t}_r, {t}_info, ({d3} >> {}u) & 7u, {t}_int)", 3 * component)
+                    }
+                };
                 if let Some((_, components, high)) = d16_format {
-                    let used: Vec<u64> = if high { vec![0] } else { (0..2 * count).filter(|&c| c % 2 == 0 || c < components).collect() };
                     for &c in &used {
                         self.line(&format!("uint {t}_s{c} = {};", sel(c)));
                     }
@@ -1808,6 +1823,13 @@ impl Em {
                         }
                     }
                     self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
+                    return Ok(());
+                }
+                if single {
+                    // decoded before the `if`, which then holds a select (no branch)
+                    let v = self.vreg(vdata);
+                    self.line(&format!("uint {t}_x = {};", sel(0)));
+                    self.line(&format!("if ({act}) {{ {v} = select({t}_ok, {t}_x, 0u); }}"));
                     return Ok(());
                 }
                 let mut assigns = Vec::new();
@@ -5418,11 +5440,40 @@ void st_bytes(uint a, uint4 r, uint n) {
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), c[(sel - 4u) & 3u])); }
 "#;
 
-/// DST_SEL of a V# (0: 0, 1: 1, 4 – 7: component 0 – 3) on raw format data: only the component
-/// it picks is decoded (`fmt_comp` is inlined at every call). Its own block, after
-/// `PRELUDE_MEM`, in programs with format loads only: the HLSL of the others, and so their
-/// DXIL and driver cache keys, stay as they were (`dst_sel` above is no longer emitted).
-const PRELUDE_FMT_SEL: &str = r#"uint fmt_sel(uint4 r, uint info, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), fmt_comp(r, info, (sel - 4u) & 3u))); }
+/// DST_SEL of a V# (0: 0, 1: 1, 4 – 7: component 0 – 3) on format data: only the component
+/// it picks is decoded, and once – the decoder is inlined at every load, so a retail program
+/// with 3 281 format_x loads carried that many copies. Its own block, after `PRELUDE_MEM`, in
+/// programs with format loads only: the HLSL of the others, and so their DXIL and driver
+/// cache keys, stay as they were (`dst_sel` and `fmt_comp` above are no longer called).
+/// `fmt_cvt` gives `fmt_comp`'s values: unorm and snorm share one division (of the same
+/// operands; `max(x, -1)` keeps an unorm quotient, which is never negative).
+const PRELUDE_FMT_SEL: &str = r#"uint fmt_off(uint info, uint c) { return select(c > 0u, (info >> 8) & 63u, 0u) + select(c > 1u, (info >> 14) & 63u, 0u) + select(c > 2u, (info >> 20) & 63u, 0u); }
+uint fmt_width(uint info, uint c) { return (info >> ((8u + 6u * c) & 31u)) & 63u; }
+// the selected value from the bits `v` (cut to their width) of component (sel - 4) & 3
+uint fmt_cvt(uint v, uint info, uint sel, bool isint) {
+    uint c = (sel - 4u) & 3u; uint n = info & 7u; uint ty = (info >> 3) & 7u; uint w = fmt_width(info, c);
+    uint sh = (32u - w) & 31u;
+    int sv = select(w >= 32u, (int)v, ((int)(v << sh)) >> sh);
+    bool sg = or(or(ty == 1u, ty == 3u), ty == 5u);
+    float fx = select(sg, (float)sv, (float)v);
+    float mx = select(sg, select(w >= 32u, 2147483647.0f, (float)((1u << ((w - 1u) & 31u)) - 1u)), select(w >= 32u, 4294967295.0f, (float)((1u << (w & 31u)) - 1u)));
+    // exact endpoints (the hardware conversion is exact; DXC divides approximately)
+    uint nrm = asuint(select(select(sg, sv == 0, v == 0u), 0.0f, select(fx >= mx, 1.0f, max(fx / mx, -1.0f))));
+    uint flt = select(w == 32u, v, select(w == 16u, asuint(f16tof32(v)), asuint(uf_small(v, select(w == 11u, 6u, 5u)))));
+    uint res = select(ty <= 1u, nrm, select(ty <= 3u, asuint(fx), select(ty <= 5u, select(sg, (uint)sv, v), flt)));
+    uint one = select(isint, 1u, 0x3F800000u);
+    return select(sel == 0u, 0u, select(sel == 1u, one, select(c >= n, select(c == 3u, one, 0u), res)));
+}
+uint fmt_sel(uint4 r, uint info, uint sel, bool isint) { uint c = (sel - 4u) & 3u; return fmt_cvt(bits_at(r, fmt_off(info, c), fmt_width(info, c)), info, sel, isint); }
+// one component at byte address `a`: only the two dwords that hold its bits are read (a
+// component ends within the element's 128 bits, so these are dwords ld_raw(a) reads too)
+uint fmt_x(uint a, uint info, uint sel, bool isint) {
+    uint c = (sel - 4u) & 3u; uint w = fmt_width(info, c);
+    uint p = (a & 3u) * 8u + fmt_off(info, c); uint s = p & 31u;
+    uint2 d = mem.Load2((a & ~3u) + (p >> 5) * 4u);
+    uint v = select(s == 0u, d.x, (d.x >> s) | (d.y << ((32u - s) & 31u)));
+    return fmt_cvt(select(w >= 32u, v, v & ((1u << (w & 31u)) - 1u)), info, sel, isint);
+}
 "#;
 
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
