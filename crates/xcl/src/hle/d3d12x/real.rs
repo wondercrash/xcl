@@ -3643,9 +3643,10 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     super::pso_async::dxil_known(dxil.len(), cs, cached.is_none());
     // in the background, one at a time (huge ones in a lane of their own) and within the commit
     // left (each ~1.5 GB in the driver); one a bind waits for goes on at once, one gone late a
-    // few at a time (`slotless_goes`)
+    // few at a time (`slotless_goes`). (The thread of a bind's build, `xcl-bind-build`, too: a
+    // build whose binds go on without it for its size takes its lane.)
     let (lane, lane_name) = big_compile_lane(dxil.len());
-    let background = big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let background = big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso") || n == "xcl-bind-build");
     // (why it went without a slot, if it did)
     let went = std::cell::Cell::new(super::pso_async::Want::No);
     let slot = background
