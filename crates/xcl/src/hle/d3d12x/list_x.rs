@@ -2312,13 +2312,14 @@ fn describe_gate(queue: usize, seq: u64, waits: &[PendingWait], reached: bool) -
         }
     }
     if !reached {
-        // XCL's own waits and Write64 signals on this queue not yet done on the GPU: waits ahead
-        // of the gate hold it; signals ahead of it say where in its work the queue stands.
+        // XCL's own waits and Write64 signals queued on this queue before the gate (`seq`) and
+        // not yet done on the GPU: waits ahead of it hold it; signals ahead of it say where in
+        // its work the queue stands. (Waits armed after the gate cannot hold it.)
         let (bridged, signals) = SYNC_GRAPH.lock().unwrap().as_ref().map_or_else(Default::default, |gr| {
             let (mut waits, mut signals): (Vec<(u64, u64, u64, Option<usize>)>, Vec<(u64, u64, u64)>) = Default::default();
             for (&va, c) in &gr.cells {
                 let done = c.fence.as_ref().map_or(0, |f| unsafe { f.GetCompletedValue() });
-                waits.extend(c.armed_waits.iter().filter(|aw| aw.waiting_queue == queue && aw.val > done).map(|aw| (va, aw.val, done, c.submitted_queue)));
+                waits.extend(c.armed_waits.iter().filter(|aw| aw.waiting_queue == queue && aw.wait_seq < seq && aw.val > done).map(|aw| (va, aw.val, done, c.submitted_queue)));
                 signals.extend(c.submitted_signals.iter().filter(|s| s.queue == queue && s.seq < seq && s.val > done).map(|s| (s.seq, va, s.val)));
             }
             signals.sort_unstable();
@@ -6936,6 +6937,31 @@ mod tests {
             assert!(matches!(early_suffix, Some(Err(fence::FenceError::Timeout(_)))), "suffix was not held before the producer advanced: {early_suffix:?}");
             assert_eq!(read_word(&suffix).unwrap(), WORDS[1]);
         }
+    }
+
+    /// A gate's line names as "ahead" only the bridged waits queued on its queue before the
+    /// gate: one armed after it cannot hold the queue there (run 22b: q1's wait on 0x7041801e8,
+    /// armed after its gates, was named ahead of each of them).
+    #[test]
+    fn a_gates_line_names_only_the_bridged_waits_queued_before_it() {
+        let queue = 0x6A7E_0001usize;
+        let (before, after) = (0x6A7E_0000_1000u64, 0x6A7E_0000_2000u64);
+        let now = Instant::now();
+        let wait = |wait_seq: u64| ArmedGpuWait { val: 9, waiting_queue: queue, waiting_queue_ty: 2, wait_seq, armed_at: now, after_write64: false };
+        {
+            let mut g = SYNC_GRAPH.lock().unwrap();
+            let g = g.get_or_insert_with(SyncGraph::default);
+            g.cells.insert(before, SyncCell { recorded_max: 9, armed_waits: vec![wait(1)], ..Default::default() });
+            g.cells.insert(after, SyncCell { recorded_max: 9, armed_waits: vec![wait(3)], ..Default::default() });
+        }
+        // the gate took sequence number 2 on its queue
+        let line = describe_gate(queue, 2, &[], false);
+        if let Some(g) = SYNC_GRAPH.lock().unwrap().as_mut() {
+            g.cells.remove(&before);
+            g.cells.remove(&after);
+        }
+        assert!(line.contains(&format!("; bridged GPU wait {before:#x} >= 0x9 ahead")), "{line}");
+        assert!(!line.contains(&format!("{after:#x}")), "{line}");
     }
 
     /// The watchdog's chain line on graphs built by hand (cells without a fence: every call is in
