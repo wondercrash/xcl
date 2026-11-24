@@ -1102,8 +1102,9 @@ impl Gpu {
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
-        // the parts on tiles with video memory: (address, window, bytes), none past its tile
-        let segs: Vec<(usize, usize, usize)> = {
+        // the parts on tiles with video memory: (address, window, bytes, the tile's
+        // `TileEntry::epoch`), none past its tile
+        let segs: Vec<(usize, usize, usize, [u32; PAGES_PER_TILE])> = {
             let b = self.st();
             let mut segs = Vec::new();
             for &(a, n) in ranges {
@@ -1115,8 +1116,8 @@ impl Gpu {
                     let to_tile_end = (tile + TILE) - cur;
                     let to_win_end = (b.bases[wi] + crate::gpu::uma::WINDOW) - cur;
                     let len = (n - done).min(to_tile_end).min(to_win_end);
-                    if b.mapped.contains_key(&tile) {
-                        segs.push((cur, wi, len));
+                    if let Some(e) = b.mapped.get(&tile) {
+                        segs.push((cur, wi, len, e.epoch));
                     }
                     done += len;
                 }
@@ -1128,12 +1129,13 @@ impl Gpu {
         }
         let Some((rb, p)) = self.readback_buf() else { return };
         let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (va, rb_off, chunk)
+        let mut epochs: Vec<[u32; PAGES_PER_TILE]> = Vec::new(); // of each `pending` part's tile
         let mut used = 0usize;
         let mut open = false;
-        for (mut cur, wi, mut len) in segs {
+        for (mut cur, wi, mut len, epoch) in segs {
             while len > 0 {
                 if used == READBACK_STAGING {
-                    self.land_readback(&mut open, &mut pending, p);
+                    self.land_readback(&mut open, &mut pending, &mut epochs, p);
                     used = 0;
                 }
                 let chunk = len.min(READBACK_STAGING - used);
@@ -1146,19 +1148,21 @@ impl Gpu {
                 let b = self.windows[wi].0;
                 self.rb_list.CopyBufferRegion(&rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
                 pending.push((cur, used, chunk));
+                epochs.push(epoch);
                 used += chunk;
                 cur += chunk;
                 len -= chunk;
             }
         }
         if open {
-            self.land_readback(&mut open, &mut pending, p);
+            self.land_readback(&mut open, &mut pending, &mut epochs, p);
         }
     }
 
     /// The readback list (if `open`) run and waited for, then `pending` (address, offset at
-    /// `p`, bytes) copied into the CPU view.
-    unsafe fn land_readback(&mut self, open: &mut bool, pending: &mut Vec<(usize, usize, usize)>, p: *mut u8) {
+    /// `p`, bytes) copied into the CPU view: the pages of it nobody committed or decommitted
+    /// since `epochs` (of each part's tile) were taken.
+    unsafe fn land_readback(&mut self, open: &mut bool, pending: &mut Vec<(usize, usize, usize)>, epochs: &mut Vec<[u32; PAGES_PER_TILE]>, p: *mut u8) {
         if *open {
             *open = false;
             if self.rb_list.Close().is_ok() {
@@ -1173,8 +1177,9 @@ impl Gpu {
             self.wait_for(self.value);
             self.reclaim_ring();
         }
-        self.st().copy_back(p, pending);
+        self.st().copy_back_current(p, pending, epochs);
         pending.clear();
+        epochs.clear();
     }
 
     /// A copy of `parts` (from `mapped_parts`) into a readback buffer of its own, recorded on the
@@ -1444,6 +1449,27 @@ impl State {
         }
     }
 
+    /// `copy_back` of the pages of `parts` nobody committed or decommitted since `epochs`
+    /// (`TileEntry::epoch` of each part's tile) were taken: the copy of one decommitted (parked,
+    /// unmapped, or committed again and cleared) while it was on its way is stale.
+    unsafe fn copy_back_current(&mut self, p: *const u8, parts: &[(usize, usize, usize)], epochs: &[[u32; PAGES_PER_TILE]]) {
+        let mut current: Vec<(usize, usize, usize)> = Vec::new();
+        for (&(va, off, len), recorded) in parts.iter().zip(epochs) {
+            let t = va & !(TILE - 1);
+            let Some(e) = self.mapped.get(&t) else { continue };
+            let mut at = va;
+            while at < va + len {
+                let idx = (at - t) / PAGE;
+                let step = ((at & !(PAGE - 1)) + PAGE).min(va + len) - at;
+                if e.epoch[idx] == recorded[idx] {
+                    current.push((at, off + (at - va), step));
+                }
+                at += step;
+            }
+        }
+        self.copy_back(p, &current);
+    }
+
     /// The parts of `ranges` (address, bytes) on tiles with video memory, as (address, offset in
     /// a buffer holding them back to back, bytes), and that buffer's size.
     fn mapped_parts(&self, ranges: &[(usize, usize)]) -> (Vec<(usize, usize, usize)>, usize) {
@@ -1647,23 +1673,7 @@ impl Readback {
         let mapped = self.fence.GetCompletedValue() != u64::MAX && self.buf.Map(0, None, Some(&mut p)).is_ok();
         if let Some(s) = STATE.lock().unwrap().as_mut() {
             if mapped {
-                // only pages nobody committed or decommitted since: the copy of one decommitted
-                // (parked, unmapped, or committed again and cleared) is stale
-                let mut parts: Vec<(usize, usize, usize)> = Vec::new();
-                for (&(va, off, len), recorded) in self.parts.iter().zip(&self.epochs) {
-                    let t = va & !(TILE - 1);
-                    let Some(e) = s.mapped.get(&t) else { continue };
-                    let mut at = va;
-                    while at < va + len {
-                        let idx = (at - t) / PAGE;
-                        let step = ((at & !(PAGE - 1)) + PAGE).min(va + len) - at;
-                        if e.epoch[idx] == recorded[idx] {
-                            parts.push((at, off + (at - va), step));
-                        }
-                        at += step;
-                    }
-                }
-                s.copy_back(p as *const u8, &parts);
+                s.copy_back_current(p as *const u8, &self.parts, &self.epochs);
             }
             if counted {
                 if let Some(n) = s.unlanded.get_mut(&self.queue) {
@@ -2583,6 +2593,69 @@ mod tests {
         assert_eq!(to_zero, vec![(t + PAGE, PAGE)], "the page is still cleared");
         decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t + PAGE, PAGE);
         assert_eq!(mapped[&t].epoch, after, "decommitting a hole again changes nothing");
+    }
+
+    /// The synchronous copy back lands, as the gated one, only on pages nobody committed or
+    /// decommitted while it waited for the GPU: a page decommitted and committed again, or a
+    /// whole tile parked and taken back, holds its new owner's data, not the old copy.
+    #[test]
+    fn a_synchronous_copy_back_skips_pages_committed_again_meanwhile() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let base = VirtualAlloc(std::ptr::null(), 2 * TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert!(base != 0 && base % TILE == 0);
+            assert!(!VirtualAlloc(base as *const c_void, 2 * TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            let mut reserved: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&buffer_desc((2 * TILE) as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved)
+                .expect("CreateReservedResource");
+            let reserved = reserved.expect("reserved buffer");
+            static BOOK: Mutex<Option<State>> = Mutex::new(None);
+            let mut g = gpu_for(&BOOK, dev, vec![(base, reserved)]);
+            g.st().commit_range(base, 2 * TILE);
+            g.map_pending();
+
+            // planned (as `readback_ranges` does): pages 0 and 1 of the first tile, page 0 of
+            // the second, with their tiles' epochs
+            let mut pending = vec![(base, 0, 2 * PAGE), (base + TILE, 2 * PAGE, PAGE)];
+            let mut epochs = {
+                let b = g.st();
+                vec![b.mapped[&base].epoch, b.mapped[&(base + TILE)].epoch]
+            };
+            // while the copy waited: page 1 decommitted and committed again, the second tile
+            // parked and taken back; their new owners wrote there
+            {
+                let mut b = g.st();
+                b.decommit_range(base + PAGE, PAGE);
+                b.commit_range(base + PAGE, PAGE);
+                b.decommit_range(base + TILE, TILE);
+                assert!(b.parked.contains_key(&(base + TILE)));
+                b.commit_range(base + TILE, TILE);
+                assert!(b.mapped.contains_key(&(base + TILE)), "the parked tile is taken back");
+            }
+            *((base + PAGE) as *mut u8) = 0x11;
+            *((base + TILE) as *mut u8) = 0x22;
+
+            let mut copy = vec![0xABu8; 3 * PAGE];
+            g.land_readback(&mut false, &mut pending, &mut epochs, copy.as_mut_ptr());
+            assert_eq!(*(base as *const u8), 0xAB, "a page nobody touched gets the copy");
+            assert_eq!(*((base + PAGE) as *const u8), 0x11, "a page committed again keeps its new owner's data");
+            assert_eq!(*((base + TILE) as *const u8), 0x22, "a tile taken back keeps its new owner's data");
+            assert!(pending.is_empty() && epochs.is_empty());
+
+            g.wait_for(g.value);
+            drop(g);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
     }
 
     /// Sub-tile decommits (two 32 KiB halves, sixteen 4 KiB pages, or decommitting the last
