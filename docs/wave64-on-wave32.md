@@ -42,7 +42,7 @@ whole-wave:
 | `v_readlane`, `v_readfirstlane` (lane index uniform) | one word: each half gives the value of lane `l & 31`, the half that owns `l` wins |
 | `ds_bpermute` (any lane) | 32 words: each half gives its lanes |
 | DPP16, DPP8, `ds_swizzle`, `v_permlane(x)16` | none: the ISA keeps them inside a 32-lane half (`WaveReadLaneAt(v, l & 31)`) |
-| `s_load*` / `s_buffer_load*` with GLC (or DLC), and every one in a group of one console wave | up to 16 words: half 0's values for both (memory another wave writes may change between the two halves' loads; without GLC the console's scalar cache is not coherent either, so in groups of several console waves plain loads are read by both halves) |
+| `s_load*` / `s_buffer_load*` with GLC (or DLC), and every one in a group of one console wave | up to 16 words: half 0's values for every thread of both halves (memory another wave writes may change between the two halves' loads; without GLC the console's scalar cache is not coherent either, so in groups of several console waves plain loads are read by both halves) |
 
 So both halves hold the full 64-bit EXEC / VCC / masks and identical SGPRs; every branch is
 taken the same way by both, and the existing scalar code (`s_bcnt1_i32_b64`, `s_ff1`,

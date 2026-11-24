@@ -1561,15 +1561,16 @@ impl Em {
         // halves take the lower half's values, so they cannot see two different ones. In a
         // group of one console wave every scalar load does: memory written during the dispatch
         // is the only thing that could make the halves' scalar values (and so their branches
-        // and, in the group-barrier form, their barriers) differ
+        // and, in the group-barrier form, their barriers) differ. Every thread takes the word
+        // from half 0's slot, so half 0's own lanes agree as well (each did its own load)
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         if self.x64() && (coherent || self.x64_threads() <= 64) {
             self.x64_words = self.x64_words.max(vals.len());
             for (i, v) in vals.iter().enumerate() {
                 self.line(&format!("xcl_x_put({i}u, {v});"));
             }
-            let get: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!("{v} = xcl_x_get({i}u);")).collect();
-            self.line(&format!("if (xcl_x_meet() && xcl_half != 0u) {{ {} }}", get.join(" ")));
+            let get: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!("{v} = xcl_x_get0({i}u);")).collect();
+            self.line(&format!("if (xcl_x_meet()) {{ {} }}", get.join(" ")));
         }
         for (i, v) in vals.iter().enumerate() {
             let s = self.sreg(sdata + i as u64);
@@ -5525,6 +5526,8 @@ uint xcl_x_thread(uint gi) {
 uint xcl_x_at(uint half, uint k) { return ((xcl_cw * 2u + half) * 2u + (k & 1u)) * XCL_X_SLOT; }
 void xcl_x_put(uint i, uint v) { XCL_XS(xcl_x_at(xcl_half, xcl_xk) + i) = v; }
 uint xcl_x_get(uint i) { return XCL_XS(xcl_x_at(xcl_half ^ 1u, xcl_xk - 1u) + i); }
+// half 0's word of the last exchange, in both halves (a scalar load: one value for all 64)
+uint xcl_x_get0(uint i) { return XCL_XS(xcl_x_at(0u, xcl_xk - 1u) + i); }
 // meet the other half after `xcl_x_put`: true = its words are readable (`xcl_x_get`)
 bool xcl_x_meet() {
     uint k = xcl_xk;
