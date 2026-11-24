@@ -234,7 +234,7 @@ fn config_root(exe: &Path) -> Option<PathBuf> {
     None
 }
 
-fn resolve_location(target: &Path) -> Result<(PathBuf, Option<PathBuf>, String), String> {
+pub(crate) fn resolve_location(target: &Path) -> Result<(PathBuf, Option<PathBuf>, String), String> {
     let target = std::fs::canonicalize(target).map_err(|e| format!("{}: {e}", target.display()))?;
     let target = PathBuf::from(target.to_string_lossy().trim_start_matches("\\\\?\\"));
     let (root, exe) = if target.is_dir() {
