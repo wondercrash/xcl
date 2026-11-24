@@ -745,12 +745,18 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// waiting for the one slot left, and the DXC pool sat idle. Each driver thread takes the
 /// biggest waiting program that `driver_fits` lets in: by the commit and memory free, and with
 /// at most `huge_most` programs over `HUGE` at once, so those never hold every thread.
+/// `XCL_PRECOMPILE_MAX_DXIL` (bytes, `parse_bytes`): a program with more DXIL is translated
+/// (its DXIL cached) but its driver compile is left to the runtime (`over_cap`).
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
+    /// programs over `max_dxil` whose driver compile was left to the runtime
+    over_cap: AtomicUsize,
+    /// `XCL_PRECOMPILE_MAX_DXIL`: the most DXIL bytes a program queued for the driver may have
+    max_dxil: Option<usize>,
     /// the driver compiles running now: when each started and its DXIL bytes
     running: Mutex<Vec<(std::time::Instant, usize)>>,
     /// driver threads, the most compiles at once: `XCL_PIPELINE_THREADS`, or half the logical CPUs
@@ -807,6 +813,18 @@ fn driver_fits(running: &[usize], avail: u64, huge_most: usize) -> Option<usize>
     };
     let huge = running.iter().filter(|&&n| n > HUGE).count();
     Some(if huge >= huge_most { most.min(HUGE) } else { most })
+}
+
+/// A byte count: a number with an optional K / M / G suffix (1024-based, any case), e.g. `8M`.
+fn parse_bytes(s: &str) -> Option<usize> {
+    let s = s.trim();
+    let (digits, shift) = match s.as_bytes().last()?.to_ascii_uppercase() {
+        b'K' => (&s[..s.len() - 1], 10),
+        b'M' => (&s[..s.len() - 1], 20),
+        b'G' => (&s[..s.len() - 1], 30),
+        _ => (s, 0),
+    };
+    digits.trim_end().parse::<usize>().ok()?.checked_mul(1 << shift)
 }
 
 /// Work waiting for a slow consumer, handed out biggest first. A push never waits: the queue
@@ -888,7 +906,24 @@ impl Pipelines {
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
             let threads = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores / 2).max(1);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), running: Mutex::new(Vec::new()), threads })
+            let max_dxil = std::env::var("XCL_PRECOMPILE_MAX_DXIL").ok().and_then(|v| {
+                let most = parse_bytes(&v);
+                if most.is_none() {
+                    eprintln!("xcl shaders: XCL_PRECOMPILE_MAX_DXIL={v} is not a byte count (e.g. 8388608 or 8M): no cap");
+                }
+                most
+            });
+            Ok(Pipelines {
+                dev,
+                signatures: Mutex::new(Default::default()),
+                made: AtomicUsize::new(0),
+                refused: AtomicUsize::new(0),
+                reused: AtomicUsize::new(0),
+                over_cap: AtomicUsize::new(0),
+                max_dxil,
+                running: Mutex::new(Vec::new()),
+                threads,
+            })
         }
     }
 
@@ -1058,6 +1093,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             HUGE >> 20,
             DRIVER_RESERVE >> 30
         );
+        if let Some(most) = p.max_dxil {
+            println!("pipelines: programs over {most} bytes of DXIL left for the runtime (XCL_PRECOMPILE_MAX_DXIL)");
+        }
     }
     // translated compute programs waiting for the driver's compiles
     let queue: BiggestFirst<recomp::pso::Compiled> = BiggestFirst::new();
@@ -1103,9 +1141,14 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             // a cached driver blob is a cheap create; the rest go to the driver
-                            // threads, so this thread translates on at once
-                            if pipelines.is_some_and(|p| !p.from_cache(&c)) {
-                                queue.push(c.dxil.len(), c);
+                            // threads, so this thread translates on at once, but those over
+                            // `XCL_PRECOMPILE_MAX_DXIL` are left to the runtime
+                            if let Some(p) = pipelines.filter(|p| !p.from_cache(&c)) {
+                                if p.max_dxil.is_some_and(|most| c.dxil.len() > most) {
+                                    p.over_cap.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    queue.push(c.dxil.len(), c);
+                                }
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
@@ -1190,7 +1233,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         t0.elapsed().as_secs_f64()
     );
     if let Some(p) = pipelines {
-        println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
+        let over = if p.max_dxil.is_some() { format!(", {} over the size cap (XCL_PRECOMPILE_MAX_DXIL) left for the runtime", p.over_cap.load(Ordering::Relaxed)) } else { String::new() };
+        println!("pipelines made on the GPU {}, refused {}{over}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
     }
     for e in errors.into_inner().unwrap() {
@@ -1572,6 +1616,15 @@ mod tests {
         assert_eq!(driver_fits(&[28 * MB], plenty, huge_most(2)), Some(HUGE));
         // a program of exactly `HUGE` bytes is not huge
         assert_eq!(driver_fits(&[HUGE, HUGE], plenty, 2), Some(usize::MAX));
+    }
+
+    #[test]
+    fn byte_counts_take_a_suffix() {
+        assert_eq!(parse_bytes("8388608"), Some(8 << 20));
+        assert_eq!((parse_bytes("8M"), parse_bytes(" 8m "), parse_bytes("8 M")), (Some(8 << 20), Some(8 << 20), Some(8 << 20)));
+        assert_eq!((parse_bytes("512k"), parse_bytes("2G")), (Some(512 << 10), Some(2 << 30)));
+        assert_eq!((parse_bytes(""), parse_bytes("M"), parse_bytes("8MB"), parse_bytes("-1")), (None, None, None, None));
+        assert_eq!(parse_bytes(&format!("{}G", usize::MAX)), None, "overflow");
     }
 
     #[test]
