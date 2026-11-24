@@ -290,6 +290,53 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
     Ok(format!("ok, {} window(s), {} µs", probes.len(), t0.elapsed().as_micros()))
 }
 
+/// The 8 bytes at UMA address `p` as the GPU reads them: a copy from the window buffer on a copy
+/// queue of XCL's own (no title queue holds it), waited for up to 500 ms. For a stalled gate's
+/// line, beside the CPU's read: in the coherent windows the two share memory, so a difference
+/// says the GPU's write has not reached memory the CPU sees, and the same low value says the
+/// GPU never wrote the waited value (or wrote a lower one after it).
+pub(super) unsafe fn gpu_read_u64(p: usize) -> Result<u64, String> {
+    let raw = device_raw();
+    let device = ID3D12Device::from_raw_borrowed(&raw).ok_or("no device")?;
+    let (buf, off) = uma_window_buffer(p, 8).ok_or("not in an open window")?;
+    let buf = buf as *mut c_void;
+    let src = ID3D12Resource::from_raw_borrowed(&buf).ok_or("no window buffer")?;
+    let ty = D3D12_COMMAND_LIST_TYPE_COPY;
+    let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).map_err(|e| format!("queue: {e}"))?;
+    let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(ty).map_err(|e| format!("allocator: {e}"))?;
+    let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, ty, &alloc, None).map_err(|e| format!("list: {e}"))?;
+    let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|e| format!("fence: {e}"))?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: 256,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut readback: Option<ID3D12Resource> = None;
+    device
+        .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback)
+        .map_err(|e| format!("readback buffer: {e}"))?;
+    let readback = readback.ok_or("readback buffer")?;
+    list.CopyBufferRegion(&readback, 0, src, off, 8);
+    list.Close().map_err(|e| format!("Close: {e}"))?;
+    queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(|e| e.to_string())?)]);
+    queue.Signal(&fence, 1).map_err(|e| format!("Signal: {e}"))?;
+    if let Err(e) = crate::gpu::fence::wait(&fence, 1, device, None, 500) {
+        // still in use by the GPU: kept alive for good rather than released under it
+        std::mem::forget((queue, alloc, list, readback, fence));
+        return Err(format!("not done in 500 ms: {e}"));
+    }
+    let mut m = std::ptr::null_mut();
+    readback.Map(0, None, Some(&mut m)).map_err(|e| format!("Map: {e}"))?;
+    let v = (m as *const u64).read_unaligned();
+    readback.Unmap(0, None);
+    Ok(v)
+}
+
 unsafe fn open_uma(device: &ID3D12Device) {
     let Some(u) = crate::gpu::uma::get() else {
         *UMA_ERROR.lock().unwrap() = "no UMA region".into();
@@ -5441,6 +5488,25 @@ pub fn stop_if_device_removed() {
             windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), e.code().0 as u32);
         }
     }
+}
+
+/// A stalled gate's GPU read (`gpu_read_u64`): a word the CPU wrote into the coherent window,
+/// read back by a copy on a queue of XCL's own.
+#[cfg(test)]
+#[test]
+fn a_gpu_copy_reads_a_coherent_window_word() {
+    if let Err(e) = init() {
+        return crate::gpu::recomp::runner::skip_test(&format!("no real D3D12.X backend: {e}"));
+    }
+    let u = crate::gpu::uma::get().expect("UMA");
+    let Some(k) = (0..4).find(|&k| u.is_committed_window(k)) else { return crate::gpu::recomp::runner::skip_test("no coherent window") };
+    let p = u.alloc_in(k, 8, 0).expect("8 bytes in the coherent window") as usize;
+    unsafe {
+        std::ptr::write_volatile(p as *mut u64, 0x5843_4C00_0000_0506);
+        assert_eq!(gpu_read_u64(p), Ok(0x5843_4C00_0000_0506));
+    }
+    u.free(p as _);
+    assert!(unsafe { gpu_read_u64(0x10) }.is_err(), "outside the windows");
 }
 
 #[cfg(test)]
