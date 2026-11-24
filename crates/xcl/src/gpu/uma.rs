@@ -730,6 +730,12 @@ impl Uma {
     }
 }
 
+/// The UMA if something made it already (`get` makes it: a process without a title, such as
+/// `xcl pipelines`, must not reserve its windows for a check).
+pub fn existing() -> Option<&'static Uma> {
+    GLOBAL.get()?.as_ref()
+}
+
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048).
 pub fn get() -> Option<&'static Uma> {
     GLOBAL

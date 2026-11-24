@@ -212,7 +212,7 @@ pub fn readable(p: usize, len: usize) -> bool {
         Some(e) => e,
         None => return false,
     };
-    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, len)) {
+    if crate::gpu::uma::existing().is_some_and(|u| u.in_committed_window(p, len)) {
         return true;
     }
     if resident_and_readable(p, end) {

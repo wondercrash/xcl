@@ -75,7 +75,18 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 
 /// Memory windows of the title's unified memory (1 without it).
 pub fn mem_windows() -> u32 {
-    crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32)
+    match MEM_WINDOWS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32),
+        n => n,
+    }
+}
+
+static MEM_WINDOWS_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `mem_windows` as a title's run had it (`xcl pipelines` replays a run's pipelines without the
+/// title's unified memory: the HLSL, and so the cache keys, must be that run's). 0: unset.
+pub fn set_mem_windows(n: u32) {
+    MEM_WINDOWS_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
