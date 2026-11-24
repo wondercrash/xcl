@@ -75,10 +75,23 @@ pub fn pc_queue_desc(d: [u32; 4]) -> [u32; 4] {
 
 /// device #8 CreateCommandQueue / #48 CreateCommandQueueX(desc, riid, queue)
 pub(super) unsafe extern "system" fn create_command_queue_x(this: *mut c_void, desc: *const [u32; 4], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let d = if desc.is_null() { [0; 4] } else { pc_queue_desc(desc.read_unaligned()) };
+    let console = if desc.is_null() { [0; 4] } else { desc.read_unaligned() };
+    let d = pc_queue_desc(console);
     let hr = real::dev_create_command_queue(this, d.as_ptr() as usize, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::list_x::on_queue_create(*ppv as usize, this as usize, D3D12_COMMAND_LIST_TYPE(d[0] as i32));
+        // (a queue whose GPU timeout the title turned off: Windows does not remove the device
+        // for work of it that does not end)
+        crate::xlog_info!(
+            "D3D12.X: command queue {} ({:#x}): priority {}, flags {:#x} (the title's: priority {}, flags {:#x}){}",
+            super::list_x::queue_label(*ppv as usize),
+            *ppv as usize,
+            d[1],
+            d[2],
+            console[1],
+            console[2],
+            if d[2] & 1 != 0 { " – no GPU timeout" } else { "" }
+        );
     }
     hr
 }
