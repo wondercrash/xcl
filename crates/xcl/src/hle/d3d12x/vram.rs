@@ -101,6 +101,22 @@ impl<H: Clone> Arenas<H> {
 unsafe impl Send for Arenas<ID3D12Heap> {}
 
 static ARENAS: Mutex<Arenas<ID3D12Heap>> = Mutex::new(Arenas::new());
+
+/// Arena releases a resource release could not do because `ARENAS` was held (`sparse::lock`:
+/// a release can run inside the D3D12 runtime with a lock of its own held, and `ARENAS` is held
+/// across `CreateHeap`): done by the next thread that takes it (`arenas`).
+static DEFERRED_ARENAS: Mutex<Vec<(u64, std::time::Instant)>> = Mutex::new(Vec::new());
+
+/// `ARENAS`, with the releases deferred meanwhile done first.
+fn arenas() -> std::sync::MutexGuard<'static, Arenas<ID3D12Heap>> {
+    let mut g = ARENAS.lock().unwrap();
+    // (taken first: the queue's guard must not live through the loop)
+    let deferred = std::mem::take(&mut *DEFERRED_ARENAS.lock().unwrap());
+    for (id, at) in deferred {
+        g.release(id, at);
+    }
+    g
+}
 /// resource → its arena's id
 static ARENA_OF: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
 /// bytes of every arena made
@@ -108,7 +124,7 @@ static MADE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 
 /// (bytes of the arenas in use, bytes of all arenas made) – `XCL_ACTIVITY`
 pub fn arena_bytes() -> (usize, usize) {
-    (ARENAS.lock().unwrap().bytes(), MADE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
+    (arenas().bytes(), MADE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
 }
 static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
@@ -122,7 +138,11 @@ pub(super) fn forget(resource: usize) {
     if placed {
         forget_pages(resource);
         if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
-            ARENAS.lock().unwrap().release(id, std::time::Instant::now());
+            let now = std::time::Instant::now();
+            match ARENAS.try_lock() {
+                Ok(mut g) => g.release(id, now),
+                Err(_) => DEFERRED_ARENAS.lock().unwrap().push((id, now)),
+            }
         }
     }
 }
@@ -248,6 +268,38 @@ unsafe impl Send for Pages {}
 
 /// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
 static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
+
+type PageMap = std::collections::BTreeMap<usize, Option<Pages>>;
+
+/// Work of a resource release left for the next `PAGES` holder (`pages`): `PAGES` is held
+/// across `UpdateTileMappings` / queue `Wait` / `CreateReservedResource`, and a release can run
+/// inside the D3D12 runtime with a lock of its own held (`sparse::lock`).
+enum PagesWork {
+    /// `forget_pages`
+    Forget(usize),
+    /// `remap_if_unmapped` (a reference held: the raw resource)
+    Remap(usize),
+}
+
+static DEFERRED_PAGES: Mutex<Vec<PagesWork>> = Mutex::new(Vec::new());
+
+/// `PAGES`, with the release work deferred meanwhile done first.
+fn pages() -> std::sync::MutexGuard<'static, PageMap> {
+    let mut g = PAGES.lock().unwrap();
+    // (taken first: a release of the remapped resource below can defer again)
+    let deferred = std::mem::take(&mut *DEFERRED_PAGES.lock().unwrap());
+    for w in deferred {
+        match w {
+            PagesWork::Forget(res) => forget_pages_in(&mut g, res),
+            PagesWork::Remap(raw) => unsafe {
+                // (its reference goes here, under `PAGES`: a last release defers its own work)
+                let res = ID3D12Resource::from_raw(raw as *mut c_void);
+                remap_in(&mut g, &res);
+            },
+        }
+    }
+    g
+}
 
 impl Pages {
     unsafe fn new(dev: &ID3D12Device) -> Option<Pages> {
@@ -498,7 +550,7 @@ unsafe fn place_on_pages(
     if (require_aligned || console_bytes.is_none()) && va % PAGE != 0 {
         return None;
     }
-    let mut g = PAGES.lock().unwrap();
+    let mut g = pages();
     let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
     // reserved textures have the PC's 64 KiB tiles
     let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
@@ -532,7 +584,7 @@ unsafe fn place_on_pages(
 /// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool immediately.
 pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
     let key = res.as_raw() as usize;
-    let mut g = PAGES.lock().unwrap();
+    let mut g = pages();
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
         let Some(t) = pages.targets.get_mut(&key) else { continue };
@@ -549,36 +601,48 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
     }
 }
 
-/// Re-map a previously unmapped placed texture when the newer placement shadowing it is released.
-pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
+/// Re-map a previously unmapped placed texture when the newer placement shadowing it is released
+/// (from that release: deferred while `PAGES` is held).
+pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) {
+    match PAGES.try_lock() {
+        Ok(mut g) => remap_in(&mut g, res),
+        Err(_) => DEFERRED_PAGES.lock().unwrap().push(PagesWork::Remap(res.clone().into_raw() as usize)),
+    }
+}
+
+unsafe fn remap_in(g: &mut PageMap, res: &ID3D12Resource) {
     let mut dev: Option<ID3D12Device> = None;
     if res.GetDevice(&mut dev).is_err() {
-        return false;
+        return;
     }
-    let Some(dev) = dev else { return false };
+    let Some(dev) = dev else { return };
     let key = res.as_raw() as usize;
-    let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
     let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
-        return false;
+        return;
     };
     if mapped {
-        return true;
+        return;
     }
     let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
-        return false;
+        return;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
         t.used = used;
         t.used_extra = used_extra;
         t.mapped = true;
     }
-    true
 }
 
-/// A resource released: its pages are no longer its.
+/// A resource released: its pages are no longer its (deferred while `PAGES` is held).
 fn forget_pages(resource: usize) {
-    let mut g = PAGES.lock().unwrap();
+    match PAGES.try_lock() {
+        Ok(mut g) => forget_pages_in(&mut g, resource),
+        Err(_) => DEFERRED_PAGES.lock().unwrap().push(PagesWork::Forget(resource)),
+    }
+}
+
+fn forget_pages_in(g: &mut PageMap, resource: usize) {
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
         let Some(t) = pages.targets.remove(&resource) else { continue };
@@ -596,7 +660,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
         return;
     }
     let Some(dev) = dev else { return };
-    let mut g = PAGES.lock().unwrap();
+    let mut g = pages();
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
     let key = queue.as_raw() as usize;
     if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
@@ -670,10 +734,10 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     let align = (info.Alignment as usize).max(PAGE);
     let now = std::time::Instant::now();
-    let (heap, offset, id) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
+    let (heap, offset, id) = arenas().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
     let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
-        ARENAS.lock().unwrap().release(id, now);
+        arenas().release(id, now);
         return None;
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
@@ -687,6 +751,25 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    /// A texture released while another thread holds the pages (across a D3D12 call that waits
+    /// for a runtime lock the release's caller holds) does not wait for them: its pages are
+    /// given back by the next thread that takes them.
+    #[test]
+    fn a_release_while_the_pages_are_held_does_not_wait_for_them() {
+        const RES: usize = 0x7E57_9A6E;
+        let held = PAGES.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            forget_pages(RES);
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "forget_pages waited for the pages");
+        assert!(DEFERRED_PAGES.lock().unwrap().iter().any(|w| matches!(w, PagesWork::Forget(RES))), "the release was dropped, not deferred");
+        drop(held);
+        drop(pages());
+        assert!(!DEFERRED_PAGES.lock().unwrap().iter().any(|w| matches!(w, PagesWork::Forget(RES))), "the next holder did not do the deferred release");
+    }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
     #[test]

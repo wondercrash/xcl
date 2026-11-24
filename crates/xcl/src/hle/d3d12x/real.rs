@@ -4979,6 +4979,15 @@ static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 /// command list slots of the newer layout → the older layout's slot of the same method
 const NEWER_LIST_SLOTS: [(usize, usize); 21] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
 
+/// The older layout's command list slot of the method the title calls at console slot `slot`,
+/// as XCL dispatches it (the same slot on the older layout and for a method that did not move).
+pub(super) fn older_list_slot(slot: usize) -> usize {
+    if !QUEUE_SHIFTED.load(Ordering::Acquire) {
+        return slot;
+    }
+    NEWER_LIST_SLOTS.iter().find(|e| e.0 == slot).map_or(slot, |e| e.1)
+}
+
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
 pub(super) fn note_newer_device_method(slot: usize) {
@@ -5256,7 +5265,7 @@ pub fn log_device_removed() {
                 let count = node.BreadcrumbCount as usize;
                 let done = if node.pLastBreadcrumbValue.is_null() { 0 } else { *node.pLastBreadcrumbValue as usize };
                 if done < count {
-                    let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
+                    let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, breadcrumb_op_name((*node.pCommandHistory.add(i)).0))).collect();
                     crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
                 }
                 n = node.pNext;
@@ -5264,6 +5273,22 @@ pub fn log_device_removed() {
             }
         }
     }
+}
+
+/// A DRED auto-breadcrumb operation (`D3D12_AUTO_BREADCRUMB_OP`) by name.
+fn breadcrumb_op_name(op: i32) -> String {
+    const NAMES: [&str; 46] = [
+        "SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced", "ExecuteIndirect", "Dispatch",
+        "CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles", "ResolveSubresource", "ClearRenderTargetView",
+        "ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier", "ExecuteBundle", "Present", "ResolveQueryData",
+        "BeginSubmission", "EndSubmission", "DecodeFrame", "ProcessFrames", "AtomicCopyBufferUINT", "AtomicCopyBufferUINT64",
+        "ResolveSubresourceRegion", "WriteBufferImmediate", "DecodeFrame1", "SetProtectedResourceSession", "DecodeFrame2",
+        "ProcessFrames1", "BuildRaytracingAccelerationStructure", "EmitRaytracingAccelerationStructurePostbuildInfo",
+        "CopyRaytracingAccelerationStructure", "DispatchRays", "InitializeMetaCommand", "ExecuteMetaCommand", "EstimateMotion",
+        "ResolveMotionVectorHeap", "SetPipelineState1", "InitializeExtensionCommand", "ExecuteExtensionCommand", "DispatchMesh",
+        "EncodeFrame", "ResolveEncoderOutputMetadata", "Barrier",
+    ];
+    usize::try_from(op).ok().and_then(|i| NAMES.get(i)).map_or_else(|| op.to_string(), |n| (*n).to_owned())
 }
 
 /// The GPU hung or the device was removed: the title is stopped at once (a title that goes on
