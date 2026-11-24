@@ -988,6 +988,35 @@ mod shader_cache_tests {
     }
 }
 
+/// `XCL_SAMPLE_RPF` (a retail `shaders.rpf`): a compute program that structuring would make 10
+/// times bigger (ScreenProbes_ActivateRays, 154 MB of HLSL) is translated in the dispatcher
+/// form (15 MB); a big one structuring keeps in proportion (ScreenProbes_ActivateProbes, 30 MB)
+/// stays structured. Does nothing without the pack.
+#[cfg(test)]
+mod structuring_tests {
+    use super::*;
+
+    #[test]
+    fn retail_structuring_that_multiplies_the_hlsl_falls_back_to_blocks() {
+        let Ok(rpf) = std::env::var("XCL_SAMPLE_RPF") else { return };
+        let data = std::fs::read(rpf).unwrap();
+        let (mut rays, mut probes) = (None, None);
+        for r in crate::gpu::pack::scan(&data, 0x40).iter() {
+            let Some(blob) = crate::gpu::pack::inflate(&data, r) else { continue };
+            match crate::gpu::shader::fnv64(&blob) {
+                0x95cc_1328_8a27_a96e => rays = Some(blob),
+                0x56c0_cd3b_82a0_0c6e => probes = Some(blob),
+                _ => {}
+            }
+        }
+        let (Some(rays), Some(probes)) = (rays, probes) else { return };
+        let (t, _) = console_translation(&rays, Stage::Compute, 0, 4, true).unwrap();
+        assert!(t.complete() && t.hlsl.contains("\n    uint pc = ") && t.hlsl.len() < 20 << 20, "{} B", t.hlsl.len());
+        let (t, _) = console_translation(&probes, Stage::Compute, 0, 4, true).unwrap();
+        assert!(t.complete() && !t.hlsl.contains("\n    uint pc = ") && t.hlsl.len() > 20 << 20, "{} B", t.hlsl.len());
+    }
+}
+
 #[cfg(test)]
 mod compile_time_bench {
     use super::*;
