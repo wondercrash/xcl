@@ -1,8 +1,10 @@
 //! `XCL_GPU_PROFILE=1`: the GPU time each console program takes.
 //!
 //! Each draw, dispatch and ExecuteIndirect of console code gets a timestamp query on its PC
-//! list right before it and one right after it, and the pair is resolved into a readback buffer
-//! right behind them. Nothing on the CPU waits for them: a reporter thread looks at the pairs
+//! list right before it and one right after it (and after its breadcrumb), and the pair is
+//! resolved into a readback buffer right behind them. The resolve waits on the GPU for the op to
+//! finish, so with the profile on a queue runs its ops one after the other. Nothing on the CPU
+//! waits for them: a reporter thread looks at the pairs
 //! every 100 ms, adds the ones the GPU has written to their program, and every 2 s logs the 15
 //! programs that took the most GPU time in those 2 s (every 20 s: since the start), with their
 //! calls, longest call, group counts and, for compute, thread group size, wave size and code size.
@@ -36,8 +38,18 @@ const WINDOW: Duration = Duration::from_secs(2);
 /// windows between two logs of the totals since the start
 const SINCE_START_EVERY: u32 = 10;
 
+#[cfg(test)]
+thread_local! {
+    /// The profile on for the current thread's calls only (`breadcrumbs::FORCE` alike).
+    pub(super) static FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(super) fn on() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("XCL_GPU_PROFILE").is_ok_and(|v| v.trim() == "1"));
+    #[cfg(test)]
+    if FORCE.with(|f| f.get()) {
+        return true;
+    }
     *ON
 }
 
@@ -326,8 +338,12 @@ pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32
     Some(pair)
 }
 
-/// After the PC call of the op `begin` gave `pair` for.
-pub(super) unsafe fn end(list: *mut c_void, pair: Option<Pair>) {
+/// After the PC call of the op `begin` gave `pair` for: `mark` (the op's breadcrumb), then the
+/// second stamp and the pair's resolve. The resolve waits on the GPU for the op to finish, so a
+/// breadcrumb recorded behind it would land only at the op's end: the op would read "not
+/// started" while it runs (`breadcrumbs::tests::an_op_the_profile_times_reads_running_while_the_gpu_runs_it`).
+pub(super) unsafe fn end(list: *mut c_void, pair: Option<Pair>, mark: impl FnOnce()) {
+    mark();
     let Some(p) = pair else { return };
     (p.end_query)(list, p.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * p.k + 1);
     (p.resolve)(list, p.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * p.k, 2, p.buf, 16 * p.k as u64);

@@ -1059,6 +1059,105 @@ mod tests {
         }
     }
 
+    /// With `XCL_GPU_PROFILE` on, an op the GPU runs still reads "running": the profile's
+    /// resolve, which waits for the op to finish, comes after the op's mark (`gpu_profile::end`).
+    /// Behind the resolve the mark only landed at the op's end (runs 22b and 23: every queue's op
+    /// "not started", and "no op of console code is running" with the GPU at 100 %).
+    #[test]
+    fn an_op_the_profile_times_reads_running_while_the_gpu_runs_it() {
+        use super::super::gpu_profile;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            if crate::gpu::recomp::dxc::location().is_err() {
+                skip_test("no DXC");
+                return;
+            }
+            struct Unforce;
+            impl Drop for Unforce {
+                fn drop(&mut self) {
+                    FORCE.with(|f| f.set(false));
+                    gpu_profile::FORCE.with(|f| f.set(false));
+                }
+            }
+            FORCE.with(|f| f.set(true));
+            gpu_profile::FORCE.with(|f| f.set(true));
+            let _unforce = Unforce;
+            // one group that runs a few hundred ms
+            let src = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer C : register(b0) { uint n; };
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 t : SV_DispatchThreadID) {
+    uint x = t.x;
+    for (uint i = 0; i < n; i++) {
+        x = x * 1664525u + 1013904223u;
+    }
+    if (x == 0x12345678u) o.Store(0, x);
+}
+"#;
+            let dxil = crate::gpu::recomp::dxc::compile(src, "main", "cs_6_6", &[]).unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+            let pso: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut out: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut out).unwrap();
+            let out = out.unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, &pso).unwrap();
+            list.SetComputeRootSignature(&rs);
+            list.SetComputeRoot32BitConstant(0, 1 << 28, 0);
+            list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            let t = gpu_profile::begin(list.as_raw(), 0, gpu_profile::Kind::Dispatch, [1, 1, 1]);
+            assert!(t.is_some(), "the profile did not time the op");
+            list.Dispatch(1, 1, 1);
+            let mut op = None;
+            gpu_profile::end(list.as_raw(), t, || op = push(list.as_raw(), 0, "Dispatch 1x1x1 (test)".into(), true, false));
+            let op = op.expect("no breadcrumb buffer");
+            list.Close().unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            let (mut seen, start) = (Vec::new(), Instant::now());
+            while fence.GetCompletedValue() < 1 && start.elapsed() < Duration::from_secs(10) {
+                let s = state_of(op);
+                if seen.last() != Some(&s) {
+                    seen.push(s);
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            assert!(until(|| fence.GetCompletedValue() >= 1), "the op did not finish");
+            assert!(seen.contains(&"running"), "while the GPU ran it the op read {seen:?}, never \"running\"");
+            assert_eq!(state_of(op), "done");
+            // (a later test's list may get this one's address)
+            list_reset(list.as_raw() as usize);
+        }
+    }
+
     fn mark(id: u32, state: &'static str, call: bool) -> OpView {
         OpView { id, what: if call { "CopyBufferRegion (console #15)".into() } else { "Dispatch 1x1x1".into() }, pso: 0, state, call, list: 0x10, args: 0, args_buf: (0, 0), args_ref: None }
     }

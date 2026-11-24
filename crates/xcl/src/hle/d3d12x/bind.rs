@@ -277,8 +277,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::PcIndirect, [max, 0, 0]);
         pc(this, sig, max, args, args_off, count_buf, count_off);
-        super::gpu_profile::end(this, t);
-        super::breadcrumbs::after_indirect(this, with(this, |s| s.pso), args_at, (args, args_off), || format!("ExecuteIndirect max {max} with a PC pipeline (args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
+        super::gpu_profile::end(this, t, || {
+            super::breadcrumbs::after_indirect(this, with(this, |s| s.pso), args_at, (args, args_off), || format!("ExecuteIndirect max {max} with a PC pipeline (args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"))
+        });
         return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -300,9 +301,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             count(if gfx { DRAWS } else { DISPATCHES });
             let t = super::gpu_profile::begin(this, pso, if gfx { super::gpu_profile::Kind::IndirectDraw } else { super::gpu_profile::Kind::IndirectDispatch }, [max, 0, 0]);
             pc(this, sig, max, args, args_off, count_buf, count_off);
-            super::gpu_profile::end(this, t);
             let kind = if gfx { "draws" } else { "dispatches" };
-            super::breadcrumbs::after_indirect(this, with(this, |s| s.pso), args_at, (args, args_off), || format!("ExecuteIndirect max {max} ({kind}; args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"));
+            super::gpu_profile::end(this, t, || {
+                super::breadcrumbs::after_indirect(this, with(this, |s| s.pso), args_at, (args, args_off), || format!("ExecuteIndirect max {max} ({kind}; args {args:#x}+{args_off:#x}, count {count_buf:#x}+{count_off:#x})"))
+            });
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
@@ -394,8 +396,7 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
             super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
             list.DrawInstanced(vertices, instances, first_vertex, first_instance);
         }
-        super::gpu_profile::end(this, t);
-        super::breadcrumbs::after(this, with(this, |s| s.pso), what);
+        super::gpu_profile::end(this, t, || super::breadcrumbs::after(this, with(this, |s| s.pso), what));
     } else {
         super::breadcrumbs::skipped(this, with(this, |s| s.pso), what);
     }
@@ -440,8 +441,7 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     let this = list.as_raw();
     let t = super::gpu_profile::begin(this, with(this, |s| s.pso), super::gpu_profile::Kind::Draw, [indices, instances, 0]);
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
-    super::gpu_profile::end(this, t);
-    super::breadcrumbs::after(this, with(this, |s| s.pso), || format!("DrawIndexedInstanced {indices} indices x {instances}"));
+    super::gpu_profile::end(this, t, || super::breadcrumbs::after(this, with(this, |s| s.pso), || format!("DrawIndexedInstanced {indices} indices x {instances}")));
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
@@ -775,10 +775,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         return;
     }
     match translated_dispatch(this, list, pso, x, y, z) {
-        Ok(()) => {
-            count(DISPATCHES);
-            super::breadcrumbs::after(this, pso, || format!("Dispatch {x}x{y}x{z}"));
-        }
+        Ok(()) => count(DISPATCHES),
         Err(e) => {
             count(DISPATCHES_SKIPPED);
             super::breadcrumbs::skipped(this, pso, || format!("Dispatch {x}x{y}x{z} skipped: {e}"));
@@ -895,6 +892,7 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     }
 }
 
+/// The dispatch on XCL's ABI, and its breadcrumb.
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
@@ -902,7 +900,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     bind_abi(this, list, pso, false)?;
     let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::Dispatch, [x, y, z]);
     list.Dispatch(x, y, z);
-    super::gpu_profile::end(this, t);
+    super::gpu_profile::end(this, t, || super::breadcrumbs::after(this, pso, || format!("Dispatch {x}x{y}x{z}")));
     Ok(())
 }
 
