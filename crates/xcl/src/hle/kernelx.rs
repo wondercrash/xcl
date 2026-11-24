@@ -192,6 +192,7 @@ pub mod mirrors {
             let taken: Vec<usize> = s.gpu.values().map(|&(_, c)| c).collect();
             if let Some(&(cpu, _)) = s.cpu.iter().rev().find(|&&(b, n)| n == size && !taken.contains(&b)) {
                 s.gpu.insert(base, (size, cpu));
+                super::GPU_VIEW_MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
                 crate::xlog_info!("kernelx: reservation {base:#x} ({size:#x} bytes, no CPU access) is the GPU view of {cpu:#x}");
             }
         } else if p & 0xFF != super::mem::PAGE_NOACCESS {
@@ -203,8 +204,11 @@ pub mod mirrors {
     pub fn released(base: usize) {
         let mut s = STATE.lock().unwrap();
         s.cpu.retain(|&(b, _)| b != base);
-        s.gpu.remove(&base);
-        s.gpu.retain(|_, &mut (_, c)| c != base);
+        let paired = s.gpu.len();
+        s.gpu.retain(|&g, &mut (_, c)| g != base && c != base);
+        if s.gpu.len() != paired {
+            super::GPU_VIEW_MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// The CPU-view address behind `va` when `va` lies in a GPU view.
@@ -251,6 +255,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
                 uma.map(|u| u.sparse_release(q));
                 return std::ptr::null_mut();
             }
+            mirrors::reserved(q, size, t, p);
             trace_mem("VirtualAlloc (64K pages, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
@@ -284,10 +289,12 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             uma.and_then(|u| u.sparse_reserve(size))
         };
         if let Some(q) = reserved {
+            mirrors::reserved(q, size, t, p);
             trace_mem("VirtualAlloc (graphics reserve, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
         if let Some(q) = uma.and_then(|u| u.reserve(size, 0x1_0000)) {
+            mirrors::reserved(q as usize, size, t, p);
             trace_mem("VirtualAlloc (graphics reserve, UMA)", 0, size, t as u64, p, q as usize);
             return q as *mut c_void;
         }
@@ -295,6 +302,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         if !q.is_null() {
             GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
             GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            mirrors::reserved(q as usize, size, t, p);
             return q;
         }
     }
@@ -429,12 +437,14 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             }
         }
         if release {
+            mirrors::released(a);
             u.sparse_release(a);
         }
         return 1;
     }
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.contains(addr as usize)) {
         if t & 0x8000 != 0 {
+            mirrors::released(addr as usize);
             return u.free(addr as usize) as BOOL;
         }
         if t & 0x4000 != 0 && size > 0 {
@@ -819,11 +829,10 @@ pub fn physical_page_at(va: usize) -> bool {
     AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
 }
 
-/// Counts the calls that map or unmap physical pages in a GPU view (`mirrors`): what
-/// `physical_page_at` says there may have changed.
+/// Changes when a GPU view gains or loses its backing reservation or physical page mappings.
 static GPU_VIEW_MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Generation of the physical-page mappings inside GPU views.
+/// Generation of the backing memory seen by textures in GPU views.
 pub fn gpu_view_map_gen() -> u64 {
     GPU_VIEW_MAP_GEN.load(Ordering::Acquire)
 }

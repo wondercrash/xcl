@@ -410,9 +410,8 @@ fn mirror_source(va: usize) -> usize {
     if mapped { va } else { src }
 }
 
-/// Physical pages were mapped or unmapped in a GPU view since the last look: textures there
-/// whose source changed (a page now mapped under one, or gone from it) read from the new one,
-/// uploaded again at this submit.
+/// A GPU view's backing reservation or physical page mappings changed since the last look.
+/// Textures whose source changed read from the new one and are uploaded again at this submit.
 fn recheck_gpu_view_sources() {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     let gen = crate::hle::kernelx::gpu_view_map_gen();
@@ -1235,7 +1234,8 @@ mod tests {
         }
         // Larger than all four UMA windows together. These public allocations
         // must use the watched Windows fallback, reserving space rather than RAM.
-        const SIZE: usize = 24usize << 30;
+        // Distinct from the 24 GiB reservation in the parallel kernelx bookkeeping test.
+        const SIZE: usize = (24usize << 30) + PAGE;
         const OFFSET: usize = 0x2_0000;
         const PAGE: usize = 0x1_0000;
         struct Reservation(usize);
@@ -1352,6 +1352,14 @@ mod tests {
             refresh(queue.as_raw());
             assert_eq!(read_r8(dev, &queue, &texture), vec![0x9A; 64 * 64], "unmapping restores the earlier CPU view");
             assert_eq!(address(key), Some(va));
+            // Keep the texture alive while its GPU address loses and regains its CPU view.
+            kernelx::mirrors::released(gpu.0);
+            recheck_gpu_view_sources();
+            assert_eq!(TEXTURES.lock().unwrap().by_res[&key].src, va);
+            kernelx::mirrors::reserved(gpu.0, SIZE, 0x2040_2000, 0x801);
+            recheck_gpu_view_sources();
+            let src_after_reuse = TEXTURES.lock().unwrap().by_res[&key].src;
+            assert_eq!(src_after_reuse, src);
             dev.GetDeviceRemovedReason().unwrap();
         }
     }

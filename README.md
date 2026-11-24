@@ -34,6 +34,9 @@ next steps:
   console upscaler runs a whole frame on a PC GPU, the GDK HTTP library initialises.
 - **Console textures decode exactly** – the GFX10 tiling and mip layout reproduce 909 of 912
   textures of the game's texture archive byte for byte, its volume textures included.
+  Texture uploads can read the paired CPU view of a GPU-only 64 KiB page reservation, including
+  when the CPU view is in a sparse window. A texture registered in a paired view follows its
+  new CPU backing if the title releases and reuses the GPU address.
 - **370+ automated tests**, including GPU tests that compare translated shaders against expected
   results instruction by instruction.
 
