@@ -679,8 +679,24 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
-/// The process's video memory on the device's adapter: (local, non-local) bytes in use.
-pub fn video_memory() -> Option<(u64, u64)> {
+/// One segment group of the process's video memory (`DXGI_QUERY_VIDEO_MEMORY_INFO`), bytes.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VideoSegment {
+    pub usage: u64,
+    /// What the OS lets the process use before it is demoted
+    pub budget: u64,
+    /// What the process reserved (`SetVideoMemoryReservation`)
+    pub reservation: u64,
+}
+
+/// The process's video memory on the device's adapter, local and non-local.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VideoMemory {
+    pub local: VideoSegment,
+    pub non_local: VideoSegment,
+}
+
+pub fn video_memory() -> Option<VideoMemory> {
     use windows::Win32::Graphics::Dxgi::*;
     let raw = device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
@@ -688,11 +704,12 @@ pub fn video_memory() -> Option<(u64, u64)> {
         let luid = dev.GetAdapterLuid();
         let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
         let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(luid).ok()?;
-        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
-        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
-        Some((local.CurrentUsage, non_local.CurrentUsage))
+        let query = |group| {
+            let mut i = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            adapter.QueryVideoMemoryInfo(0, group, &mut i).ok()?;
+            Some(VideoSegment { usage: i.CurrentUsage, budget: i.Budget, reservation: i.CurrentReservation })
+        };
+        Some(VideoMemory { local: query(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, non_local: query(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)? })
     }
 }
 

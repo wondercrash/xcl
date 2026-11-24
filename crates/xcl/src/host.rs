@@ -8,6 +8,61 @@ use crate::config::Boot;
 
 pub static HOST_MODE: AtomicBool = AtomicBool::new(false);
 
+/// "usage/budget MB (+ reservation, when there is one)" of one segment group.
+fn segment_text(s: &crate::hle::d3d12x::real::VideoSegment) -> String {
+    let mut t = format!("{}/{} MB", s.usage >> 20, s.budget >> 20);
+    if s.reservation != 0 {
+        t += &format!(" (reserved {} MB)", s.reservation >> 20);
+    }
+    t
+}
+
+/// The memory line's video memory part: usage/budget of both segment groups.
+fn video_memory_text(v: &crate::hle::d3d12x::real::VideoMemory) -> String {
+    format!("{} local, {} non-local (usage/budget)", segment_text(&v.local), segment_text(&v.non_local))
+}
+
+/// Notices in the periodic video-memory samples: local usage first past 90 % of its budget,
+/// and a budget (either group) that moved more than 5 % from the last one reported.
+#[derive(Default)]
+struct BudgetWatch {
+    seen: Option<(u64, u64)>,
+    warned_90: bool,
+}
+
+impl BudgetWatch {
+    fn observe(&mut self, v: &crate::hle::d3d12x::real::VideoMemory, t: f64) -> Vec<String> {
+        let mut out = Vec::new();
+        let now = (v.local.budget, v.non_local.budget);
+        if v.local.budget != 0 && !self.warned_90 && v.local.usage as u128 * 10 > v.local.budget as u128 * 9 {
+            self.warned_90 = true;
+            out.push(format!(
+                "video memory: local usage {} MB passed 90% of its budget {} MB at {t:.1} s",
+                v.local.usage >> 20,
+                v.local.budget >> 20
+            ));
+        }
+        match self.seen {
+            None => self.seen = Some(now),
+            Some((l, n)) => {
+                let moved = |old: u64, new: u64| old.abs_diff(new) as u128 * 20 > old as u128;
+                let (lm, nm) = (moved(l, now.0), moved(n, now.1));
+                if lm || nm {
+                    out.push(format!(
+                        "video memory: budget changed at {t:.1} s: local {} -> {} MB, non-local {} -> {} MB",
+                        l >> 20,
+                        now.0 >> 20,
+                        n >> 20,
+                        now.1 >> 20
+                    ));
+                    self.seen = Some(now);
+                }
+            }
+        }
+        out
+    }
+}
+
 pub fn host_main(boot_path: &Path) -> i32 {
     let boot: Boot = match std::fs::read_to_string(boot_path).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
         Ok(b) => b,
@@ -40,6 +95,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
+            let mut budget = BudgetWatch::default();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -56,16 +112,21 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
                     c.PrivateUsage
                 };
-                let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
+                let video = crate::hle::d3d12x::real::video_memory();
+                if let Some(v) = &video {
+                    for line in budget.observe(v, crate::log::uptime()) {
+                        crate::xlog_info!("{line}");
+                    }
+                }
+                let video = video.unwrap_or_default();
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
                 let mb = |b: u64| b >> 20;
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    "memory: {} MB committed by the process; video memory {}; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
                     mb(private as u64),
-                    mb(local),
-                    mb(non_local),
+                    video_memory_text(&video),
                     mb(pages as u64),
                     mb(page_pools as u64),
                     mb(arenas as u64),
@@ -145,4 +206,36 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::d3d12x::real::{VideoMemory, VideoSegment};
+
+    const MB: u64 = 1 << 20;
+    fn seg(usage: u64, budget: u64, reservation: u64) -> VideoSegment {
+        VideoSegment { usage: usage * MB, budget: budget * MB, reservation: reservation * MB }
+    }
+
+    #[test]
+    fn the_memory_line_shows_usage_over_budget() {
+        let v = VideoMemory { local: seg(15993, 16384, 0), non_local: seg(4829, 24000, 512) };
+        assert_eq!(video_memory_text(&v), "15993/16384 MB local, 4829/24000 MB (reserved 512 MB) non-local (usage/budget)");
+    }
+
+    #[test]
+    fn ninety_percent_once_and_budget_moves_over_five_percent() {
+        let mut w = BudgetWatch::default();
+        let at = |l: u64, b: u64| VideoMemory { local: seg(l, b, 0), non_local: seg(0, 24000, 0) };
+        assert!(w.observe(&at(1000, 16000), 1.0).is_empty());
+        let o = w.observe(&at(14500, 16000), 2.0);
+        assert_eq!(o.len(), 1, "{o:?}");
+        assert!(o[0].contains("90%") && o[0].contains("2.0 s"), "{o:?}");
+        assert!(w.observe(&at(15000, 16000), 3.0).is_empty(), "90 % is reported once");
+        assert!(w.observe(&at(15000, 15500), 4.0).is_empty(), "3 % is below the threshold");
+        let o = w.observe(&at(15000, 12000), 5.0);
+        assert_eq!(o.len(), 1, "{o:?}");
+        assert!(o[0].contains("local 16000 -> 12000 MB"), "{o:?}");
+    }
 }
