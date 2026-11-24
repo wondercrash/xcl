@@ -189,25 +189,15 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     // what an earlier run of this binary finished
     let done_path = journal.with_extension("done");
     let key = binary_key();
-    let mut done_file = {
-        let old = std::fs::read(&done_path).unwrap_or_default();
-        let mut g = q.0.lock().unwrap();
-        if old.len() >= 8 && old[..8] == key.to_le_bytes() {
-            g.taken.extend(old[8..].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())));
+    let mut done_file = match open_done(&done_path, key) {
+        Ok((f, done)) => {
+            q.0.lock().unwrap().taken.extend(done);
+            f
         }
-        let fresh = g.taken.is_empty();
-        let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&done_path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("xcl pipelines: {}: {e}", done_path.display());
-                return 2;
-            }
-        };
-        if fresh {
-            let _ = f.set_len(0);
-            let _ = f.write_all(&key.to_le_bytes());
+        Err(e) => {
+            eprintln!("xcl pipelines: {}: {e}", done_path.display());
+            return 2;
         }
-        f
     };
     let (already, first) = {
         let mut g = q.0.lock().unwrap();
@@ -368,9 +358,55 @@ fn device(adapter: &str) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12D
     }
 }
 
+/// Opens `pipelines.done` for `key` (this binary): the hashes it holds, and the file positioned
+/// after them. A file of another binary starts over; a torn last record is cut off.
+fn open_done(path: &Path, key: u64) -> std::io::Result<(std::fs::File, Vec<u64>)> {
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+    let mut old = Vec::new();
+    f.read_to_end(&mut old)?;
+    let done: Vec<u64> = if old.len() >= 8 && old[..8] == key.to_le_bytes() {
+        old[8..].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()
+    } else {
+        Vec::new()
+    };
+    if done.is_empty() {
+        f.set_len(0)?;
+        f.seek(std::io::SeekFrom::Start(0))?;
+        f.write_all(&key.to_le_bytes())?;
+    } else {
+        let end = 8 + 8 * done.len() as u64;
+        f.set_len(end)?;
+        f.seek(std::io::SeekFrom::Start(end))?;
+    }
+    Ok((f, done))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn done_file_of_another_binary_is_replaced_and_a_torn_record_cut() {
+        let path = std::env::temp_dir().join(format!("xcl-done-test-{}.done", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (mut f, done) = open_done(&path, 1).unwrap();
+        assert!(done.is_empty());
+        f.write_all(&7u64.to_le_bytes()).unwrap();
+        f.write_all(&[9, 9, 9]).unwrap(); // a record cut short
+        drop(f);
+        let (mut f, done) = open_done(&path, 1).unwrap();
+        assert_eq!(done, [7]);
+        f.write_all(&8u64.to_le_bytes()).unwrap();
+        drop(f);
+        assert_eq!(std::fs::read(&path).unwrap().len(), 24, "the torn record was cut, 8 follows 7");
+        let (mut f, done) = open_done(&path, 2).unwrap();
+        assert!(done.is_empty(), "another binary's progress is not reused");
+        f.write_all(&5u64.to_le_bytes()).unwrap();
+        drop(f);
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bytes, [2u64.to_le_bytes(), 5u64.to_le_bytes()].concat(), "the old file was replaced, not appended to");
+    }
 
     fn frame(tag: u8, hash: u64, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![tag, 4, 0, 0];
