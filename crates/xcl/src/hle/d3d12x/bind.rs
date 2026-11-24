@@ -244,12 +244,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(with(this, |s| s.pso)) {
+        if super::pso_async::is_pending(with(this, |s| s.pso)) || super::real::two_pass_of(pso).is_some() {
             count(DRAWS_SKIPPED);
             super::breadcrumbs::skipped(this, with(this, |s| s.pso), || format!("ExecuteIndirect max {max} skipped: pipeline still being built"));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pending or two-pass pipeline skipped");
             }
             return;
         }
@@ -1206,6 +1206,42 @@ mod tests {
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);
+    }
+
+    /// A two-pass mesh/GS pipeline is built with XCL's mesh root signature and registered in
+    /// `TWO_PASS` (not `TRANSLATED_GRAPHICS`). `ExecuteIndirect` must skip it instead of falling
+    /// through to the PC path with the title's root signature and unbound root descriptors.
+    #[test]
+    fn execute_indirect_with_a_two_pass_pipeline_is_skipped() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
+        let two_pass_pso = 0x7200_00AAusize;
+        real::register_two_pass_for_test(two_pass_pso);
+        reset(list_ptr, 0x7200_0200, two_pass_pso);
+        let before = counts_snapshot();
+        unsafe {
+            execute_indirect(list_ptr, 0x7200_02F0, 1, 0, 0, 0, 0);
+        }
+        let after = counts_snapshot();
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0, "two-pass PSO must not run on the PC ExecuteIndirect path");
+        assert!(after[DRAWS_SKIPPED] > before[DRAWS_SKIPPED], "skipped two-pass ExecuteIndirect should increment DRAWS_SKIPPED");
+        forget(list_ptr);
+        real::forget_pso_for_test(two_pass_pso);
     }
 
     #[test]
