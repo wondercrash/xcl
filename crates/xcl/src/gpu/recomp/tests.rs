@@ -3310,7 +3310,12 @@ fn gpu_memory_windows_reject_out_of_uma_aliasing() {
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
     let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    // the window switch of programs below `emit::FLAT_WINDOW_LOADS_FROM`, then the flat loads of
+    // bigger ones: the same values, and the stores / atomics still switch
+    let dxils: Vec<Vec<u8>> = [t.hlsl.clone(), flat_window_loads(&t.hlsl, 2)]
+        .iter()
+        .map(|h| super::dxc::compile(h, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{h}")).unwrap())
+        .collect();
 
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[0x1000, base_hi + 4]); // s[2:3]: out-of-UMA hi = base_hi + 4
@@ -3339,23 +3344,65 @@ fn gpu_memory_windows_reject_out_of_uma_aliasing() {
         r[18] = 0x7777_7777;
     }
 
-    let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
-    assert_eq!(r.sgpr[30], 0, "out-of-UMA s_load must return 0");
-    assert_eq!(r.sgpr[31], 0xABCD_0123, "hi == 0 s_load must still read window 0 (32-bit descriptor tables)");
-    assert_eq!(r.vgpr[0][2], 0, "out-of-UMA buffer_load must return 0");
-    assert_eq!(r.vgpr[0][3], 0x5566_7788, "valid strided V# buffer_load must mask stride out of d1");
-    assert_eq!(r.vgpr[0][10], 0, "out-of-UMA global_atomic_add GLC must return 0");
-    assert_eq!(r.vgpr[0][11], 0, "out-of-UMA global_atomic_inc CAS loop must return 0 and terminate");
-    assert_eq!(r.vgpr[0][14], 0, "out-of-UMA buffer_atomic_add GLC must return 0");
-    assert_eq!(r.vgpr[0][17], 0x99AA_BBCC, "64-bit carry global_load must cross from w0 into w1");
-    assert_eq!(r.vgpr[0][18], 0, "64-bit signed borrow below window 0 must be rejected and read 0");
+    for (form, dxil) in ["switch", "flat"].iter().zip(&dxils) {
+        let r = runner::run_in_arena(dxil, &st, &arena).unwrap();
+        assert_eq!(r.sgpr[30], 0, "{form}: out-of-UMA s_load must return 0");
+        assert_eq!(r.sgpr[31], 0xABCD_0123, "{form}: hi == 0 s_load must still read window 0 (32-bit descriptor tables)");
+        assert_eq!(r.vgpr[0][2], 0, "{form}: out-of-UMA buffer_load must return 0");
+        assert_eq!(r.vgpr[0][3], 0x5566_7788, "{form}: valid strided V# buffer_load must mask stride out of d1");
+        assert_eq!(r.vgpr[0][10], 0, "{form}: out-of-UMA global_atomic_add GLC must return 0");
+        assert_eq!(r.vgpr[0][11], 0, "{form}: out-of-UMA global_atomic_inc CAS loop must return 0 and terminate");
+        assert_eq!(r.vgpr[0][14], 0, "{form}: out-of-UMA buffer_atomic_add GLC must return 0");
+        assert_eq!(r.vgpr[0][17], 0x99AA_BBCC, "{form}: 64-bit carry global_load must cross from w0 into w1");
+        assert_eq!(r.vgpr[0][18], 0, "{form}: 64-bit signed borrow below window 0 must be rejected and read 0");
 
-    assert_eq!(*word(w0 + 0x1000), CANARY0, "out-of-UMA global_store must not clobber w0");
-    assert_eq!(*word(w1 + 0x1000), CANARY1, "out-of-UMA buffer_store must not clobber w1");
-    assert_eq!(*word(w0 + 0x2000), CANARY0, "hi == 0 global_store must not clobber w0");
-    assert_eq!(*word(w1 + 0x2000), CANARY1, "out-of-UMA global_atomic_add must not clobber w1");
-    assert_eq!(*word(w0 + 0x3000), CANARY0, "out-of-UMA buffer_atomic_add must not clobber w0");
-    assert_eq!(*word(w1 + 0x3000), CANARY1, "out-of-UMA global_atomic_inc must not clobber w1");
+        assert_eq!(*word(w0 + 0x1000), CANARY0, "{form}: out-of-UMA global_store must not clobber w0");
+        assert_eq!(*word(w1 + 0x1000), CANARY1, "{form}: out-of-UMA buffer_store must not clobber w1");
+        assert_eq!(*word(w0 + 0x2000), CANARY0, "{form}: hi == 0 global_store must not clobber w0");
+        assert_eq!(*word(w1 + 0x2000), CANARY1, "{form}: out-of-UMA global_atomic_add must not clobber w1");
+        assert_eq!(*word(w0 + 0x3000), CANARY0, "{form}: out-of-UMA buffer_atomic_add must not clobber w0");
+        assert_eq!(*word(w1 + 0x3000), CANARY1, "{form}: out-of-UMA global_atomic_inc must not clobber w1");
+    }
+}
+
+/// HLSL of a program below `emit::FLAT_WINDOW_LOADS_FROM` with the window loads of a bigger one
+/// (`emit::mem_accessors`' `flat`).
+fn flat_window_loads(hlsl: &str, windows: u32) -> String {
+    let switched = super::emit::mem_accessors(windows, false);
+    assert!(hlsl.contains(&switched), "a small program keeps the window switch");
+    hlsl.replacen(&switched, &super::emit::mem_accessors(windows, true), 1)
+}
+
+/// Compute programs from `emit::FLAT_WINDOW_LOADS_FROM` on read their windows without a switch;
+/// stores and atomics keep it, and smaller programs keep their HLSL (and cache keys).
+#[test]
+fn big_programs_read_their_windows_without_a_switch() {
+    let small = format!("{}{}", super::emit::MEM_ACCESSORS_HERE, "uint x = mem.Load(4u);\n");
+    let (s, b) = (super::emit::windowed(&small, 4, false), super::emit::windowed(&small, 4, true));
+    let line = |h: &str, f: &str| h.lines().find(|l| l.contains(f)).unwrap_or_else(|| panic!("{f}")).to_string();
+    assert_eq!(s, small.replacen(super::emit::MEM_ACCESSORS_HERE, &super::emit::mem_accessors(4, false), 1).replace("mem.Load(4u)", "xcl_mLoad(4u)"));
+    for f in ["uint4 xcl_loadx4(", "uint xcl_mLoad(", "uint2 xcl_mLoad2(", "uint3 xcl_mLoad3(", "uint4 xcl_mLoad4("] {
+        assert!(line(&s, f).contains("switch (xcl_w)"), "{f}");
+        let l = line(&b, f);
+        assert!(!l.contains("switch") && !l.contains("if"), "{l}");
+        // each window once, the unselected ones at offset 0; out of range: 0
+        for k in ["mem.", "mem1.", "mem2.", "mem3."] {
+            assert!(l.contains(k), "{l}");
+        }
+        assert!(l.contains("select(xcl_w == 3u, r3, uint") || l.contains("select(xcl_w == 3u, r3, 0u)"), "{l}");
+    }
+    // the gate: a compute program of about 1.5 MB of HLSL (scalar loads) is flat, a short one not
+    let load = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0)][..], None);
+    let opt = || Options { mem_windows: 4, ..Default::default() };
+    let short = translate(&prog(&[load]), &opt()).unwrap().hlsl;
+    let long = translate(&prog(&vec![load; 4000]), &opt()).unwrap().hlsl;
+    assert!(short.len() < super::emit::FLAT_WINDOW_LOADS_FROM && long.len() >= super::emit::FLAT_WINDOW_LOADS_FROM, "{} / {}", short.len(), long.len());
+    assert!(line(&short, "uint4 xcl_loadx4(").contains("switch (xcl_w)"));
+    assert_eq!(line(&long, "uint4 xcl_loadx4("), line(&b, "uint4 xcl_loadx4("));
+    for f in ["void xcl_mStore(", "void xcl_mInterlockedAdd(uint a, uint v, out uint o)", "void xcl_mInterlockedCompareExchange("] {
+        assert_eq!(line(&b, f), line(&s, f), "{f}");
+        assert!(line(&b, f).contains("switch (xcl_w)"), "{f}");
+    }
 }
 
 /// The start-up check of the coherent UMA windows (`real::check_uma_import`): the GPU sees what
@@ -3444,23 +3491,31 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     ]);
     let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 6, ..Default::default() };
     let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), mem_windows: 4, ..Default::default() })).unwrap();
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    // the window switch, then the flat loads of programs from `emit::FLAT_WINDOW_LOADS_FROM` on
+    let dxils: Vec<Vec<u8>> = [t.hlsl.clone(), flat_window_loads(&t.hlsl, 4)]
+        .iter()
+        .map(|h| super::dxc::compile(h, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{h}")).unwrap())
+        .collect();
 
     // Execute on the real D3D12.X device + queue (goes through q_execute_command_lists -> sparse::before_execute)
     unsafe {
         let dev_raw = crate::hle::d3d12x::real::device_raw();
         let dev = ID3D12Device::from_raw_borrowed(&dev_raw).expect("device").clone();
         let rs = crate::gpu::recomp::pso::abi_root_signature(&dev, false).expect("ABI root signature");
-        let pso: ID3D12PipelineState = dev
-            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
-                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
-                ..Default::default()
+        let psos: Vec<ID3D12PipelineState> = dxils
+            .iter()
+            .map(|dxil| {
+                dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+                .expect("CreateComputePipelineState")
             })
-            .expect("CreateComputePipelineState");
+            .collect();
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&pso)).unwrap();
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&psos[0])).unwrap();
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
 
         // User SGPRs: s[0:1] = 64-bit arg_table (Window 3), s4 = 32-bit descriptor table offset in Window 0
@@ -3472,10 +3527,10 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         io[5] = 0xDEAD_BEEF; // shader overwrites s5 = 0 to prove hi == 0 32-bit addressing hits Window 0 sparse VRAM
         std::ptr::copy_nonoverlapping(io.as_ptr() as *const u8, io_buf as *mut u8, io.len() * 4);
 
-        let record_and_run = |fence_val: u64, first: bool| {
+        let record_and_run = |pso: &ID3D12PipelineState, fence_val: u64, first: bool| {
             if !first {
                 alloc.Reset().unwrap();
-                list.Reset(&alloc, Some(&pso)).unwrap();
+                list.Reset(&alloc, Some(pso)).unwrap();
             }
             list.SetComputeRootSignature(&rs);
             list.SetComputeRootUnorderedAccessView(0, crate::hle::d3d12x::real::uma_va_of(io_buf).unwrap());
@@ -3495,22 +3550,30 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
             }
         };
 
-        // Submit 1: reads slot 0 -> in_a (sparse VRAM) + arg_table constant 77 (Window 3)
-        record_and_run(1, true);
-        for l in 0..64usize {
-            let got = *((out_buf + 4 * l) as *const u32);
-            assert_eq!(got, 1000 + l as u32 + 77, "submit 1 lane {l} mismatch");
-        }
+        for (n, (form, pso)) in ["switch", "flat"].iter().zip(&psos).enumerate() {
+            let n = n as u64;
+            *(arg_table as *mut u32) = 77;
+            *((in_b + 4 * 3) as *mut u32) = 5000 + 2 * 3;
+            crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_a));
+            // Submit 1: reads slot 0 -> in_a (sparse VRAM) + arg_table constant 77 (Window 3)
+            std::ptr::write_bytes(out_buf as *mut u8, 0, 256);
+            record_and_run(pso, 2 * n + 1, n == 0);
+            for l in 0..64usize {
+                let got = *((out_buf + 4 * l) as *const u32);
+                assert_eq!(got, 1000 + l as u32 + 77, "{form}: submit 1 lane {l} mismatch");
+            }
 
-        // Submit 2: mutate descriptor slot 0 in Window 0 sparse VRAM -> in_b, and mutate in_b[3] + arg_table
-        *(arg_table as *mut u32) = 13;
-        *((in_b + 4 * 3) as *mut u32) = 9999;
-        crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_b));
-        record_and_run(2, false);
-        for l in 0..64usize {
-            let expected = if l == 3 { 9999 + 13 } else { 5000 + 2 * l as u32 + 13 };
-            let got = *((out_buf + 4 * l) as *const u32);
-            assert_eq!(got, expected, "submit 2 (mutated sparse descriptor + XMem buffer) lane {l} mismatch");
+            // Submit 2: mutate descriptor slot 0 in Window 0 sparse VRAM -> in_b, and mutate in_b[3] + arg_table
+            *(arg_table as *mut u32) = 13;
+            *((in_b + 4 * 3) as *mut u32) = 9999;
+            crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_b));
+            std::ptr::write_bytes(out_buf as *mut u8, 0, 256);
+            record_and_run(pso, 2 * n + 2, false);
+            for l in 0..64usize {
+                let expected = if l == 3 { 9999 + 13 } else { 5000 + 2 * l as u32 + 13 };
+                let got = *((out_buf + 4 * l) as *const u32);
+                assert_eq!(got, expected, "{form}: submit 2 (mutated sparse descriptor + XMem buffer) lane {l} mismatch");
+            }
         }
 
         // Clean up
