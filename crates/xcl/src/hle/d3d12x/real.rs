@@ -3338,6 +3338,10 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// driver's verdict on it).
 /// DXIL size from which a compute pipeline's driver compile goes to the background
 const BIG_DRIVER_COMPILE: usize = 256 << 10;
+/// DXIL size from which a compute program's driver compile has a lane of its own
+/// (`pso_async::big_compile`): a retail game's 13.5 – 28 MB ones took the driver 15+ min each
+/// (the next biggest of its pack is 1.9 MB)
+const HUGE_DRIVER_COMPILE: usize = 4 << 20;
 
 /// Before a big driver compile in the background: until 3 GB of commit are free (each takes
 /// ~1.5 GB; the title loading next to it must not run out – no minute's grace as for DXC).
@@ -3402,10 +3406,11 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
     let started = std::time::Instant::now();
-    // in the background, one at a time and within the commit left (each ~1.5 GB in the driver);
-    // one a bind waits for gets the next slot, ahead of the ones built ahead of their first use
+    // in the background, within the commit left (each ~1.5 GB in the driver): one at a time for
+    // the ones built ahead of their first use (huge ones in a lane of their own), and one a bind
+    // waits for does not wait for those
     let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = super::pso_async::big_compile();
+        let slot = super::pso_async::big_compile(dxil.len() >= HUGE_DRIVER_COMPILE);
         wait_for_commit();
         slot
     });
