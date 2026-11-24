@@ -1579,6 +1579,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
+        super::list_x::forget_driver_va(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -1720,7 +1721,10 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
             let placed = TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
             placed.or_else(|| texture_memory(this)).unwrap_or(0) as u64
         }
-        va => va,
+        va => {
+            super::list_x::note_driver_va(this, va);
+            va
+        }
     }
 }
 

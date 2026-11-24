@@ -17,7 +17,7 @@
 //! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
 //! An index buffer at such an address is given to the PC as the window buffer's GPU address.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -217,8 +217,10 @@ impl PendingWait {
         }
     }
 
+    /// Memory that is no longer readable counts as reached, as in `is_satisfied`: a cell the
+    /// title freed while a gate waits on it must not hold the queue until the release.
     unsafe fn progress_reached(&self) -> bool {
-        self.read_value().is_some_and(|current| current >= self.value)
+        self.read_value().is_none_or(|current| current >= self.value)
     }
 
     unsafe fn is_satisfied(&self) -> bool {
@@ -1927,7 +1929,14 @@ pub(super) fn take_cpu_writes_for_test(list: *mut c_void, progress_va: u64) -> V
 /// When `queue` is non-null, gated waits (`PendingWait::gate`) become queue-side gates and other
 /// monotonic 64-bit waits backed by a recorded `Write64BitValue*` are bridged to GPU-side
 /// `queue.Wait`, without blocking the submitter thread on the CPU.
-pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
+pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], submit: impl FnMut(&[*mut c_void])) {
+    execute_with_waits_before(queue, lists, false, submit);
+}
+
+/// `execute_with_waits_on` for `lists` that the caller follows on `queue` with one more list
+/// (KickoffX's active segment). `sparse_tail`: that list has sparse writes, so gated waits in
+/// `lists` keep the bounded CPU wait, as for a list with sparse writes later in `lists`.
+unsafe fn execute_with_waits_before(queue: *mut c_void, lists: &[*mut c_void], sparse_tail: bool, mut submit: impl FnMut(&[*mut c_void])) {
     if lists.is_empty() || PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
         submit(lists);
         return;
@@ -1953,7 +1962,7 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
         if i > start {
             submit(&lists[start..i]);
         }
-        wait_or_gate(queue, waits, list_writes, last_sparse.is_some_and(|last| last >= i));
+        wait_or_gate(queue, waits, list_writes, sparse_tail || last_sparse.is_some_and(|last| last >= i));
         start = i;
     }
     if start < lists.len() {
@@ -1964,18 +1973,15 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
 /// Wait for `waits` before the list that recorded them goes to `queue`. Gated waits arm a
 /// queue-side gate (`wait_gate`) that the CPU opens once it sees the progress value, so XCL adds
 /// no GPU-to-GPU wait that another queue's later submission could close into a cycle. With
-/// sparse writes at or after the gated list in the same submission, the synchronous sparse
-/// readback would block on this very queue and keep the submitting thread from submitting the
-/// producer on another queue: those waits keep the bounded CPU wait.
+/// sparse writes at or after the gated list in the same submission (or in KickoffX's active
+/// segment after its earlier ones), the synchronous sparse readback would block on this very
+/// queue and keep the submitting thread from submitting the producer on another queue: those
+/// waits keep the bounded CPU wait. A later submission to a queue whose gate is still closed has
+/// its readback recorded on that queue and landed by a worker (`sparse::readback_after_execute`).
 unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)], sparse_after: bool) {
     let (gated, other): (Vec<PendingWait>, Vec<PendingWait>) = waits.iter().copied().partition(|w| w.gate);
     wait_all_on(queue, &other, list_writes);
-    // A value this very list writes later can only be reached after the list: skipped, as
-    // `try_gpu_wait` does for a same-batch self-wait, instead of gating the list on itself.
-    let gated: Vec<PendingWait> = gated
-        .into_iter()
-        .filter(|w| !w.progress_reached() && !list_writes.iter().any(|&(va, v)| va == w.va && v >= w.value))
-        .collect();
+    let gated: Vec<PendingWait> = gated.into_iter().filter(|w| !w.progress_reached() && !waits_on_itself(w, list_writes)).collect();
     if gated.is_empty() {
         return;
     }
@@ -1993,6 +1999,15 @@ unsafe fn wait_or_gate(queue: *mut c_void, waits: &[PendingWait], list_writes: &
         Ok(()) => super::breadcrumbs::waited(queue, || format!("Wait64BitValueX gate on {}", label.unwrap_or_default())),
         Err(reason) => fail_submission(reason),
     }
+}
+
+/// A gated wait on a value this very list writes later while no submission has signalled it
+/// yet can only be reached after the list: skipped, as `try_gpu_wait` does for a same-batch
+/// self-wait, instead of gating the list on itself. Once another queue's producer of the value
+/// is submitted (`submitted_max`), the wait is gated so the list does not run ahead of it.
+fn waits_on_itself(w: &PendingWait, list_writes: &[(u64, u64)]) -> bool {
+    list_writes.iter().any(|&(va, v)| va == w.va && v >= w.value)
+        && SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&w.va)).is_none_or(|c| c.submitted_max < w.value)
 }
 
 /// `q{id}/ty{type}` of a title queue, as the other synchronisation warnings name it.
@@ -2919,7 +2934,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
-            execute_with_waits_on(q_raw, prior, |chunk| {
+            execute_with_waits_before(q_raw, prior, !sparse_writes.is_empty(), |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
                 super::breadcrumbs::executed(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
@@ -3222,8 +3237,9 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
     if t != va || va == 0 || bytes == 0 {
         return t;
     }
-    // in a window by number: a PC resource's GPU address
-    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, bytes) {
+    // in a window by number, or a PC buffer's GPU address the driver gave (#631 puts the
+    // process's memory in the same number range): as it is
+    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || is_driver_va(va) || !crate::gpu::shader::readable(va as usize, bytes) {
         return t;
     }
     if mirror {
@@ -3245,6 +3261,69 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
         crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – bound as a copy made now (#{n})");
     }
     pc_va(p as u64)
+}
+
+/// The driver GPU addresses `res_gpu_va_x` gave console code for PC buffers: `[start, end)` by
+/// start, with the buffer, and each buffer's start. Kept apart from each other.
+#[derive(Default)]
+struct DriverVas {
+    ranges: BTreeMap<u64, (u64, usize)>,
+    by_res: HashMap<usize, u64>,
+}
+
+static DRIVER_VAS: Mutex<Option<DriverVas>> = Mutex::new(None);
+
+impl DriverVas {
+    fn remove(&mut self, start: u64) {
+        if let Some((_, res)) = self.ranges.remove(&start) {
+            self.by_res.remove(&res);
+        }
+    }
+
+    fn insert(&mut self, res: usize, start: u64, end: u64) {
+        if self.ranges.get(&start) == Some(&(end, res)) {
+            return;
+        }
+        if let Some(old) = self.by_res.get(&res).copied() {
+            self.remove(old);
+        }
+        // a range this one overlaps belongs to a buffer the driver no longer has
+        let stale: Vec<u64> = self.ranges.range(..end).rev().take_while(|(_, &(e, _))| e > start).map(|(&s, _)| s).collect();
+        for s in stale {
+            self.remove(s);
+        }
+        self.ranges.insert(start, (end, res));
+        self.by_res.insert(res, start);
+    }
+
+    fn contains(&self, va: u64) -> bool {
+        self.ranges.range(..=va).next_back().is_some_and(|(_, &(end, _))| va < end)
+    }
+}
+
+/// Console code was given `va` as the GPU address of `res`, a PC resource: a buffer's range
+/// is noted so `gpu_va` passes addresses in it on as they are.
+pub(super) unsafe fn note_driver_va(res: *mut c_void, va: u64) {
+    let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else { return };
+    let d = r.GetDesc();
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || d.Width == 0 {
+        return;
+    }
+    DRIVER_VAS.lock().unwrap().get_or_insert_with(DriverVas::default).insert(res as usize, va, va.saturating_add(d.Width));
+}
+
+/// The PC resource `res` was released for good: its driver address may go to another buffer.
+pub(super) fn forget_driver_va(res: usize) {
+    let mut g = DRIVER_VAS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return };
+    if let Some(start) = m.by_res.get(&res).copied() {
+        m.remove(start);
+    }
+}
+
+/// Whether `va` lies in a PC buffer's driver GPU address range (`note_driver_va`).
+fn is_driver_va(va: u64) -> bool {
+    DRIVER_VAS.lock().unwrap().as_ref().is_some_and(|m| m.contains(va))
 }
 
 /// Ranges of the title's memory with a mirror in unified memory: (start, bytes, mirror). A
@@ -4168,6 +4247,75 @@ mod tests {
             cell64.store(0x0000_0002_0000_0001, Ordering::Release);
             assert!(w64.is_satisfied());
         }
+    }
+
+    #[test]
+    fn progress_wait_on_memory_no_longer_readable_counts_as_reached() {
+        let w = PendingWait {
+            // the first 64 KiB of the address space are never mapped
+            va: 0x1000,
+            width: 8,
+            comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+            value: 5,
+            mask: u64::MAX,
+            after_write64: false,
+            gate: true,
+        };
+        unsafe {
+            assert_eq!(w.read_value(), None);
+            assert_eq!(w.progress_reached(), w.is_satisfied(), "a gate and the bounded wait must agree on unreadable memory");
+            assert!(w.progress_reached());
+        }
+        let cell = AtomicU64::new(4);
+        let w = PendingWait { va: &cell as *const AtomicU64 as u64, ..w };
+        unsafe {
+            assert!(!w.progress_reached());
+            cell.store(5, Ordering::Release);
+            assert!(w.progress_reached());
+        }
+    }
+
+    #[test]
+    fn gated_wait_on_its_own_list_write_is_skipped_only_until_another_producer_is_submitted() {
+        let cell = AtomicU64::new(0);
+        let va = &cell as *const AtomicU64 as u64;
+        let w = PendingWait {
+            va,
+            width: 8,
+            comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+            value: 7,
+            mask: u64::MAX,
+            after_write64: false,
+            gate: true,
+        };
+        let list_writes = [(va, 7)];
+        assert!(waits_on_itself(&w, &list_writes), "nobody has the value yet: the list itself writes it");
+        assert!(!waits_on_itself(&w, &[(va, 6)]), "a lower value of the list does not satisfy the wait");
+        SYNC_GRAPH.lock().unwrap().get_or_insert_with(SyncGraph::default).cells.insert(va, SyncCell { recorded_max: 7, submitted_max: 6, ..Default::default() });
+        assert!(waits_on_itself(&w, &list_writes), "a lower submitted value is not the producer");
+        SYNC_GRAPH.lock().unwrap().as_mut().unwrap().cells.get_mut(&va).unwrap().submitted_max = 7;
+        let skipped = waits_on_itself(&w, &list_writes);
+        SYNC_GRAPH.lock().unwrap().as_mut().unwrap().cells.remove(&va);
+        assert!(!skipped, "another queue's producer is already submitted: the wait must be gated");
+    }
+
+    #[test]
+    fn driver_va_ranges_follow_the_buffers_the_driver_has() {
+        let mut m = DriverVas::default();
+        m.insert(1, 0x1_0000, 0x2_0000);
+        m.insert(2, 0x3_0000, 0x3_1000);
+        assert!(m.contains(0x1_0000) && m.contains(0x1_ffff), "inside a buffer's range");
+        assert!(!m.contains(0x2_0000) && !m.contains(0xffff), "past the end or before the start");
+        // a new buffer over part of an old one's range: the old buffer is gone
+        m.insert(3, 0x1_8000, 0x1_9000);
+        assert!(!m.contains(0x1_0000), "a range overlapped by a newer buffer stays noted");
+        assert!(m.contains(0x1_8000));
+        // a buffer asked again at another address keeps only the new range
+        m.insert(2, 0x5_0000, 0x5_1000);
+        assert!(!m.contains(0x3_0000) && m.contains(0x5_0000));
+        m.remove(m.by_res[&3]);
+        assert!(!m.contains(0x1_8000), "a released buffer's range stays noted");
+        assert_eq!((m.ranges.len(), m.by_res.len()), (1, 1));
     }
 
     #[test]

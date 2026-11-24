@@ -91,11 +91,21 @@ struct TileEntry {
     holes: u16,
     /// per-4 KiB-page hashes of the 64-byte chunks last sent to the GPU (`None` = all zero)
     sent: [Option<Box<[u64; CHUNKS]>>; PAGES_PER_TILE],
+    /// changes whenever a page of the tile is committed or decommitted (`TILE_EPOCH`): a copy
+    /// back recorded before that is stale for this tile (`Readback::land`)
+    epoch: u64,
+}
+
+/// source of `TileEntry::epoch`
+static TILE_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_epoch() -> u64 {
+    TILE_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
 impl TileEntry {
     fn with_holes(pool: (u32, u32), holes: u16) -> Self {
-        Self { pool, holes, sent: std::array::from_fn(|_| None) }
+        Self { pool, holes, sent: std::array::from_fn(|_| None), epoch: next_epoch() }
     }
 }
 
@@ -162,6 +172,9 @@ fn decommit_tiles(
                     newly_holed |= bit;
                 }
                 p += PAGE;
+            }
+            if newly_holed != 0 {
+                entry.epoch = next_epoch();
             }
             if entry.holes == 0xFFFF {
                 unmapped.push(t);
@@ -250,6 +263,11 @@ struct State {
     rb_last_fence: u64,
     /// the fence value each title queue last waited for
     waited: FxHashMap<usize, u64>,
+    /// title queue → a fence it signals after a copy back recorded on it (`readback_on`), and
+    /// its last value
+    queue_rb: FxHashMap<usize, (ID3D12Fence, u64)>,
+    /// title queue → its copies back the worker has not landed yet (later ones follow in order)
+    unlanded: FxHashMap<usize, u32>,
     /// `mapped` as sorted (start, end) runs (None: to be made again)
     runs: Option<Vec<(usize, usize)>>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
@@ -555,6 +573,8 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             rb_list,
             rb_last_fence: 0,
             waited: FxHashMap::default(),
+            queue_rb: FxHashMap::default(),
+            unlanded: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
         })
@@ -1018,24 +1038,7 @@ impl State {
                 s.wait_for(s.value);
                 s.reclaim_ring();
             }
-            for &(dst, off, len) in pending.iter() {
-                // copy only committed (non-hole) bytes
-                let mut at = dst;
-                let mut src_off = off;
-                let end = dst + len;
-                while at < end {
-                    let pg = at & !(PAGE - 1);
-                    let t = pg & !(TILE - 1);
-                    let idx = (pg - t) / PAGE;
-                    let step = (pg + PAGE).min(end) - at;
-                    if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
-                        std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
-                    }
-                    at += step;
-                    src_off += step;
-                }
-                s.sync_sent_range(dst, len);
-            }
+            s.copy_back(p, pending);
             pending.clear();
             *used = 0;
         };
@@ -1074,6 +1077,86 @@ impl State {
         if open {
             flush_and_copy(self, &mut open, &mut pending, &mut used, p);
         }
+    }
+
+    /// `parts` (address, offset at `p`, bytes) from video memory into the CPU view (its
+    /// committed pages), `sent` hashes following.
+    unsafe fn copy_back(&mut self, p: *const u8, parts: &[(usize, usize, usize)]) {
+        for &(dst, off, len) in parts {
+            // copy only committed (non-hole) bytes
+            let mut at = dst;
+            let mut src_off = off;
+            let end = dst + len;
+            while at < end {
+                let pg = at & !(PAGE - 1);
+                let t = pg & !(TILE - 1);
+                let idx = (pg - t) / PAGE;
+                let step = (pg + PAGE).min(end) - at;
+                if self.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
+                    std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+                }
+                at += step;
+                src_off += step;
+            }
+            self.sync_sent_range(dst, len);
+        }
+    }
+
+    /// The parts of `ranges` (address, bytes) on tiles with video memory, as (address, offset in
+    /// a buffer holding them back to back, bytes), and that buffer's size.
+    fn mapped_parts(&self, ranges: &[(usize, usize)]) -> (Vec<(usize, usize, usize)>, usize) {
+        let mut parts = Vec::new();
+        let mut size = 0usize;
+        for &(a, n) in ranges {
+            let mut cur = a;
+            while cur < a + n {
+                let tile = cur & !(TILE - 1);
+                let step = (a + n).min(tile + TILE) - cur;
+                if self.mapped.contains_key(&tile) {
+                    parts.push((cur, size, step));
+                    size += step;
+                }
+                cur += step;
+            }
+        }
+        (parts, size)
+    }
+
+    /// A copy of `parts` (from `mapped_parts`) into a readback buffer of its own, recorded on the
+    /// title's `queue` after what it has been given and followed by a signal of that queue's
+    /// fence: nothing waits for the queue to get there.
+    unsafe fn readback_on(&mut self, queue: &ID3D12CommandQueue, parts: Vec<(usize, usize, usize)>, size: usize) -> Option<Readback> {
+        let ty = queue.GetDesc().Type;
+        let alloc: ID3D12CommandAllocator = self.dev.CreateCommandAllocator(ty).ok()?;
+        let list: ID3D12GraphicsCommandList = self.dev.CreateCommandList(0, ty, &alloc, None).ok()?;
+        let mut d = buffer_desc(size as u64);
+        d.Flags = D3D12_RESOURCE_FLAG_NONE;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        let mut buf: Option<ID3D12Resource> = None;
+        self.dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buf).ok()?;
+        let buf = buf?;
+        for &(va, off, len) in &parts {
+            let wi = self.window_index(va)?;
+            list.CopyBufferRegion(&buf, off as u64, &self.windows[wi].1, (va - self.windows[wi].0) as u64, len as u64);
+        }
+        list.Close().ok()?;
+        let l: ID3D12CommandList = list.cast().ok()?;
+        let q = queue.as_raw() as usize;
+        if !self.queue_rb.contains_key(&q) {
+            let f: ID3D12Fence = self.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            self.queue_rb.insert(q, (f, 0));
+        }
+        let (fence, value) = self.queue_rb.get_mut(&q)?;
+        *value += 1;
+        let epochs = parts.iter().map(|&(va, _, _)| self.mapped.get(&(va & !(TILE - 1))).map_or(0, |e| e.epoch)).collect();
+        let job = Readback { queue: q, fence: fence.clone(), value: *value, buf, parts, epochs, _list: (alloc, list) };
+        execute_own(queue, &l);
+        if super::breadcrumbs::labelled(|| "sparse readback signal".to_owned(), || queue.Signal(&job.fence, job.value)).is_err() {
+            // nothing tells when the copy is done: its buffer and list stay alive for good
+            std::mem::forget(job);
+            return None;
+        }
+        Some(job)
     }
 
     /// Asynchronously zero `runs` (address, bytes) in sparse VRAM using the pre-zeroed `zero_buf`
@@ -1222,7 +1305,8 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
 }
 
 /// For a stuck queue's warning: how far the sparse queue is (every title queue waits for its
-/// fence before new work), and whether it waits for a title queue's readback signal.
+/// fence before new work), whether it waits for a title queue's readback signal, and the copies
+/// back of gated queues still to land.
 pub fn hub_state() -> String {
     let g = match STATE.try_lock() {
         Ok(g) => g,
@@ -1232,9 +1316,16 @@ pub fn hub_state() -> String {
     let Some(s) = g.as_ref() else { return "no sparse queue".to_owned() };
     let (done, rb_done) = unsafe { (s.fence.GetCompletedValue(), s.rb_fence.GetCompletedValue()) };
     let rb = if rb_done < s.rb_value { "waits for a title queue's readback signal" } else { "waits for no title queue" };
-    format!("sparse queue at {done}/{}, readback fence {rb_done}/{} ({rb})", s.value, s.rb_value)
+    let unlanded: u32 = s.unlanded.values().sum();
+    format!("sparse queue at {done}/{}, readback fence {rb_done}/{} ({rb}), {unlanded} copies back of gated queues to land", s.value, s.rb_value)
 }
 
+/// After `queue.ExecuteCommandLists`: GPU writes into sparse windows go back to the CPU view.
+/// The sparse queue waits for `queue` and copies them while this call waits – unless `queue` is
+/// held by a Wait64 gate (`wait_gate::closed_on`): it may only get there after a submission the
+/// title makes later, so the copy is recorded on `queue` itself and a worker lands it once the
+/// GPU is there. Neither the sparse queue (which every title queue waits for) nor this call
+/// waits for a gated queue. Until those copies landed, later ones of `queue` take the same way.
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;
@@ -1256,6 +1347,30 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             _ => merged.push((a, n)),
         }
     }
+    let q = queue.as_raw() as usize;
+    if super::wait_gate::closed_on(q) || s.unlanded.get(&q).is_some_and(|&n| n > 0) {
+        let (parts, size) = s.mapped_parts(&merged);
+        if parts.is_empty() {
+            return;
+        }
+        if let Some(job) = s.readback_on(queue, parts, size) {
+            *s.unlanded.entry(q).or_default() += 1;
+            drop(g);
+            match READBACK_WORKER.as_ref() {
+                Some(tx) => {
+                    if let Err(e) = tx.send(job) {
+                        e.0.land();
+                    }
+                }
+                None => job.land(),
+            }
+            return;
+        }
+        static FAILED: AtomicU64 = AtomicU64::new(0);
+        if FAILED.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("sparse windows: could not record a copy back on gated queue {q:#x}; the sparse queue copies it and this call waits for the queue");
+        }
+    }
     s.rb_value += 1;
     let v = s.rb_value;
     if super::breadcrumbs::labelled(|| "sparse readback signal".to_owned(), || queue.Signal(&s.rb_fence, v)).is_ok() {
@@ -1263,6 +1378,92 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     }
     s.readback_ranges(&merged);
 }
+
+/// `list` on the title's `queue` as XCL's own work: past the title-queue hooks (no uploads, sparse
+/// waits or progress waits of a title submission).
+unsafe fn execute_own(queue: &ID3D12CommandQueue, list: &ID3D12CommandList) {
+    let raw = queue.as_raw();
+    if super::real::is_adopted(raw) {
+        const SLOT: usize = std::mem::offset_of!(ID3D12CommandQueue_Vtbl, ExecuteCommandLists) / std::mem::size_of::<usize>();
+        type Exec = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+        let exec: Exec = std::mem::transmute(super::real::orig_fn(raw, SLOT));
+        let lists = [list.as_raw()];
+        exec(raw, 1, lists.as_ptr());
+    } else {
+        super::title_textures::own_work(|| queue.ExecuteCommandLists(&[Some(list.clone())]));
+    }
+}
+
+/// A copy back recorded on a title queue (`State::readback_on`): done when `fence` reaches
+/// `value`.
+struct Readback {
+    queue: usize,
+    fence: ID3D12Fence,
+    value: u64,
+    buf: ID3D12Resource,
+    /// (address, offset in `buf`, bytes)
+    parts: Vec<(usize, usize, usize)>,
+    /// `TileEntry::epoch` of each part's tile when the copy was recorded
+    epochs: Vec<u64>,
+    /// in use by the GPU until `fence` reaches `value`
+    _list: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+}
+
+// SAFETY: D3D12 objects are free-threaded; the rest is plain data
+unsafe impl Send for Readback {}
+
+impl Readback {
+    /// Once the queue is past the copy, into the CPU view (nothing when the device is gone).
+    /// Returns only then: the buffer and list are in use until it.
+    unsafe fn land(self) {
+        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+        if self.fence.GetCompletedValue() < self.value {
+            let event = CreateEventW(None, false, false, None).ok();
+            while self.fence.GetCompletedValue() < self.value {
+                match event {
+                    Some(e) if self.fence.SetEventOnCompletion(self.value, e).is_ok() => {
+                        WaitForSingleObject(e, 10_000);
+                    }
+                    _ => std::thread::sleep(std::time::Duration::from_millis(1)),
+                }
+            }
+            if let Some(e) = event {
+                let _ = CloseHandle(e);
+            }
+        }
+        let mut p = std::ptr::null_mut();
+        let mapped = self.fence.GetCompletedValue() != u64::MAX && self.buf.Map(0, None, Some(&mut p)).is_ok();
+        if let Some(s) = STATE.lock().unwrap().as_mut() {
+            if mapped {
+                // only tiles nobody committed or decommitted a page of since: the copy of one
+                // decommitted (parked, unmapped, or committed again and cleared) is stale
+                let parts: Vec<(usize, usize, usize)> = self.parts.iter().zip(&self.epochs)
+                    .filter(|&(&(va, _, _), &epoch)| s.mapped.get(&(va & !(TILE - 1))).is_some_and(|e| e.epoch == epoch))
+                    .map(|(&part, _)| part)
+                    .collect();
+                s.copy_back(p as *const u8, &parts);
+            }
+            if let Some(n) = s.unlanded.get_mut(&self.queue) {
+                *n = n.saturating_sub(1);
+            }
+        }
+        if mapped {
+            self.buf.Unmap(0, None);
+        }
+    }
+}
+
+/// The thread that lands copies back of gated queues in the CPU view, in submission order.
+static READBACK_WORKER: std::sync::LazyLock<Option<std::sync::mpsc::Sender<Readback>>> = std::sync::LazyLock::new(|| {
+    let (tx, rx) = std::sync::mpsc::channel::<Readback>();
+    match std::thread::Builder::new().name("xcl-sparse-readback".into()).spawn(move || rx.into_iter().for_each(|job| unsafe { job.land() })) {
+        Ok(_) => Some(tx),
+        Err(e) => {
+            crate::xlog_error!("sparse windows: no thread for copies back from video memory: {e}");
+            None
+        }
+    }
+});
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
 /// a non-empty read range, or `Map(0, NULL)` on a sparse readback resource): flushes pending
@@ -1352,9 +1553,13 @@ impl State {
             let tile_end = t.saturating_add(TILE).min(end);
             if let Some(entry) = self.mapped.get_mut(&t) {
                 let mut p = pg;
+                let before = entry.holes;
                 while p < tile_end {
                     entry.holes &= !(1u16 << ((p - t) / PAGE));
                     p += PAGE;
+                }
+                if entry.holes != before {
+                    entry.epoch = next_epoch();
                 }
             }
             if tile_end <= pg {
@@ -1686,6 +1891,8 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
+                queue_rb: FxHashMap::default(),
+                unlanded: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
             };
@@ -1892,6 +2099,8 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
+                queue_rb: FxHashMap::default(),
+                unlanded: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
             };
@@ -1987,6 +2196,8 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
+                queue_rb: FxHashMap::default(),
+                unlanded: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
             };
@@ -2038,6 +2249,27 @@ mod tests {
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
+    }
+
+    /// A copy back of a gated queue lands only on tiles whose pages nobody committed or
+    /// decommitted since it was recorded (`TileEntry::epoch`): a page decommitted (and cleared)
+    /// in between changes the tile's epoch; a decommit of nothing new does not.
+    #[test]
+    fn a_page_decommitted_changes_its_tiles_epoch() {
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let pinned: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+        let (mut free, mut to_zero) = (Vec::new(), Vec::new());
+        let t = 0x20_0000usize;
+        mapped.insert(t, TileEntry::with_holes((0, 1), 0));
+        let other = TileEntry::with_holes((0, 2), 0).epoch;
+        let recorded = mapped[&t].epoch;
+        assert_ne!(recorded, other, "every new tile entry has its own epoch");
+        decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t + PAGE, PAGE);
+        let after = mapped[&t].epoch;
+        assert_ne!(after, recorded, "a decommitted page makes an earlier copy back stale");
+        assert_eq!(to_zero, vec![(t + PAGE, PAGE)], "the page is still cleared");
+        decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t + PAGE, PAGE);
+        assert_eq!(mapped[&t].epoch, after, "decommitting a hole again changes nothing");
     }
 
     /// Sub-tile decommits (two 32 KiB halves, sixteen 4 KiB pages, or decommitting the last
