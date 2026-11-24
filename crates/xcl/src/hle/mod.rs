@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::util::glob_match;
 
 pub mod acphal;
+pub mod bcpack;
 pub mod d3d12_layout;
 pub mod d3d12x;
 pub mod dstorage;
