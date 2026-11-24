@@ -747,6 +747,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
         return;
     }
     let key = list as usize;
+    super::breadcrumbs::list_reset(key);
     // (of a list that was here before and whose release was not seen: the GPU may still use it)
     release_copy_scratch(key);
     let old = {
@@ -785,6 +786,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    super::breadcrumbs::list_reset(list);
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
@@ -2196,6 +2198,7 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
     };
     note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+    super::breadcrumbs::detail(this, || format!("{src:#x} → {dst:#x}, {size:#x} bytes"));
     if d == s && dst < src + size && src < dst + size {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
     }
@@ -2456,6 +2459,7 @@ unsafe fn fill(list: *mut c_void, va: u64, size: u64, pat: [u8; 16], unit: u64, 
     let Some(src) = pattern_buffer(list, pat, size) else {
         return warn(&N, what, format_args!("no pattern buffer for {pat:x?}"));
     };
+    super::breadcrumbs::detail(list, || format!("{va:#x}, {size:#x} bytes"));
     note_write(list as usize, va, size);
     as_copy_dest(list, d, || copy_buffer_region(list, d, off, src, 0, size));
 }
@@ -3908,6 +3912,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         return hr;
     }
     super::title_list::clear_recorded_work(this);
+    super::breadcrumbs::list_reset(this as usize);
 
     reset_copy_scratch(this);
     let is_bundle = {
@@ -4094,6 +4099,7 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
         }
     }
+    super::breadcrumbs::detail(this, || format!("{n:#x} bytes"));
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
 }
 
