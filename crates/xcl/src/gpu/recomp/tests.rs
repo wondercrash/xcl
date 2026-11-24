@@ -8124,8 +8124,9 @@ fn decoded(code: &[u8]) -> Vec<crate::gpu::rdna2::Decoded> {
 
 /// Compute programs keep `globallycoherent` memory windows only for what can read other
 /// groups' writes during the dispatch (`MemoryUse::coherent_because`): atomics, GDS / GWS,
-/// GLC / DLC loads, cache invalidations, vector loads with vector stores. Scalar loads, image
-/// work, loads alone and stores alone get the cached view; graphics never was coherent.
+/// GLC / DLC loads, cache invalidations, vector loads (BVH node reads too) with vector stores.
+/// Scalar loads, image work, loads alone and stores alone get the cached view; graphics never
+/// was coherent. `XCL_CS_COHERENT` / `XCL_CS_CACHED_ALL` override the rule.
 #[test]
 fn compute_memory_is_coherent_only_where_other_groups_are_read() {
     type I<'a> = (&'a str, &'a str, &'a [(&'a str, u64)], Option<u32>);
@@ -8133,40 +8134,69 @@ fn compute_memory_is_coherent_only_where_other_groups_are_read() {
     const S_LOAD_GLC: I = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0x20), ("GLC", 1)], None);
     const LOAD: I = ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None);
     const LOAD_DLC: I = ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 2), ("SADDR", 2), ("DLC", 1)], None);
+    const T_LOAD: I = ("TBUFFER_LOAD_FORMAT_X", "ENC_MTBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1), ("FORMAT", 20)], None);
+    const T_STORE: I = ("TBUFFER_STORE_FORMAT_X", "ENC_MTBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1), ("FORMAT", 20)], None);
+    const F_LOAD: I = ("FLAT_LOAD_DWORD", "ENC_FLAT", &[("VDST", 1), ("ADDR", 2)], None);
+    const F_STORE: I = ("FLAT_STORE_DWORD", "ENC_FLAT", &[("ADDR", 2), ("DATA", 4)], None);
     const STORE: I = ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None);
     const ATOMIC: I = ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None);
-    const INV: I = ("BUFFER_GL0_INV", "ENC_MUBUF", &[], None);
+    const BVH: I = ("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None);
+    const BVH_GLC: I = ("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15), ("GLC", 1)], None);
+    const INV0: I = ("BUFFER_GL0_INV", "ENC_MUBUF", &[], None);
+    const INV1: I = ("BUFFER_GL1_INV", "ENC_MUBUF", &[], None);
+    const S_INV: I = ("S_DCACHE_INV", "ENC_SMEM", &[], None);
+    const S_INV1: I = ("S_GL1_INV", "ENC_SMEM", &[], None);
     const GDS: I = ("DS_ADD_U32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1), ("GDS", 1)], None);
+    const ORDERED: I = ("DS_ORDERED_COUNT", "ENC_DS", &[("ADDR", 0), ("VDST", 1)], None);
+    const GWS: I = ("DS_GWS_INIT", "ENC_DS", &[("DATA0", 1)], None);
     const LDS: I = ("DS_ADD_U32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None);
-    let cases: [(&[I], Option<&str>); 11] = [
+    let cases: [(&[I], Option<&str>); 23] = [
         (&[S_LOAD], None),
         (&[S_LOAD, LOAD], None),
         (&[S_LOAD, STORE], None),
         (&[S_LOAD, LDS, STORE], None),
+        (&[T_LOAD], None),
+        (&[F_STORE], None),
+        (&[BVH], None),
         (&[LOAD, STORE], Some("vector loads and stores")),
+        (&[T_LOAD, T_STORE], Some("vector loads and stores")),
+        (&[F_LOAD, F_STORE], Some("vector loads and stores")),
+        (&[BVH, STORE], Some("vector loads and stores")),
         (&[S_LOAD_GLC], Some("GLC / DLC loads")),
         (&[LOAD_DLC], Some("GLC / DLC loads")),
+        (&[BVH_GLC], Some("GLC / DLC loads")),
         (&[ATOMIC], Some("memory atomics")),
-        (&[S_LOAD, INV, STORE], Some("cache invalidations")),
-        (&[GDS], Some("GDS / ordered count / GWS")),
         (&[ATOMIC, LOAD, STORE], Some("memory atomics")),
+        (&[S_LOAD, INV0, STORE], Some("cache invalidations")),
+        (&[S_LOAD, INV1, STORE], Some("cache invalidations")),
+        (&[S_INV, S_LOAD], Some("cache invalidations")),
+        (&[S_INV1, S_LOAD], Some("cache invalidations")),
+        (&[GDS], Some("GDS / ordered count / GWS")),
+        (&[ORDERED], Some("GDS / ordered count / GWS")),
+        (&[GWS], Some("GDS / ordered count / GWS")),
     ];
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, ..Default::default() };
     for (list, want) in cases {
         let code = prog(list);
         let names: Vec<&str> = list.iter().map(|i| i.0).collect();
-        assert_eq!(super::MemoryUse::of(&decoded(&code)).coherent_because(), want, "{names:?}");
-        if list.iter().any(|i| i.1 == "ENC_DS" || i.0.ends_with("_INV")) {
-            continue;
-        }
-        let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, ..Default::default() };
-        let h = translate(&code, &Options { mode: Mode::Compute(cs), mem_windows: 4, ..Default::default() }).unwrap().hlsl;
-        assert_eq!(h.contains("globallycoherent RWByteAddressBuffer mem :"), want.is_some(), "{names:?}\n{h}");
-        assert_eq!(h.matches("globallycoherent RWByteAddressBuffer mem").count(), if want.is_some() { 4 } else { 0 }, "{names:?}");
-        // graphics and kernels: the cached view whatever the program does
-        let k = translate(&code, &Options { mem_windows: 4, ..Default::default() }).unwrap().hlsl;
-        assert!(!k.contains("globallycoherent"), "{names:?}");
-        if super::dxc::location().is_ok() {
-            super::dxc::compile(&h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}"));
+        let u = super::MemoryUse::of(&decoded(&code));
+        assert_eq!(u.coherent_because(), want, "{names:?}");
+        // the switches: XCL_CS_COHERENT=1 every program (and before XCL_CS_CACHED_ALL), XCL_CS_CACHED_ALL=1 none
+        assert_eq!(super::compute_coherent_because(&u, false, false), want, "{names:?}");
+        assert_eq!(super::compute_coherent_because(&u, true, false), Some("XCL_CS_COHERENT"), "{names:?}");
+        assert_eq!(super::compute_coherent_because(&u, true, true), Some("XCL_CS_COHERENT"), "{names:?}");
+        assert_eq!(super::compute_coherent_because(&u, false, true), None, "{names:?}");
+        for windows in [4u32, 1] {
+            let t = translate(&code, &Options { mode: Mode::Compute(cs.clone()), mem_windows: windows, ..Default::default() }).unwrap();
+            let h = &t.hlsl;
+            assert_eq!(h.contains("globallycoherent RWByteAddressBuffer mem :"), want.is_some(), "{names:?}, {windows} window(s)\n{h}");
+            assert_eq!(h.matches("globallycoherent RWByteAddressBuffer mem").count(), if want.is_some() { windows as usize } else { 0 }, "{names:?}, {windows} window(s)");
+            // graphics and kernels: the cached view whatever the program does
+            let k = translate(&code, &Options { mem_windows: windows, ..Default::default() }).unwrap().hlsl;
+            assert!(!k.contains("globallycoherent"), "{names:?}");
+            if t.complete() && super::dxc::location().is_ok() {
+                super::dxc::compile(h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}"));
+            }
         }
     }
 }
